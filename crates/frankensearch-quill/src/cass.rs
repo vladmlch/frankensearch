@@ -1700,6 +1700,10 @@ mod tests {
                                     field_ord: field::CONTENT,
                                     limit: 1_024,
                                     actual: 1_025,
+                                    // The refusal also names the prefix it
+                                    // exploded (`pattern`); this gate pins the
+                                    // budget refusal itself, not the naming.
+                                    ..
                                 }
                             )
                         ),

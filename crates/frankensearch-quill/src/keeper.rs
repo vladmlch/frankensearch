@@ -24009,6 +24009,7 @@ mod tests {
             TermDictionaryError::InvalidRange,
             TermDictionaryError::MaterializationLimitExceeded { limit: 8 },
             TermDictionaryError::GlobExpansionLimitExceeded {
+                pattern: "test*".to_owned(),
                 field_ord: 1,
                 limit: 8,
                 actual: 9,

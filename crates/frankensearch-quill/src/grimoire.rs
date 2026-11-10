@@ -685,9 +685,13 @@ pub enum TermDictionaryError {
     },
     /// A glob matched one more dictionary term than the caller allowed.
     #[error(
-        "glob expansion for field {field_ord} observed at least {actual} matches, exceeding limit {limit}"
+        "glob expansion for pattern {pattern} over field {field_ord} observed at least {actual} matching terms, exceeding limit {limit}"
     )]
     GlobExpansionLimitExceeded {
+        /// The glob pattern whose expansion crossed the cap, lossily decoded
+        /// for the diagnostic. Carried so a typed refusal names the pattern
+        /// that exploded instead of only the field and the count.
+        pattern: String,
         /// Field whose dictionary terms were scanned.
         field_ord: u16,
         /// Caller-selected expansion cap.
@@ -1689,15 +1693,20 @@ impl<'a> TermDictionary<'a> {
             return collect_glob_matches(
                 self.prefix_cursor(field_ord, prefix)?,
                 field_ord,
+                pattern,
                 limit,
                 |_| true,
             );
         }
 
         let longest_literal = longest_glob_literal(pattern);
-        collect_glob_matches(self.field_cursor(field_ord)?, field_ord, limit, |term| {
-            contains_subslice(term, longest_literal) && star_glob_matches(pattern, term)
-        })
+        collect_glob_matches(
+            self.field_cursor(field_ord)?,
+            field_ord,
+            pattern,
+            limit,
+            |term| contains_subslice(term, longest_literal) && star_glob_matches(pattern, term),
+        )
     }
 
     fn expand_exact_glob(
@@ -1710,7 +1719,7 @@ impl<'a> TermDictionary<'a> {
             return Ok(Vec::new());
         };
         if limit == 0 {
-            return Err(glob_limit_error(field_ord, limit, 1));
+            return Err(glob_limit_error(field_ord, term, limit, 1));
         }
 
         let mut output = Vec::new();
@@ -1740,6 +1749,7 @@ impl<'a> TermDictionary<'a> {
 fn collect_glob_matches<F>(
     mut cursor: TermCursor<'_, '_>,
     field_ord: u16,
+    pattern: &[u8],
     limit: usize,
     mut matches: F,
 ) -> Result<Vec<OwnedTerm>, TermDictionaryError>
@@ -1752,6 +1762,7 @@ where
             if output.len() >= limit {
                 return Err(glob_limit_error(
                     field_ord,
+                    pattern,
                     limit,
                     output.len().saturating_add(1),
                 ));
@@ -1769,8 +1780,14 @@ where
     Ok(output)
 }
 
-const fn glob_limit_error(field_ord: u16, limit: usize, actual: usize) -> TermDictionaryError {
+fn glob_limit_error(
+    field_ord: u16,
+    pattern: &[u8],
+    limit: usize,
+    actual: usize,
+) -> TermDictionaryError {
     TermDictionaryError::GlobExpansionLimitExceeded {
+        pattern: String::from_utf8_lossy(pattern).into_owned(),
         field_ord,
         limit,
         actual,
@@ -4032,26 +4049,29 @@ mod tests {
         assert!(matches!(
             dictionary.expand_glob(0, b"a*", 2),
             Err(TermDictionaryError::GlobExpansionLimitExceeded {
+                pattern,
                 field_ord: 0,
                 limit: 2,
                 actual: 3,
-            })
+            }) if pattern == "a*"
         ));
         assert!(matches!(
             dictionary.expand_glob(0, b"*a*", 2),
             Err(TermDictionaryError::GlobExpansionLimitExceeded {
+                pattern,
                 field_ord: 0,
                 limit: 2,
                 actual: 3,
-            })
+            }) if pattern == "*a*"
         ));
         assert!(matches!(
             dictionary.expand_glob(0, b"a", 0),
             Err(TermDictionaryError::GlobExpansionLimitExceeded {
+                pattern,
                 field_ord: 0,
                 limit: 0,
                 actual: 1,
-            })
+            }) if pattern == "a"
         ));
         assert_eq!(
             expanded_glob_terms(&dictionary, 0, b"a", 1)?,
