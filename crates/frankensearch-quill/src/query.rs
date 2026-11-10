@@ -5267,7 +5267,39 @@ impl CassQueryParser {
                             .collect(),
                     ));
                 }
-                Some(Query::term(self.fields.searchable(), term))
+                // CASS fork (cass-prefix-expansion): exact and prefix
+                // literals lower to two OR'd arms instead of the incumbent
+                // single term query. The first arm is the incumbent four
+                // field `TermQuery` (`title`, `content`, `title_prefix`,
+                // `content_prefix`); the second arm expands `term*` as a
+                // trailing-star glob over the unwindowed `content` field.
+                // The `content_prefix` edge-ngram column is built over only
+                // the first 4 KiB of each document, so the incumbent arm
+                // alone silently missed every document whose only matching
+                // token sits past that window (`docker` matched
+                // `dockerfile` inside the window, but not at offset 5 KiB).
+                // The glob arm walks each leaf's own `content` term
+                // dictionary (`leaf_glob_terms`), so a prefix that expands
+                // past the per-leaf cap is a typed
+                // `GlobExpansionLimitExceeded` refusal naming the pattern
+                // and a query whose expansion work exceeds the fuel budget
+                // is a typed `QueryFuelExhausted` refusal - never a silent
+                // under-match. CJK literals keep the bigram lowering above:
+                // the decomposition already covers the unwindowed `content`
+                // field, and bigram globs would explode the expansion.
+                Some(Query::boolean(
+                    Vec::from([
+                        BooleanClause::new(
+                            Occur::Should,
+                            Query::term(self.fields.searchable(), term.clone()),
+                        ),
+                        BooleanClause::new(
+                            Occur::Should,
+                            Query::glob(Vec::from([self.fields.content]), format!("{term}*")),
+                        ),
+                    ]),
+                    Some(BooleanOperator::Or),
+                ))
             }
             CassWildcardPattern::Suffix(_)
             | CassWildcardPattern::Substring(_)
@@ -6946,14 +6978,52 @@ mod tests {
                     (
                         CassWildcardPattern::Exact(expected)
                         | CassWildcardPattern::Prefix(expected),
-                        QueryNode::Term { fields, text },
+                        QueryNode::Boolean { clauses, operator },
                     ) => {
-                        assert_eq!(text, &expected, "native parser glob text for {id}");
+                        // CASS fork (cass-prefix-expansion): exact and prefix
+                        // literals lower to two OR'd arms - the incumbent
+                        // four-field term query plus an unwindowed `content`
+                        // glob - so a matching token is found past the 4 KiB
+                        // `content_prefix` window. The fixture row pinned above
+                        // still documents the shipping adapter's TermQuery
+                        // strategy; this arm pins the fork's native shape.
                         assert_eq!(
-                            fields,
-                            &cass_parser().fields.searchable(),
-                            "native parser glob fields for {id}"
+                            operator,
+                            &Some(BooleanOperator::Or),
+                            "native parser glob arm operator for {id}"
                         );
+                        assert_eq!(clauses.len(), 2, "native parser glob arms for {id}");
+                        match (
+                            parsed.query.node(clauses[0].query),
+                            parsed.query.node(clauses[1].query),
+                        ) {
+                            (
+                                QueryNode::Term { fields, text },
+                                QueryNode::Glob { field_ids, pattern },
+                            ) => {
+                                assert_eq!(text, &expected, "native parser glob text for {id}");
+                                assert_eq!(
+                                    fields,
+                                    &cass_parser().fields.searchable(),
+                                    "native parser glob fields for {id}"
+                                );
+                                assert_eq!(
+                                    pattern,
+                                    &format!("{}*", expected),
+                                    "native parser glob prefix-arm pattern for {id}"
+                                );
+                                assert_eq!(
+                                    field_ids.as_slice(),
+                                    &[cass_parser().fields.content][..],
+                                    "native parser glob prefix-arm field for {id}"
+                                );
+                            }
+                            (first, second) => {
+                                panic!(
+                                    "native parser two-arm mismatch for {id}: {first:?} + {second:?}"
+                                )
+                            }
+                        }
                     }
                     (
                         CassWildcardPattern::Suffix(_)
@@ -6999,6 +7069,105 @@ mod tests {
         }
         assert_eq!(executed, expected, "every pinned CASS parser case ran");
         assert!(executed >= 39, "the full harvested CASS contract slice ran");
+    }
+
+    /// Fork (cass-prefix-expansion): non-CJK exact and prefix literals
+    /// lower to two OR'd arms — the incumbent four-field term query plus a
+    /// trailing-star glob over the unwindowed `content` field — so a
+    /// matching token is found past the 4 KiB `content_prefix` window
+    /// instead of only inside it.
+    #[test]
+    fn cass_exact_and_prefix_terms_lower_to_two_or_arms() {
+        let filters = CassQueryFilters::default();
+        for raw in ["docker", "docker*"] {
+            let parsed = cass_parser().parse(raw, &filters);
+            let QueryNode::Boolean { clauses, operator } = parsed.query.root() else {
+                panic!("{raw} must lower to a two-arm Boolean root");
+            };
+            assert_eq!(
+                operator,
+                &Some(BooleanOperator::Or),
+                "{raw}'s arms must combine with OR"
+            );
+            assert_eq!(clauses.len(), 2, "{raw} must have exactly two arms");
+            match (
+                parsed.query.node(clauses[0].query),
+                parsed.query.node(clauses[1].query),
+            ) {
+                (QueryNode::Term { fields, text }, QueryNode::Glob { field_ids, pattern }) => {
+                    assert_eq!(text, "docker", "the exact arm carries the term itself");
+                    assert_eq!(
+                        fields,
+                        &cass_parser().fields.searchable(),
+                        "the exact arm keeps the incumbent four-field expansion"
+                    );
+                    assert_eq!(
+                        pattern, "docker*",
+                        "the glob arm carries the trailing-star pattern"
+                    );
+                    assert_eq!(
+                        field_ids,
+                        &Vec::from([cass_parser().fields.content]),
+                        "the glob arm expands only the unwindowed content field"
+                    );
+                }
+                (first, second) => panic!(
+                    "{raw} must lower to [term over searchable, content glob], got {first:?} + {second:?}"
+                ),
+            }
+        }
+    }
+
+    /// Fork (cass-prefix-expansion): the CJK bigram decomposition and the
+    /// regex glob classes keep their incumbent lowerings — CJK literals
+    /// gain no glob arm, and a suffix literal keeps its regex glob root.
+    #[test]
+    fn cass_cjk_literals_and_regex_globs_keep_their_lowerings() {
+        let filters = CassQueryFilters::default();
+        let parsed = cass_parser().parse("搜索引擎", &filters);
+        match parsed.query.root() {
+            QueryNode::Boolean { clauses, operator } => {
+                assert_eq!(
+                    operator,
+                    &Some(BooleanOperator::And),
+                    "CJK bigrams stay Must-joined"
+                );
+                assert_eq!(
+                    clauses.len(),
+                    3,
+                    "four CJK chars decompose to three bigrams"
+                );
+                for clause in clauses {
+                    assert_eq!(clause.occur, Occur::Must, "every bigram stays required");
+                    let QueryNode::Term { fields, .. } = parsed.query.node(clause.query) else {
+                        panic!("each CJK bigram must stay an exact term, not gain a glob arm");
+                    };
+                    assert_eq!(
+                        fields,
+                        &cass_parser().fields.searchable(),
+                        "each bigram keeps the four-field expansion"
+                    );
+                }
+            }
+            other => panic!("CJK input must keep the bigram Boolean root, got {other:?}"),
+        }
+        let single = cass_parser().parse("搜", &filters);
+        assert!(
+            matches!(single.query.root(), QueryNode::Term { .. }),
+            "a single CJK character stays a unigram term over the searchable fields"
+        );
+        let suffix = cass_parser().parse("*ocker", &filters);
+        match suffix.query.root() {
+            QueryNode::Glob { field_ids, pattern } => {
+                assert_eq!(pattern, "*ocker", "the suffix literal keeps its pattern");
+                assert_eq!(
+                    field_ids,
+                    &cass_parser().fields.regex_fields(),
+                    "the suffix glob keeps the regex fields [content, title]"
+                );
+            }
+            other => panic!("a suffix literal must keep its regex glob root, got {other:?}"),
+        }
     }
 
     #[cfg(feature = "tantivy-oracle")]
@@ -7070,6 +7239,46 @@ mod tests {
         }
     }
 
+    /// Fork (cass-prefix-expansion): assert `query`'s root is the two-arm
+    /// Exact lowering of `expected` — [term over the searchable fields,
+    /// content glob `{expected}*`] under an OR — which is what every
+    /// recovered single-token parse now lowers to.
+    fn assert_two_arm_exact_root(query: &Query, expected: &str) {
+        let QueryNode::Boolean { clauses, operator } = query.root() else {
+            panic!("{expected:?} must recover as the two-arm Boolean root");
+        };
+        assert_eq!(
+            operator,
+            &Some(BooleanOperator::Or),
+            "{expected:?}'s arms must combine with OR"
+        );
+        assert_eq!(clauses.len(), 2, "{expected:?} must have exactly two arms");
+        match (query.node(clauses[0].query), query.node(clauses[1].query)) {
+            (QueryNode::Term { fields, text }, QueryNode::Glob { field_ids, pattern }) => {
+                assert_eq!(text, expected, "the exact arm carries the term itself");
+                assert_eq!(
+                    fields,
+                    &cass_parser().fields.searchable(),
+                    "the exact arm keeps the incumbent four-field expansion"
+                );
+                assert_eq!(
+                    pattern,
+                    &format!("{expected}*"),
+                    "the glob arm carries the trailing-star pattern"
+                );
+                assert_eq!(
+                    field_ids,
+                    &Vec::from([cass_parser().fields.content]),
+                    "the glob arm expands only the unwindowed content field"
+                );
+            }
+            (first, second) => panic!(
+                "{expected:?} must recover to [term over searchable, content glob], got \
+                 {first:?} + {second:?}"
+            ),
+        }
+    }
+
     #[test]
     fn cass_parser_validates_configuration_and_recovers_hostile_input() {
         assert!(matches!(
@@ -7087,10 +7296,7 @@ mod tests {
             diagnostic.kind == QueryDiagnosticKind::Truncated
                 && diagnostic.message.contains("10000 Unicode scalar values")
         }));
-        assert!(matches!(
-            truncated.query.root(),
-            QueryNode::Term { text, .. } if text == "auth"
-        ));
+        assert_two_arm_exact_root(&truncated.query, "auth");
 
         for raw in [
             "AND auth",
@@ -7112,10 +7318,7 @@ mod tests {
         }
 
         let recovered = parser.parse("NOT AND cache", &CassQueryFilters::default());
-        assert!(matches!(
-            recovered.query.root(),
-            QueryNode::Term { text, .. } if text == "cache"
-        ));
+        assert_two_arm_exact_root(&recovered.query, "cache");
         // The operand-less NOT and the operand-less AND are both dropped with
         // a diagnostic, leaving `auth OR deprecated`.
         let recovered = parser.parse("auth OR NOT AND deprecated", &CassQueryFilters::default());
