@@ -1740,12 +1740,12 @@ version = "0.7.1"
 dependencies = [
  "asupersync",
  "criterion",
- "frankensearch-core",
- "frankensearch-durability",
+ "frankensearch-core 0.4.0",
+ "frankensearch-durability 0.4.0",
  "frankensearch-embed",
  "frankensearch-fusion",
- "frankensearch-index",
- "frankensearch-lexical",
+ "frankensearch-index 0.4.0",
+ "frankensearch-lexical 0.4.0",
  "frankensearch-quill",
  "frankensearch-rerank",
  "frankensearch-storage",
@@ -1778,12 +1778,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "frankensearch-core"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3d1643f2349b0356e67b989c8c060ef44bc41928bd1841bb20fc36a33fe91c74"
+dependencies = [
+ "asupersync",
+ "compact_str 0.10.0",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror 2.0.21",
+ "toml",
+ "tracing",
+ "unicode-normalization",
+]
+
+[[package]]
 name = "frankensearch-durability"
 version = "0.4.0"
 dependencies = [
  "crc32fast",
  "criterion",
- "frankensearch-core",
+ "frankensearch-core 0.4.0",
  "fsqlite-core",
  "fsqlite-error",
  "fsqlite-types",
@@ -1799,13 +1816,34 @@ dependencies = [
 ]
 
 [[package]]
+name = "frankensearch-durability"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0fc37bd4fd5169ec34b5c3facd89377c84405ed77651756b7fbe392e6ea6204d"
+dependencies = [
+ "crc32fast",
+ "frankensearch-core 0.4.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "fsqlite-core",
+ "fsqlite-error",
+ "fsqlite-types",
+ "libc",
+ "memmap2",
+ "raptorq",
+ "rustix 1.1.5",
+ "serde",
+ "serde_json",
+ "tracing",
+ "xxhash-rust",
+]
+
+[[package]]
 name = "frankensearch-embed"
 version = "0.4.0"
 dependencies = [
  "asupersync",
  "criterion",
  "fastembed",
- "frankensearch-core",
+ "frankensearch-core 0.4.0",
  "rayon",
  "safetensors",
  "serde",
@@ -1825,12 +1863,12 @@ dependencies = [
  "compact_str 0.10.0",
  "criterion",
  "frankensearch",
- "frankensearch-core",
- "frankensearch-durability",
+ "frankensearch-core 0.4.0",
+ "frankensearch-durability 0.4.0",
  "frankensearch-embed",
  "frankensearch-fusion",
- "frankensearch-index",
- "frankensearch-lexical",
+ "frankensearch-index 0.4.0",
+ "frankensearch-lexical 0.4.0",
  "frankensearch-quill",
  "frankensearch-rerank",
  "frankensearch-storage",
@@ -1877,10 +1915,10 @@ dependencies = [
  "asupersync",
  "compact_str 0.10.0",
  "criterion",
- "frankensearch-core",
+ "frankensearch-core 0.4.0",
  "frankensearch-embed",
- "frankensearch-index",
- "frankensearch-lexical",
+ "frankensearch-index 0.4.0",
+ "frankensearch-lexical 0.4.0",
  "frankensearch-quill",
  "frankensearch-rerank",
  "rayon",
@@ -1904,7 +1942,7 @@ dependencies = [
  "crc32fast",
  "criterion",
  "frankenhnsw",
- "frankensearch-core",
+ "frankensearch-core 0.4.0",
  "half",
  "hnsw_rs",
  "libc",
@@ -1922,12 +1960,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "frankensearch-index"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d77c69bcd01b50ab4c6fa4b52c20c3f4ce1d15050c37314f90cda358a5cc3ddb"
+dependencies = [
+ "ahash",
+ "arc-swap",
+ "bytemuck",
+ "crc32fast",
+ "frankensearch-core 0.4.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "half",
+ "libc",
+ "memmap2",
+ "rayon",
+ "rustix 1.1.5",
+ "same-file",
+ "serde",
+ "sha2 0.11.0",
+ "tempfile",
+ "tracing",
+ "wide 1.7.1",
+]
+
+[[package]]
 name = "frankensearch-lexical"
 version = "0.4.0"
 dependencies = [
  "asupersync",
  "criterion",
- "frankensearch-core",
+ "frankensearch-core 0.4.0",
  "rayon",
  "serde",
  "serde_json",
@@ -1938,12 +2000,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "frankensearch-lexical"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "38f9f1dc51d32741153820b48118d4b8813662e787042133d065846f5058ccd9"
+dependencies = [
+ "asupersync",
+ "frankensearch-core 0.4.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "rayon",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tantivy",
+ "tracing",
+]
+
+[[package]]
 name = "frankensearch-ops"
 version = "0.4.0"
 dependencies = [
  "ahash",
  "criterion",
- "frankensearch-core",
+ "frankensearch-core 0.4.0",
  "frankensearch-tui",
  "fsqlite",
  "fsqlite-types",
@@ -1973,10 +2051,10 @@ dependencies = [
  "compact_str 0.10.0",
  "crc32fast",
  "criterion",
- "frankensearch-core",
- "frankensearch-durability",
- "frankensearch-index",
- "frankensearch-lexical",
+ "frankensearch-core 0.4.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "frankensearch-durability 0.4.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "frankensearch-index 0.4.2",
+ "frankensearch-lexical 0.4.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "rayon",
  "rustix 1.1.5",
  "same-file",
@@ -2001,8 +2079,8 @@ dependencies = [
  "chacha20poly1305",
  "criterion",
  "ed25519-dalek 3.0.0",
- "frankensearch-core",
- "frankensearch-lexical",
+ "frankensearch-core 0.4.0",
+ "frankensearch-lexical 0.4.0",
  "frankensearch-quill",
  "getrandom 0.4.3",
  "hmac",
@@ -2031,7 +2109,7 @@ dependencies = [
  "bytemuck",
  "criterion",
  "fastembed",
- "frankensearch-core",
+ "frankensearch-core 0.4.0",
  "frankensearch-embed",
  "frankentorch-api",
  "frankentorch-autograd",
@@ -2051,7 +2129,7 @@ version = "0.4.0"
 dependencies = [
  "asupersync",
  "criterion",
- "frankensearch-core",
+ "frankensearch-core 0.4.0",
  "fsqlite",
  "fsqlite-ext-fts5",
  "fsqlite-types",
@@ -2070,7 +2148,7 @@ version = "0.3.1"
 dependencies = [
  "ahash",
  "criterion",
- "frankensearch-core",
+ "frankensearch-core 0.4.0",
  "ftui-core",
  "ftui-layout",
  "ftui-render",
@@ -4069,7 +4147,7 @@ name = "optimize-params"
 version = "0.1.0"
 dependencies = [
  "fastcma",
- "frankensearch-core",
+ "frankensearch-core 0.4.0",
  "frankensearch-fusion",
  "serde",
  "serde_json",
