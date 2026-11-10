@@ -38,10 +38,23 @@ tantivy-oracle = [
 ]
 
 [dependencies]
-frankensearch-core = { workspace = true }
-frankensearch-index = { workspace = true }
-frankensearch-durability = { workspace = true, optional = true }
-frankensearch-lexical = { workspace = true, optional = true, features = ["bench-internals"] }
+# CASS fork note (cass-prefix-expansion): these four family dependencies are
+# declared against crates.io, NOT against the workspace path entries, so a
+# consumer that pins THIS crate alone through a git patch
+# (`[patch.crates-io] frankensearch-quill = { git = ... }`) resolves every
+# other family member from its published registry version and the lockfile
+# keeps exactly one resolution per package. The requirements below are the
+# published frankensearch-quill 0.4.1 manifest's requirements verbatim
+# (registry normalization of the same deps), so the resolved set is the one
+# the published crate already builds against: core 0.4.0, durability 0.4.0,
+# index 0.4.0 (the 0.4.2 hotfix line), lexical 0.4.0. Keeping the workspace
+# path entries here would make the git-sourced crate pull sibling copies of
+# core/index/lexical/durability from this repository's tree at the pinned
+# rev, duplicating every family package in the consumer's Cargo.lock.
+frankensearch-core = "0.4.0"
+frankensearch-index = "0.4.0"
+frankensearch-durability = { version = "0.4.0", optional = true, default-features = false }
+frankensearch-lexical = { version = "0.4.0", optional = true, features = ["bench-internals"] }
 asupersync = { workspace = true }
 arc-swap = { workspace = true }
 wide = { workspace = true }
