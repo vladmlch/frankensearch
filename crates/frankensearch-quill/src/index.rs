@@ -13893,6 +13893,11 @@ fn query_work_upper_bound(
         .saturating_mul(posting_blocks_per_stream)
         .saturating_mul(2);
     // Snapshot-level expansions run while each segment scorer is lowered.
+    // Glob expansion became leaf-local (`leaf_glob_terms`: one dictionary
+    // walk per leaf, S walks total), but the scan ceiling keeps the
+    // historical snapshot-wide product on purpose: it only decides whether
+    // metering arms (`upper_bound > budget`), and over-covering arms metering
+    // sooner without ever refusing work that fits the budget.
     let scanned_dictionary_blocks = shape
         .dictionary_scans
         .saturating_mul(dictionary_blocks)
@@ -16669,9 +16674,9 @@ fn lower_leaf_glob<'a>(
         .try_reserve_exact(field_ids.len())
         .map_err(|_| invalid_state("could not allocate glob field clauses"))?;
     for &field_ord in field_ids {
-        let terms = snapshot_glob_terms(
-            Some(checkpoint),
-            snapshot,
+        let terms = leaf_glob_terms(
+            checkpoint,
+            leaf,
             schema,
             field_ord,
             pattern,
@@ -16786,7 +16791,13 @@ fn snapshot_glob_terms(
                 checkpoint.admit(QueryWorkKind::DictionaryBlock, 1)?;
             }
             if dictionary.lookup(field_ord, pattern)?.is_some() {
-                insert_glob_term(&mut terms, field_ord, pattern.to_vec(), expansion_limit)?;
+                insert_glob_term(
+                    &mut terms,
+                    field_ord,
+                    pattern,
+                    pattern.to_vec(),
+                    expansion_limit,
+                )?;
             }
             continue;
         }
@@ -16809,6 +16820,7 @@ fn snapshot_glob_terms(
                 insert_glob_term(
                     &mut terms,
                     field_ord,
+                    pattern,
                     current.term.to_vec(),
                     expansion_limit,
                 )?;
@@ -16853,7 +16865,130 @@ fn snapshot_glob_terms(
             // even on the `checkpoint == None` path, which has nothing to
             // admit against and previously walked every chain unmetered.
             if term.live_doc_freq() != 0 && star_glob_matches(pattern, term.term()) {
-                insert_glob_term(&mut terms, field_ord, term.term().to_vec(), expansion_limit)?;
+                insert_glob_term(
+                    &mut terms,
+                    field_ord,
+                    pattern,
+                    term.term().to_vec(),
+                    expansion_limit,
+                )?;
+            }
+        }
+    }
+    Ok(terms.into_iter().collect())
+}
+
+/// Expand one glob against ONE query leaf: the sealed segment's own term
+/// dictionary, or the Delta leaf's ordered term view.
+///
+/// `lower_leaf_glob` used to ask [`snapshot_glob_terms`] for the
+/// snapshot-wide term union once per leaf, so a glob-bearing query over S
+/// segments performed S full union walks — S^2 dictionary walks, ~81k of
+/// them on a 285-segment corpus. The union's cross-leaf terms are absent
+/// terms for this leaf: they lower to dictionary probes with no postings, so
+/// expanding against the leaf's own dictionary yields the same match set
+/// for the lowered disjunction while walking one dictionary per leaf.
+/// The trailing-star fast path (`prefix_cursor`), the full-field scan for
+/// complex globs, the indexed exact-lookup arm, and the per-block fuel
+/// admission all mirror `snapshot_glob_terms` exactly; only the scope of
+/// the walk changes.
+///
+/// The typed [`TermDictionaryError::GlobExpansionLimitExceeded`] cap applies
+/// per leaf, mirroring the phrase-prefix path's leaf locality
+/// ([`leaf_phrase_prefix_terms`]): each leaf refuses independently when its
+/// own matching range crosses the configured limit, while the query fuel
+/// budget remains the snapshot-wide backstop for the aggregate walk.
+///
+/// # Errors
+///
+/// Returns a typed error for an invalid string field, cursor or view
+/// failure, fuel exhaustion, or the per-leaf glob expansion limit.
+fn leaf_glob_terms(
+    checkpoint: &QueryCheckpointHandle<'_>,
+    leaf: QueryLeaf<'_>,
+    schema: SchemaDescriptor,
+    field_ord: u16,
+    pattern: &[u8],
+    expansion_limit: usize,
+) -> Result<Vec<Vec<u8>>, QuillIndexError> {
+    validate_string_query_field(schema, field_ord, "glob")?;
+    let mut terms = BTreeSet::<Vec<u8>>::new();
+    match leaf {
+        QueryLeaf::Sealed(segment) => {
+            let dictionary = open_dictionary(segment, schema)?;
+            if !pattern.contains(&b'*') {
+                checkpoint.admit(QueryWorkKind::DictionaryBlock, 1)?;
+                if dictionary.lookup(field_ord, pattern)?.is_some() {
+                    insert_glob_term(
+                        &mut terms,
+                        field_ord,
+                        pattern,
+                        pattern.to_vec(),
+                        expansion_limit,
+                    )?;
+                }
+                return Ok(terms.into_iter().collect());
+            }
+            let trailing_prefix = trailing_star_prefix(pattern);
+            let mut cursor = if let Some(prefix) = trailing_prefix {
+                dictionary.prefix_cursor(field_ord, prefix)?
+            } else {
+                dictionary.field_cursor(field_ord)?
+            };
+            let mut admitted_block = None;
+            while let Some(current) = cursor.current() {
+                let block = cursor.current_block_index();
+                if block != admitted_block {
+                    checkpoint.admit(QueryWorkKind::DictionaryBlock, 1)?;
+                    admitted_block = block;
+                }
+                if trailing_prefix.is_some() || star_glob_matches(pattern, current.term) {
+                    insert_glob_term(
+                        &mut terms,
+                        field_ord,
+                        pattern,
+                        current.term.to_vec(),
+                        expansion_limit,
+                    )?;
+                }
+                cursor.next()?;
+            }
+        }
+        QueryLeaf::Delta(delta) => {
+            // The ordered view's one-generation materialization ceiling is
+            // admitted before the view exists, exactly as in
+            // `snapshot_glob_terms`: the sort allocates once per frozen
+            // generation and a cancelled or zero-fuel query must still pay
+            // for it in full before touching a single term.
+            checkpoint.admit(
+                QueryWorkKind::DictionaryBlock,
+                delta_ordered_view_blocks(delta.segment().term_count()),
+            )?;
+            let field_terms = delta.ordered_terms_for_field(field_ord);
+            if delta.segment().term_count() != 0 {
+                // A nonempty Delta still needs to surface cancellation after
+                // its cached view was obtained, even when this field is empty.
+                checkpoint.admit(QueryWorkKind::DictionaryBlock, 0)?;
+            }
+            for (term_index, term) in field_terms.enumerate() {
+                // The blocks are paid for above, so this admits ZERO units:
+                // it exists only so that a cancellation during a long walk is
+                // still surfaced promptly.
+                if term_index != 0 && term_index % 16 == 0 {
+                    checkpoint.admit(QueryWorkKind::DictionaryBlock, 0)?;
+                }
+                // The live count is taken at freeze, so this stays O(1) per
+                // term and drops fully tombstoned terms the sealed cursor
+                // arms never see at all.
+                if term.live_doc_freq() != 0 && star_glob_matches(pattern, term.term()) {
+                    insert_glob_term(
+                        &mut terms,
+                        field_ord,
+                        pattern,
+                        term.term().to_vec(),
+                        expansion_limit,
+                    )?;
+                }
             }
         }
     }
@@ -16981,11 +17116,13 @@ fn collect_snippet_term_bytes(
 fn insert_glob_term(
     terms: &mut BTreeSet<Vec<u8>>,
     field_ord: u16,
+    pattern: &[u8],
     term: Vec<u8>,
     expansion_limit: usize,
 ) -> Result<(), QuillIndexError> {
     if terms.insert(term) && terms.len() > expansion_limit {
         return Err(TermDictionaryError::GlobExpansionLimitExceeded {
+            pattern: String::from_utf8_lossy(pattern).into_owned(),
             field_ord,
             limit: expansion_limit,
             actual: terms.len(),
@@ -30859,11 +30996,12 @@ mod tests {
                 bounded.execute_ranked_query(&cx, &glob, &snapshot, 10, 0, true, Vec::new()),
                 Err(QuillIndexError::Dictionary(
                     TermDictionaryError::GlobExpansionLimitExceeded {
+                        pattern,
                         field_ord: 1,
                         limit: 1,
                         actual: 2,
                     }
-                ))
+                )) if pattern == "alp*"
             ));
         });
     }
