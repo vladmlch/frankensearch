@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "contract_version": "1.0.3",
+  "contract_version": "1.0.4",
   "oracle": {
     "engine": "tantivy",
     "version": "0.27.0",
@@ -1360,39 +1360,14 @@
           {
             "occur": "Should",
             "query": {
-              "type": "Term",
-              "text": "auth",
-              "fields": [
-                {
-                  "name": "title",
-                  "boost": 1.0
-                },
-                {
-                  "name": "content",
-                  "boost": 1.0
-                },
-                {
-                  "name": "title_prefix",
-                  "boost": 1.0
-                },
-                {
-                  "name": "content_prefix",
-                  "boost": 1.0
-                }
-              ]
-            }
-          },
-          {
-            "occur": "Should",
-            "query": {
               "type": "Boolean",
-              "operator": "AND",
+              "operator": "OR",
               "children": [
                 {
-                  "occur": "Must",
+                  "occur": "Should",
                   "query": {
                     "type": "Term",
-                    "text": "token",
+                    "text": "auth",
                     "fields": [
                       {
                         "name": "title",
@@ -1414,26 +1389,102 @@
                   }
                 },
                 {
+                  "occur": "Should",
+                  "query": {
+                    "type": "Glob",
+                    "pattern": "auth*",
+                    "fields": ["content"]
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "occur": "Should",
+            "query": {
+              "type": "Boolean",
+              "operator": "AND",
+              "children": [
+                {
                   "occur": "Must",
                   "query": {
-                    "type": "Term",
-                    "text": "cache",
-                    "fields": [
+                    "type": "Boolean",
+                    "operator": "OR",
+                    "children": [
                       {
-                        "name": "title",
-                        "boost": 1.0
+                        "occur": "Should",
+                        "query": {
+                          "type": "Term",
+                          "text": "token",
+                          "fields": [
+                            {
+                              "name": "title",
+                              "boost": 1.0
+                            },
+                            {
+                              "name": "content",
+                              "boost": 1.0
+                            },
+                            {
+                              "name": "title_prefix",
+                              "boost": 1.0
+                            },
+                            {
+                              "name": "content_prefix",
+                              "boost": 1.0
+                            }
+                          ]
+                        }
                       },
                       {
-                        "name": "content",
-                        "boost": 1.0
+                        "occur": "Should",
+                        "query": {
+                          "type": "Glob",
+                          "pattern": "token*",
+                          "fields": ["content"]
+                        }
+                      }
+                    ]
+                  }
+                },
+                {
+                  "occur": "Must",
+                  "query": {
+                    "type": "Boolean",
+                    "operator": "OR",
+                    "children": [
+                      {
+                        "occur": "Should",
+                        "query": {
+                          "type": "Term",
+                          "text": "cache",
+                          "fields": [
+                            {
+                              "name": "title",
+                              "boost": 1.0
+                            },
+                            {
+                              "name": "content",
+                              "boost": 1.0
+                            },
+                            {
+                              "name": "title_prefix",
+                              "boost": 1.0
+                            },
+                            {
+                              "name": "content_prefix",
+                              "boost": 1.0
+                            }
+                          ]
+                        }
                       },
                       {
-                        "name": "title_prefix",
-                        "boost": 1.0
-                      },
-                      {
-                        "name": "content_prefix",
-                        "boost": 1.0
+                        "occur": "Should",
+                        "query": {
+                          "type": "Glob",
+                          "pattern": "cache*",
+                          "fields": ["content"]
+                        }
                       }
                     ]
                   }
@@ -1461,80 +1512,11 @@
           {
             "occur": "MustNot",
             "query": {
-              "type": "Term",
-              "text": "deprecated",
-              "fields": [
-                {
-                  "name": "title",
-                  "boost": 1.0
-                },
-                {
-                  "name": "content",
-                  "boost": 1.0
-                },
-                {
-                  "name": "title_prefix",
-                  "boost": 1.0
-                },
-                {
-                  "name": "content_prefix",
-                  "boost": 1.0
-                }
-              ],
-              "score": 0.0
-            }
-          }
-        ]
-      },
-      "known_shipping_gap": "cass_compat currently emits a negative-only BooleanQuery for this shape"
-    },
-    {
-      "id": "query-boolean-negative-or-operand-universe",
-      "query_class": "boolean",
-      "parser": "cass",
-      "input": "auth OR NOT deprecated",
-      "expected_ast": {
-        "type": "Boolean",
-        "operator": "OR",
-        "children": [
-          {
-            "occur": "Should",
-            "query": {
-              "type": "Term",
-              "text": "auth",
-              "fields": [
-                {
-                  "name": "title",
-                  "boost": 1.0
-                },
-                {
-                  "name": "content",
-                  "boost": 1.0
-                },
-                {
-                  "name": "title_prefix",
-                  "boost": 1.0
-                },
-                {
-                  "name": "content_prefix",
-                  "boost": 1.0
-                }
-              ]
-            }
-          },
-          {
-            "occur": "Should",
-            "query": {
               "type": "Boolean",
+              "operator": "OR",
               "children": [
                 {
-                  "occur": "Must",
-                  "query": {
-                    "type": "All"
-                  }
-                },
-                {
-                  "occur": "MustNot",
+                  "occur": "Should",
                   "query": {
                     "type": "Term",
                     "text": "deprecated",
@@ -1555,8 +1537,126 @@
                         "name": "content_prefix",
                         "boost": 1.0
                       }
-                    ],
-                    "score": 0.0
+                    ]
+                  }
+                },
+                {
+                  "occur": "Should",
+                  "query": {
+                    "type": "Glob",
+                    "pattern": "deprecated*",
+                    "fields": ["content"]
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      },
+      "known_shipping_gap": "cass_compat currently emits a negative-only BooleanQuery for this shape"
+    },
+    {
+      "id": "query-boolean-negative-or-operand-universe",
+      "query_class": "boolean",
+      "parser": "cass",
+      "input": "auth OR NOT deprecated",
+      "expected_ast": {
+        "type": "Boolean",
+        "operator": "OR",
+        "children": [
+          {
+            "occur": "Should",
+            "query": {
+              "type": "Boolean",
+              "operator": "OR",
+              "children": [
+                {
+                  "occur": "Should",
+                  "query": {
+                    "type": "Term",
+                    "text": "auth",
+                    "fields": [
+                      {
+                        "name": "title",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "title_prefix",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content_prefix",
+                        "boost": 1.0
+                      }
+                    ]
+                  }
+                },
+                {
+                  "occur": "Should",
+                  "query": {
+                    "type": "Glob",
+                    "pattern": "auth*",
+                    "fields": ["content"]
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "occur": "Should",
+            "query": {
+              "type": "Boolean",
+              "children": [
+                {
+                  "occur": "Must",
+                  "query": {
+                    "type": "All"
+                  }
+                },
+                {
+                  "occur": "MustNot",
+                  "query": {
+                    "type": "Boolean",
+                    "operator": "OR",
+                    "children": [
+                      {
+                        "occur": "Should",
+                        "query": {
+                          "type": "Term",
+                          "text": "deprecated",
+                          "fields": [
+                            {
+                              "name": "title",
+                              "boost": 1.0
+                            },
+                            {
+                              "name": "content",
+                              "boost": 1.0
+                            },
+                            {
+                              "name": "title_prefix",
+                              "boost": 1.0
+                            },
+                            {
+                              "name": "content_prefix",
+                              "boost": 1.0
+                            }
+                          ]
+                        }
+                      },
+                      {
+                        "occur": "Should",
+                        "query": {
+                          "type": "Glob",
+                          "pattern": "deprecated*",
+                          "fields": ["content"]
+                        }
+                      }
+                    ]
                   }
                 }
               ]
@@ -1577,24 +1677,41 @@
           {
             "occur": "Must",
             "query": {
-              "type": "Term",
-              "text": "auth",
-              "fields": [
+              "type": "Boolean",
+              "operator": "OR",
+              "children": [
                 {
-                  "name": "title",
-                  "boost": 1.0
+                  "occur": "Should",
+                  "query": {
+                    "type": "Term",
+                    "text": "auth",
+                    "fields": [
+                      {
+                        "name": "title",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "title_prefix",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content_prefix",
+                        "boost": 1.0
+                      }
+                    ]
+                  }
                 },
                 {
-                  "name": "content",
-                  "boost": 1.0
-                },
-                {
-                  "name": "title_prefix",
-                  "boost": 1.0
-                },
-                {
-                  "name": "content_prefix",
-                  "boost": 1.0
+                  "occur": "Should",
+                  "query": {
+                    "type": "Glob",
+                    "pattern": "auth*",
+                    "fields": ["content"]
+                  }
                 }
               ]
             }
@@ -1602,27 +1719,43 @@
           {
             "occur": "MustNot",
             "query": {
-              "type": "Term",
-              "text": "deprecated",
-              "fields": [
+              "type": "Boolean",
+              "operator": "OR",
+              "children": [
                 {
-                  "name": "title",
-                  "boost": 1.0
+                  "occur": "Should",
+                  "query": {
+                    "type": "Term",
+                    "text": "deprecated",
+                    "fields": [
+                      {
+                        "name": "title",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "title_prefix",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content_prefix",
+                        "boost": 1.0
+                      }
+                    ]
+                  }
                 },
                 {
-                  "name": "content",
-                  "boost": 1.0
-                },
-                {
-                  "name": "title_prefix",
-                  "boost": 1.0
-                },
-                {
-                  "name": "content_prefix",
-                  "boost": 1.0
+                  "occur": "Should",
+                  "query": {
+                    "type": "Glob",
+                    "pattern": "deprecated*",
+                    "fields": ["content"]
+                  }
                 }
-              ],
-              "score": 0.0
+              ]
             }
           }
         ]
@@ -1640,24 +1773,41 @@
           {
             "occur": "Must",
             "query": {
-              "type": "Term",
-              "text": "auth",
-              "fields": [
+              "type": "Boolean",
+              "operator": "OR",
+              "children": [
                 {
-                  "name": "title",
-                  "boost": 1.0
+                  "occur": "Should",
+                  "query": {
+                    "type": "Term",
+                    "text": "auth",
+                    "fields": [
+                      {
+                        "name": "title",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "title_prefix",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content_prefix",
+                        "boost": 1.0
+                      }
+                    ]
+                  }
                 },
                 {
-                  "name": "content",
-                  "boost": 1.0
-                },
-                {
-                  "name": "title_prefix",
-                  "boost": 1.0
-                },
-                {
-                  "name": "content_prefix",
-                  "boost": 1.0
+                  "occur": "Should",
+                  "query": {
+                    "type": "Glob",
+                    "pattern": "auth*",
+                    "fields": ["content"]
+                  }
                 }
               ]
             }
@@ -1665,24 +1815,41 @@
           {
             "occur": "Must",
             "query": {
-              "type": "Term",
-              "text": "deprecated",
-              "fields": [
+              "type": "Boolean",
+              "operator": "OR",
+              "children": [
                 {
-                  "name": "title",
-                  "boost": 1.0
+                  "occur": "Should",
+                  "query": {
+                    "type": "Term",
+                    "text": "deprecated",
+                    "fields": [
+                      {
+                        "name": "title",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "title_prefix",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content_prefix",
+                        "boost": 1.0
+                      }
+                    ]
+                  }
                 },
                 {
-                  "name": "content",
-                  "boost": 1.0
-                },
-                {
-                  "name": "title_prefix",
-                  "boost": 1.0
-                },
-                {
-                  "name": "content_prefix",
-                  "boost": 1.0
+                  "occur": "Should",
+                  "query": {
+                    "type": "Glob",
+                    "pattern": "deprecated*",
+                    "fields": ["content"]
+                  }
                 }
               ]
             }
@@ -1776,24 +1943,41 @@
           {
             "occur": "Must",
             "query": {
-              "type": "Term",
-              "text": "cache",
-              "fields": [
+              "type": "Boolean",
+              "operator": "OR",
+              "children": [
                 {
-                  "name": "title",
-                  "boost": 1.0
+                  "occur": "Should",
+                  "query": {
+                    "type": "Term",
+                    "text": "cache",
+                    "fields": [
+                      {
+                        "name": "title",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "title_prefix",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content_prefix",
+                        "boost": 1.0
+                      }
+                    ]
+                  }
                 },
                 {
-                  "name": "content",
-                  "boost": 1.0
-                },
-                {
-                  "name": "title_prefix",
-                  "boost": 1.0
-                },
-                {
-                  "name": "content_prefix",
-                  "boost": 1.0
+                  "occur": "Should",
+                  "query": {
+                    "type": "Glob",
+                    "pattern": "cache*",
+                    "fields": ["content"]
+                  }
                 }
               ]
             }
@@ -1832,24 +2016,41 @@
           {
             "occur": "Must",
             "query": {
-              "type": "Term",
-              "text": "cache",
-              "fields": [
+              "type": "Boolean",
+              "operator": "OR",
+              "children": [
                 {
-                  "name": "title",
-                  "boost": 1.0
+                  "occur": "Should",
+                  "query": {
+                    "type": "Term",
+                    "text": "cache",
+                    "fields": [
+                      {
+                        "name": "title",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "title_prefix",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content_prefix",
+                        "boost": 1.0
+                      }
+                    ]
+                  }
                 },
                 {
-                  "name": "content",
-                  "boost": 1.0
-                },
-                {
-                  "name": "title_prefix",
-                  "boost": 1.0
-                },
-                {
-                  "name": "content_prefix",
-                  "boost": 1.0
+                  "occur": "Should",
+                  "query": {
+                    "type": "Glob",
+                    "pattern": "cache*",
+                    "fields": ["content"]
+                  }
                 }
               ]
             }
@@ -2206,24 +2407,41 @@
       "parser": "cass",
       "input": "\"auth\"",
       "expected_ast": {
-        "type": "Term",
-        "text": "auth",
-        "fields": [
+        "type": "Boolean",
+        "operator": "OR",
+        "children": [
           {
-            "name": "title",
-            "boost": 1.0
+            "occur": "Should",
+            "query": {
+              "type": "Term",
+              "text": "auth",
+              "fields": [
+                {
+                  "name": "title",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content",
+                  "boost": 1.0
+                },
+                {
+                  "name": "title_prefix",
+                  "boost": 1.0
+                },
+                {
+                  "name": "content_prefix",
+                  "boost": 1.0
+                }
+              ]
+            }
           },
           {
-            "name": "content",
-            "boost": 1.0
-          },
-          {
-            "name": "title_prefix",
-            "boost": 1.0
-          },
-          {
-            "name": "content_prefix",
-            "boost": 1.0
+            "occur": "Should",
+            "query": {
+              "type": "Glob",
+              "pattern": "auth*",
+              "fields": ["content"]
+            }
           }
         ]
       }
@@ -2258,24 +2476,41 @@
           {
             "occur": "Must",
             "query": {
-              "type": "Term",
-              "text": "cache",
-              "fields": [
+              "type": "Boolean",
+              "operator": "OR",
+              "children": [
                 {
-                  "name": "title",
-                  "boost": 1.0
+                  "occur": "Should",
+                  "query": {
+                    "type": "Term",
+                    "text": "cache",
+                    "fields": [
+                      {
+                        "name": "title",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "title_prefix",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content_prefix",
+                        "boost": 1.0
+                      }
+                    ]
+                  }
                 },
                 {
-                  "name": "content",
-                  "boost": 1.0
-                },
-                {
-                  "name": "title_prefix",
-                  "boost": 1.0
-                },
-                {
-                  "name": "content_prefix",
-                  "boost": 1.0
+                  "occur": "Should",
+                  "query": {
+                    "type": "Glob",
+                    "pattern": "cache*",
+                    "fields": ["content"]
+                  }
                 }
               ]
             }
@@ -2297,331 +2532,6 @@
       "query_class": "boolean",
       "parser": "cass",
       "input": "auth token",
-      "expected_ast": {
-        "type": "Boolean",
-        "operator": "AND",
-        "children": [
-          {
-            "occur": "Must",
-            "query": {
-              "type": "Term",
-              "text": "auth",
-              "fields": [
-                {
-                  "name": "title",
-                  "boost": 1.0
-                },
-                {
-                  "name": "content",
-                  "boost": 1.0
-                },
-                {
-                  "name": "title_prefix",
-                  "boost": 1.0
-                },
-                {
-                  "name": "content_prefix",
-                  "boost": 1.0
-                }
-              ]
-            }
-          },
-          {
-            "occur": "Must",
-            "query": {
-              "type": "Term",
-              "text": "token",
-              "fields": [
-                {
-                  "name": "title",
-                  "boost": 1.0
-                },
-                {
-                  "name": "content",
-                  "boost": 1.0
-                },
-                {
-                  "name": "title_prefix",
-                  "boost": 1.0
-                },
-                {
-                  "name": "content_prefix",
-                  "boost": 1.0
-                }
-              ]
-            }
-          }
-        ]
-      }
-    },
-    {
-      "id": "query-cass-explicit-and-equivalent",
-      "query_class": "boolean",
-      "parser": "cass",
-      "input": "auth AND token",
-      "expected_ast": {
-        "ref": "query-cass-implicit-and"
-      }
-    },
-    {
-      "id": "query-cass-symbolic-and-equivalent",
-      "query_class": "boolean",
-      "parser": "cass",
-      "input": "auth&&token",
-      "expected_ast": {
-        "ref": "query-cass-implicit-and"
-      }
-    },
-    {
-      "id": "query-cass-or-chain",
-      "query_class": "boolean",
-      "parser": "cass",
-      "input": "auth OR token OR cache",
-      "expected_ast": {
-        "type": "Boolean",
-        "operator": "OR",
-        "children": [
-          {
-            "occur": "Should",
-            "query": {
-              "type": "Term",
-              "text": "auth",
-              "fields": [
-                {
-                  "name": "title",
-                  "boost": 1.0
-                },
-                {
-                  "name": "content",
-                  "boost": 1.0
-                },
-                {
-                  "name": "title_prefix",
-                  "boost": 1.0
-                },
-                {
-                  "name": "content_prefix",
-                  "boost": 1.0
-                }
-              ]
-            }
-          },
-          {
-            "occur": "Should",
-            "query": {
-              "type": "Term",
-              "text": "token",
-              "fields": [
-                {
-                  "name": "title",
-                  "boost": 1.0
-                },
-                {
-                  "name": "content",
-                  "boost": 1.0
-                },
-                {
-                  "name": "title_prefix",
-                  "boost": 1.0
-                },
-                {
-                  "name": "content_prefix",
-                  "boost": 1.0
-                }
-              ]
-            }
-          },
-          {
-            "occur": "Should",
-            "query": {
-              "type": "Term",
-              "text": "cache",
-              "fields": [
-                {
-                  "name": "title",
-                  "boost": 1.0
-                },
-                {
-                  "name": "content",
-                  "boost": 1.0
-                },
-                {
-                  "name": "title_prefix",
-                  "boost": 1.0
-                },
-                {
-                  "name": "content_prefix",
-                  "boost": 1.0
-                }
-              ]
-            }
-          }
-        ]
-      }
-    },
-    {
-      "id": "query-cass-symbolic-or",
-      "query_class": "boolean",
-      "parser": "cass",
-      "input": "auth||token",
-      "expected_ast": {
-        "type": "Boolean",
-        "operator": "OR",
-        "children": [
-          {
-            "occur": "Should",
-            "query": {
-              "type": "Term",
-              "text": "auth",
-              "fields": [
-                {
-                  "name": "title",
-                  "boost": 1.0
-                },
-                {
-                  "name": "content",
-                  "boost": 1.0
-                },
-                {
-                  "name": "title_prefix",
-                  "boost": 1.0
-                },
-                {
-                  "name": "content_prefix",
-                  "boost": 1.0
-                }
-              ]
-            }
-          },
-          {
-            "occur": "Should",
-            "query": {
-              "type": "Term",
-              "text": "token",
-              "fields": [
-                {
-                  "name": "title",
-                  "boost": 1.0
-                },
-                {
-                  "name": "content",
-                  "boost": 1.0
-                },
-                {
-                  "name": "title_prefix",
-                  "boost": 1.0
-                },
-                {
-                  "name": "content_prefix",
-                  "boost": 1.0
-                }
-              ]
-            }
-          }
-        ]
-      }
-    },
-    {
-      "id": "query-cass-and-binds-before-or",
-      "query_class": "boolean",
-      "parser": "cass",
-      "input": "auth AND token OR cache",
-      "expected_ast": {
-        "type": "Boolean",
-        "operator": "OR",
-        "children": [
-          {
-            "occur": "Should",
-            "query": {
-              "type": "Boolean",
-              "operator": "AND",
-              "children": [
-                {
-                  "occur": "Must",
-                  "query": {
-                    "type": "Term",
-                    "text": "auth",
-                    "fields": [
-                      {
-                        "name": "title",
-                        "boost": 1.0
-                      },
-                      {
-                        "name": "content",
-                        "boost": 1.0
-                      },
-                      {
-                        "name": "title_prefix",
-                        "boost": 1.0
-                      },
-                      {
-                        "name": "content_prefix",
-                        "boost": 1.0
-                      }
-                    ]
-                  }
-                },
-                {
-                  "occur": "Must",
-                  "query": {
-                    "type": "Term",
-                    "text": "token",
-                    "fields": [
-                      {
-                        "name": "title",
-                        "boost": 1.0
-                      },
-                      {
-                        "name": "content",
-                        "boost": 1.0
-                      },
-                      {
-                        "name": "title_prefix",
-                        "boost": 1.0
-                      },
-                      {
-                        "name": "content_prefix",
-                        "boost": 1.0
-                      }
-                    ]
-                  }
-                }
-              ]
-            }
-          },
-          {
-            "occur": "Should",
-            "query": {
-              "type": "Term",
-              "text": "cache",
-              "fields": [
-                {
-                  "name": "title",
-                  "boost": 1.0
-                },
-                {
-                  "name": "content",
-                  "boost": 1.0
-                },
-                {
-                  "name": "title_prefix",
-                  "boost": 1.0
-                },
-                {
-                  "name": "content_prefix",
-                  "boost": 1.0
-                }
-              ]
-            }
-          }
-        ]
-      }
-    },
-    {
-      "id": "query-cass-parentheses-group",
-      "query_class": "boolean",
-      "parser": "cass",
-      "input": "(auth OR token) AND cache",
       "expected_ast": {
         "type": "Boolean",
         "operator": "AND",
@@ -2660,6 +2570,23 @@
                 {
                   "occur": "Should",
                   "query": {
+                    "type": "Glob",
+                    "pattern": "auth*",
+                    "fields": ["content"]
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "occur": "Must",
+            "query": {
+              "type": "Boolean",
+              "operator": "OR",
+              "children": [
+                {
+                  "occur": "Should",
+                  "query": {
                     "type": "Term",
                     "text": "token",
                     "fields": [
@@ -2681,6 +2608,518 @@
                       }
                     ]
                   }
+                },
+                {
+                  "occur": "Should",
+                  "query": {
+                    "type": "Glob",
+                    "pattern": "token*",
+                    "fields": ["content"]
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": "query-cass-explicit-and-equivalent",
+      "query_class": "boolean",
+      "parser": "cass",
+      "input": "auth AND token",
+      "expected_ast": {
+        "ref": "query-cass-implicit-and"
+      }
+    },
+    {
+      "id": "query-cass-symbolic-and-equivalent",
+      "query_class": "boolean",
+      "parser": "cass",
+      "input": "auth&&token",
+      "expected_ast": {
+        "ref": "query-cass-implicit-and"
+      }
+    },
+    {
+      "id": "query-cass-or-chain",
+      "query_class": "boolean",
+      "parser": "cass",
+      "input": "auth OR token OR cache",
+      "expected_ast": {
+        "type": "Boolean",
+        "operator": "OR",
+        "children": [
+          {
+            "occur": "Should",
+            "query": {
+              "type": "Boolean",
+              "operator": "OR",
+              "children": [
+                {
+                  "occur": "Should",
+                  "query": {
+                    "type": "Term",
+                    "text": "auth",
+                    "fields": [
+                      {
+                        "name": "title",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "title_prefix",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content_prefix",
+                        "boost": 1.0
+                      }
+                    ]
+                  }
+                },
+                {
+                  "occur": "Should",
+                  "query": {
+                    "type": "Glob",
+                    "pattern": "auth*",
+                    "fields": ["content"]
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "occur": "Should",
+            "query": {
+              "type": "Boolean",
+              "operator": "OR",
+              "children": [
+                {
+                  "occur": "Should",
+                  "query": {
+                    "type": "Term",
+                    "text": "token",
+                    "fields": [
+                      {
+                        "name": "title",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "title_prefix",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content_prefix",
+                        "boost": 1.0
+                      }
+                    ]
+                  }
+                },
+                {
+                  "occur": "Should",
+                  "query": {
+                    "type": "Glob",
+                    "pattern": "token*",
+                    "fields": ["content"]
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "occur": "Should",
+            "query": {
+              "type": "Boolean",
+              "operator": "OR",
+              "children": [
+                {
+                  "occur": "Should",
+                  "query": {
+                    "type": "Term",
+                    "text": "cache",
+                    "fields": [
+                      {
+                        "name": "title",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "title_prefix",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content_prefix",
+                        "boost": 1.0
+                      }
+                    ]
+                  }
+                },
+                {
+                  "occur": "Should",
+                  "query": {
+                    "type": "Glob",
+                    "pattern": "cache*",
+                    "fields": ["content"]
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": "query-cass-symbolic-or",
+      "query_class": "boolean",
+      "parser": "cass",
+      "input": "auth||token",
+      "expected_ast": {
+        "type": "Boolean",
+        "operator": "OR",
+        "children": [
+          {
+            "occur": "Should",
+            "query": {
+              "type": "Boolean",
+              "operator": "OR",
+              "children": [
+                {
+                  "occur": "Should",
+                  "query": {
+                    "type": "Term",
+                    "text": "auth",
+                    "fields": [
+                      {
+                        "name": "title",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "title_prefix",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content_prefix",
+                        "boost": 1.0
+                      }
+                    ]
+                  }
+                },
+                {
+                  "occur": "Should",
+                  "query": {
+                    "type": "Glob",
+                    "pattern": "auth*",
+                    "fields": ["content"]
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "occur": "Should",
+            "query": {
+              "type": "Boolean",
+              "operator": "OR",
+              "children": [
+                {
+                  "occur": "Should",
+                  "query": {
+                    "type": "Term",
+                    "text": "token",
+                    "fields": [
+                      {
+                        "name": "title",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "title_prefix",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content_prefix",
+                        "boost": 1.0
+                      }
+                    ]
+                  }
+                },
+                {
+                  "occur": "Should",
+                  "query": {
+                    "type": "Glob",
+                    "pattern": "token*",
+                    "fields": ["content"]
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": "query-cass-and-binds-before-or",
+      "query_class": "boolean",
+      "parser": "cass",
+      "input": "auth AND token OR cache",
+      "expected_ast": {
+        "type": "Boolean",
+        "operator": "OR",
+        "children": [
+          {
+            "occur": "Should",
+            "query": {
+              "type": "Boolean",
+              "operator": "AND",
+              "children": [
+                {
+                  "occur": "Must",
+                  "query": {
+                    "type": "Boolean",
+                    "operator": "OR",
+                    "children": [
+                      {
+                        "occur": "Should",
+                        "query": {
+                          "type": "Term",
+                          "text": "auth",
+                          "fields": [
+                            {
+                              "name": "title",
+                              "boost": 1.0
+                            },
+                            {
+                              "name": "content",
+                              "boost": 1.0
+                            },
+                            {
+                              "name": "title_prefix",
+                              "boost": 1.0
+                            },
+                            {
+                              "name": "content_prefix",
+                              "boost": 1.0
+                            }
+                          ]
+                        }
+                      },
+                      {
+                        "occur": "Should",
+                        "query": {
+                          "type": "Glob",
+                          "pattern": "auth*",
+                          "fields": ["content"]
+                        }
+                      }
+                    ]
+                  }
+                },
+                {
+                  "occur": "Must",
+                  "query": {
+                    "type": "Boolean",
+                    "operator": "OR",
+                    "children": [
+                      {
+                        "occur": "Should",
+                        "query": {
+                          "type": "Term",
+                          "text": "token",
+                          "fields": [
+                            {
+                              "name": "title",
+                              "boost": 1.0
+                            },
+                            {
+                              "name": "content",
+                              "boost": 1.0
+                            },
+                            {
+                              "name": "title_prefix",
+                              "boost": 1.0
+                            },
+                            {
+                              "name": "content_prefix",
+                              "boost": 1.0
+                            }
+                          ]
+                        }
+                      },
+                      {
+                        "occur": "Should",
+                        "query": {
+                          "type": "Glob",
+                          "pattern": "token*",
+                          "fields": ["content"]
+                        }
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "occur": "Should",
+            "query": {
+              "type": "Boolean",
+              "operator": "OR",
+              "children": [
+                {
+                  "occur": "Should",
+                  "query": {
+                    "type": "Term",
+                    "text": "cache",
+                    "fields": [
+                      {
+                        "name": "title",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "title_prefix",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content_prefix",
+                        "boost": 1.0
+                      }
+                    ]
+                  }
+                },
+                {
+                  "occur": "Should",
+                  "query": {
+                    "type": "Glob",
+                    "pattern": "cache*",
+                    "fields": ["content"]
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "id": "query-cass-parentheses-group",
+      "query_class": "boolean",
+      "parser": "cass",
+      "input": "(auth OR token) AND cache",
+      "expected_ast": {
+        "type": "Boolean",
+        "operator": "AND",
+        "children": [
+          {
+            "occur": "Must",
+            "query": {
+              "type": "Boolean",
+              "operator": "OR",
+              "children": [
+                {
+                  "occur": "Should",
+                  "query": {
+                    "type": "Boolean",
+                    "operator": "OR",
+                    "children": [
+                      {
+                        "occur": "Should",
+                        "query": {
+                          "type": "Term",
+                          "text": "auth",
+                          "fields": [
+                            {
+                              "name": "title",
+                              "boost": 1.0
+                            },
+                            {
+                              "name": "content",
+                              "boost": 1.0
+                            },
+                            {
+                              "name": "title_prefix",
+                              "boost": 1.0
+                            },
+                            {
+                              "name": "content_prefix",
+                              "boost": 1.0
+                            }
+                          ]
+                        }
+                      },
+                      {
+                        "occur": "Should",
+                        "query": {
+                          "type": "Glob",
+                          "pattern": "auth*",
+                          "fields": ["content"]
+                        }
+                      }
+                    ]
+                  }
+                },
+                {
+                  "occur": "Should",
+                  "query": {
+                    "type": "Boolean",
+                    "operator": "OR",
+                    "children": [
+                      {
+                        "occur": "Should",
+                        "query": {
+                          "type": "Term",
+                          "text": "token",
+                          "fields": [
+                            {
+                              "name": "title",
+                              "boost": 1.0
+                            },
+                            {
+                              "name": "content",
+                              "boost": 1.0
+                            },
+                            {
+                              "name": "title_prefix",
+                              "boost": 1.0
+                            },
+                            {
+                              "name": "content_prefix",
+                              "boost": 1.0
+                            }
+                          ]
+                        }
+                      },
+                      {
+                        "occur": "Should",
+                        "query": {
+                          "type": "Glob",
+                          "pattern": "token*",
+                          "fields": ["content"]
+                        }
+                      }
+                    ]
+                  }
                 }
               ]
             }
@@ -2688,24 +3127,41 @@
           {
             "occur": "Must",
             "query": {
-              "type": "Term",
-              "text": "cache",
-              "fields": [
+              "type": "Boolean",
+              "operator": "OR",
+              "children": [
                 {
-                  "name": "title",
-                  "boost": 1.0
+                  "occur": "Should",
+                  "query": {
+                    "type": "Term",
+                    "text": "cache",
+                    "fields": [
+                      {
+                        "name": "title",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "title_prefix",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content_prefix",
+                        "boost": 1.0
+                      }
+                    ]
+                  }
                 },
                 {
-                  "name": "content",
-                  "boost": 1.0
-                },
-                {
-                  "name": "title_prefix",
-                  "boost": 1.0
-                },
-                {
-                  "name": "content_prefix",
-                  "boost": 1.0
+                  "occur": "Should",
+                  "query": {
+                    "type": "Glob",
+                    "pattern": "cache*",
+                    "fields": ["content"]
+                  }
                 }
               ]
             }
@@ -2734,24 +3190,41 @@
           {
             "occur": "Should",
             "query": {
-              "type": "Term",
-              "text": "auth",
-              "fields": [
+              "type": "Boolean",
+              "operator": "OR",
+              "children": [
                 {
-                  "name": "title",
-                  "boost": 1.0
+                  "occur": "Should",
+                  "query": {
+                    "type": "Term",
+                    "text": "auth",
+                    "fields": [
+                      {
+                        "name": "title",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "title_prefix",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content_prefix",
+                        "boost": 1.0
+                      }
+                    ]
+                  }
                 },
                 {
-                  "name": "content",
-                  "boost": 1.0
-                },
-                {
-                  "name": "title_prefix",
-                  "boost": 1.0
-                },
-                {
-                  "name": "content_prefix",
-                  "boost": 1.0
+                  "occur": "Should",
+                  "query": {
+                    "type": "Glob",
+                    "pattern": "auth*",
+                    "fields": ["content"]
+                  }
                 }
               ]
             }
@@ -2759,24 +3232,41 @@
           {
             "occur": "Should",
             "query": {
-              "type": "Term",
-              "text": "token",
-              "fields": [
+              "type": "Boolean",
+              "operator": "OR",
+              "children": [
                 {
-                  "name": "title",
-                  "boost": 1.0
+                  "occur": "Should",
+                  "query": {
+                    "type": "Term",
+                    "text": "token",
+                    "fields": [
+                      {
+                        "name": "title",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "title_prefix",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content_prefix",
+                        "boost": 1.0
+                      }
+                    ]
+                  }
                 },
                 {
-                  "name": "content",
-                  "boost": 1.0
-                },
-                {
-                  "name": "title_prefix",
-                  "boost": 1.0
-                },
-                {
-                  "name": "content_prefix",
-                  "boost": 1.0
+                  "occur": "Should",
+                  "query": {
+                    "type": "Glob",
+                    "pattern": "token*",
+                    "fields": ["content"]
+                  }
                 }
               ]
             }
@@ -2808,24 +3298,41 @@
           {
             "occur": "Must",
             "query": {
-              "type": "Term",
-              "text": "cache",
-              "fields": [
+              "type": "Boolean",
+              "operator": "OR",
+              "children": [
                 {
-                  "name": "title",
-                  "boost": 1.0
+                  "occur": "Should",
+                  "query": {
+                    "type": "Term",
+                    "text": "cache",
+                    "fields": [
+                      {
+                        "name": "title",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "title_prefix",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content_prefix",
+                        "boost": 1.0
+                      }
+                    ]
+                  }
                 },
                 {
-                  "name": "content",
-                  "boost": 1.0
-                },
-                {
-                  "name": "title_prefix",
-                  "boost": 1.0
-                },
-                {
-                  "name": "content_prefix",
-                  "boost": 1.0
+                  "occur": "Should",
+                  "query": {
+                    "type": "Glob",
+                    "pattern": "cache*",
+                    "fields": ["content"]
+                  }
                 }
               ]
             }
@@ -2862,24 +3369,41 @@
           {
             "occur": "Must",
             "query": {
-              "type": "Term",
-              "text": "cache",
-              "fields": [
+              "type": "Boolean",
+              "operator": "OR",
+              "children": [
                 {
-                  "name": "title",
-                  "boost": 1.0
+                  "occur": "Should",
+                  "query": {
+                    "type": "Term",
+                    "text": "cache",
+                    "fields": [
+                      {
+                        "name": "title",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "title_prefix",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content_prefix",
+                        "boost": 1.0
+                      }
+                    ]
+                  }
                 },
                 {
-                  "name": "content",
-                  "boost": 1.0
-                },
-                {
-                  "name": "title_prefix",
-                  "boost": 1.0
-                },
-                {
-                  "name": "content_prefix",
-                  "boost": 1.0
+                  "occur": "Should",
+                  "query": {
+                    "type": "Glob",
+                    "pattern": "cache*",
+                    "fields": ["content"]
+                  }
                 }
               ]
             }
@@ -2916,24 +3440,41 @@
           {
             "occur": "Must",
             "query": {
-              "type": "Term",
-              "text": "cache",
-              "fields": [
+              "type": "Boolean",
+              "operator": "OR",
+              "children": [
                 {
-                  "name": "title",
-                  "boost": 1.0
+                  "occur": "Should",
+                  "query": {
+                    "type": "Term",
+                    "text": "cache",
+                    "fields": [
+                      {
+                        "name": "title",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "title_prefix",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content_prefix",
+                        "boost": 1.0
+                      }
+                    ]
+                  }
                 },
                 {
-                  "name": "content",
-                  "boost": 1.0
-                },
-                {
-                  "name": "title_prefix",
-                  "boost": 1.0
-                },
-                {
-                  "name": "content_prefix",
-                  "boost": 1.0
+                  "occur": "Should",
+                  "query": {
+                    "type": "Glob",
+                    "pattern": "cache*",
+                    "fields": ["content"]
+                  }
                 }
               ]
             }
@@ -2981,24 +3522,41 @@
           {
             "occur": "Must",
             "query": {
-              "type": "Term",
-              "text": "cache",
-              "fields": [
+              "type": "Boolean",
+              "operator": "OR",
+              "children": [
                 {
-                  "name": "title",
-                  "boost": 1.0
+                  "occur": "Should",
+                  "query": {
+                    "type": "Term",
+                    "text": "cache",
+                    "fields": [
+                      {
+                        "name": "title",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "title_prefix",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content_prefix",
+                        "boost": 1.0
+                      }
+                    ]
+                  }
                 },
                 {
-                  "name": "content",
-                  "boost": 1.0
-                },
-                {
-                  "name": "title_prefix",
-                  "boost": 1.0
-                },
-                {
-                  "name": "content_prefix",
-                  "boost": 1.0
+                  "occur": "Should",
+                  "query": {
+                    "type": "Glob",
+                    "pattern": "cache*",
+                    "fields": ["content"]
+                  }
                 }
               ]
             }
@@ -3129,24 +3687,41 @@
           {
             "occur": "Must",
             "query": {
-              "type": "Term",
-              "text": "auth",
-              "fields": [
+              "type": "Boolean",
+              "operator": "OR",
+              "children": [
                 {
-                  "name": "title",
-                  "boost": 1.0
+                  "occur": "Should",
+                  "query": {
+                    "type": "Term",
+                    "text": "auth",
+                    "fields": [
+                      {
+                        "name": "title",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "title_prefix",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content_prefix",
+                        "boost": 1.0
+                      }
+                    ]
+                  }
                 },
                 {
-                  "name": "content",
-                  "boost": 1.0
-                },
-                {
-                  "name": "title_prefix",
-                  "boost": 1.0
-                },
-                {
-                  "name": "content_prefix",
-                  "boost": 1.0
+                  "occur": "Should",
+                  "query": {
+                    "type": "Glob",
+                    "pattern": "auth*",
+                    "fields": ["content"]
+                  }
                 }
               ]
             }
@@ -3154,24 +3729,41 @@
           {
             "occur": "Must",
             "query": {
-              "type": "Term",
-              "text": "or",
-              "fields": [
+              "type": "Boolean",
+              "operator": "OR",
+              "children": [
                 {
-                  "name": "title",
-                  "boost": 1.0
+                  "occur": "Should",
+                  "query": {
+                    "type": "Term",
+                    "text": "or",
+                    "fields": [
+                      {
+                        "name": "title",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "title_prefix",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content_prefix",
+                        "boost": 1.0
+                      }
+                    ]
+                  }
                 },
                 {
-                  "name": "content",
-                  "boost": 1.0
-                },
-                {
-                  "name": "title_prefix",
-                  "boost": 1.0
-                },
-                {
-                  "name": "content_prefix",
-                  "boost": 1.0
+                  "occur": "Should",
+                  "query": {
+                    "type": "Glob",
+                    "pattern": "or*",
+                    "fields": ["content"]
+                  }
                 }
               ]
             }
@@ -3179,24 +3771,41 @@
           {
             "occur": "Must",
             "query": {
-              "type": "Term",
-              "text": "cache",
-              "fields": [
+              "type": "Boolean",
+              "operator": "OR",
+              "children": [
                 {
-                  "name": "title",
-                  "boost": 1.0
+                  "occur": "Should",
+                  "query": {
+                    "type": "Term",
+                    "text": "cache",
+                    "fields": [
+                      {
+                        "name": "title",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "title_prefix",
+                        "boost": 1.0
+                      },
+                      {
+                        "name": "content_prefix",
+                        "boost": 1.0
+                      }
+                    ]
+                  }
                 },
                 {
-                  "name": "content",
-                  "boost": 1.0
-                },
-                {
-                  "name": "title_prefix",
-                  "boost": 1.0
-                },
-                {
-                  "name": "content_prefix",
-                  "boost": 1.0
+                  "occur": "Should",
+                  "query": {
+                    "type": "Glob",
+                    "pattern": "cache*",
+                    "fields": ["content"]
+                  }
                 }
               ]
             }
@@ -3691,6 +4300,7 @@
         "prefix fields contain lengths 2 through 20 only",
         "explicit ASCII prefixes search complete title/content fields beyond edge-ngram bounds",
         "explicit prefix expansion is complete or fails above 1024 terms per field/segment",
+        "bare exact terms also match the complete content field through a bounded trailing-star glob arm (term*) beside the incumbent four-field term",
         "exact terms of length 2 through 20 may match longer tokens through prefix fields",
         "mixed-script CJK input drops non-CJK characters before bigramming",
         "single CJK unigram does not match inside a multi-character bigram-indexed run"

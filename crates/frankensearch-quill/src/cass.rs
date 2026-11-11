@@ -712,6 +712,390 @@ mod tests {
         });
     }
 
+    /// Content for a deep-window fixture: at least a full 4 KiB window of
+    /// filler whose tokens neither equal nor extend the probe term, then the
+    /// probe's only occurrence. The returned string's filler bytes exceed
+    /// [`CONTENT_PREFIX_MAX_BYTES`] before the probe token starts, so the
+    /// probe's edge grams cannot be in `content_prefix`.
+    fn deep_window_content(probe: &str) -> String {
+        let mut content = String::with_capacity(6 * 1024);
+        while content.len() < CONTENT_PREFIX_MAX_BYTES + 1024 {
+            content.push_str("benign filler text; ");
+        }
+        content.push_str(probe);
+        content
+    }
+
+    /// A bare or `*`-suffixed term must find a document whose only matching
+    /// token sits past the 4 KiB `content_prefix` window.
+    ///
+    /// `content` holds every exact token of the whole body, but the
+    /// edge-ngram `content_prefix` column is built over only the first
+    /// [`CONTENT_PREFIX_MAX_BYTES`] bytes, so the incumbent single term
+    /// query found `dockerfile` only inside the window: a `dockerfile` at
+    /// offset 5 KiB had no exact `docker` token and no in-window prefix
+    /// gram, and `docker` silently missed it. The two-arm lowering (fork
+    /// cass-prefix-expansion) adds the leaf-local `docker*` glob over the
+    /// unwindowed `content` field, so the deep-window document must now be
+    /// a hit for the bare term, the explicit prefix, and the quoted single
+    /// term alike — and a term absent from the document must stay absent.
+    #[test]
+    fn bare_term_finds_a_deep_window_prefix_match() {
+        let content = deep_window_content("dockerfile");
+
+        asupersync::test_utils::run_test_with_cx(move |cx| async move {
+            let directory = tempfile::tempdir().expect("cass index directory");
+            let index = crate::index::QuillIndex::create_with_schema(
+                &cx,
+                directory.path(),
+                crate::schema::CASS_SEMANTIC_SCHEMA,
+                crate::QuillConfig::default(),
+            )
+            .await
+            .expect("create a CASS-schema index");
+
+            let document = sample_document("deep", 0, "claude", "unrelated title", &content)
+                .to_schema_document();
+            index
+                .index_schema_documents(&cx, std::slice::from_ref(&document))
+                .await
+                .expect("ingest the deep-window document");
+            index.commit(&cx).await.expect("publish the document");
+
+            let reader = crate::index::QuillSearchIndex::open_with_schema(
+                &cx,
+                directory.path(),
+                crate::schema::CASS_SEMANTIC_SCHEMA,
+                crate::QuillConfig::default(),
+            )
+            .await
+            .expect("open the reader");
+
+            let parser = crate::query::CassQueryParser::new(crate::schema::CASS_SEMANTIC_SCHEMA)
+                .expect("build the CASS parser");
+            let filters = crate::query::CassQueryFilters::default();
+            for raw in ["docker", "docker*", "\"docker\""] {
+                let parsed = parser.parse(raw, &filters);
+                let result = reader
+                    .search_preparsed_paginated(&cx, &parsed.query, 10, 0, true)
+                    .unwrap_or_else(|error| panic!("search {raw} must lower and run: {error}"));
+                assert_eq!(
+                    result.total_count,
+                    Some(1),
+                    "the deep-window dockerfile must be found by {raw:?}"
+                );
+            }
+            let parsed = parser.parse("kubernetes", &filters);
+            let result = reader
+                .search_preparsed_paginated(&cx, &parsed.query, 10, 0, true)
+                .expect("search an absent term");
+            assert_eq!(
+                result.total_count,
+                Some(0),
+                "an absent term must not match the deep-window document"
+            );
+        });
+    }
+
+    /// The leaf-local glob expansion must cover every sealed leaf.
+    ///
+    /// Two documents are sealed in two separate commits with tier merges
+    /// disabled, so the snapshot holds two leaves: the deep-window
+    /// `dockerfile` document in the first, `dockworker` in the second. One
+    /// bare-term query must find both documents through each leaf's own
+    /// `content` dictionary, and the discriminating queries must keep their
+    /// counts — `dockerfile` (the deep exact token), `dock*` (both), and
+    /// `dockw*` (the second document only).
+    #[test]
+    fn bare_term_expands_the_content_glob_on_every_leaf() {
+        let deep = deep_window_content("dockerfile");
+        let config = crate::QuillConfig {
+            tier_fanout: usize::MAX,
+            ..crate::QuillConfig::default()
+        };
+
+        asupersync::test_utils::run_test_with_cx(move |cx| async move {
+            let directory = tempfile::tempdir().expect("cass index directory");
+            let index = crate::index::QuillIndex::create_with_schema(
+                &cx,
+                directory.path(),
+                crate::schema::CASS_SEMANTIC_SCHEMA,
+                config.clone(),
+            )
+            .await
+            .expect("create a CASS-schema index");
+
+            let early = sample_document("early", 0, "claude", "unrelated title", &deep)
+                .to_schema_document();
+            index
+                .index_schema_documents(&cx, std::slice::from_ref(&early))
+                .await
+                .expect("ingest the deep-window document");
+            index.commit(&cx).await.expect("publish the first leaf");
+
+            let late = sample_document(
+                "late",
+                1,
+                "codex",
+                "another title",
+                "the dockworker manifest",
+            )
+            .to_schema_document();
+            index
+                .index_schema_documents(&cx, std::slice::from_ref(&late))
+                .await
+                .expect("ingest the second leaf");
+            index.commit(&cx).await.expect("publish the second leaf");
+
+            let reader = crate::index::QuillSearchIndex::open_with_schema(
+                &cx,
+                directory.path(),
+                crate::schema::CASS_SEMANTIC_SCHEMA,
+                config,
+            )
+            .await
+            .expect("open the reader");
+
+            let parser = crate::query::CassQueryParser::new(crate::schema::CASS_SEMANTIC_SCHEMA)
+                .expect("build the CASS parser");
+            let filters = crate::query::CassQueryFilters::default();
+            for (raw, expected) in [
+                ("dock", 2_u64),
+                ("dockerfile", 1),
+                ("dockw*", 1),
+                ("kubernetes", 0),
+            ] {
+                let parsed = parser.parse(raw, &filters);
+                let result = reader
+                    .search_preparsed_paginated(&cx, &parsed.query, 10, 0, true)
+                    .unwrap_or_else(|error| panic!("search {raw} must lower and run: {error}"));
+                assert_eq!(
+                    result.total_count,
+                    Some(expected),
+                    "query {raw:?} must see every leaf's content dictionary"
+                );
+            }
+        });
+    }
+
+    /// An over-broad prefix whose expansion crosses the per-leaf cap is a
+    /// typed refusal that names the glob, never a silently truncated match
+    /// set.
+    ///
+    /// One document carries 32 distinct `docker`-prefixed tokens, and the
+    /// reader's `glob_expansion_limit` is 8, so the glob arm of the two-arm
+    /// `docker` lowering must refuse with
+    /// [`crate::index::QuillIndexError::Dictionary`] carrying
+    /// [`crate::grimoire::TermDictionaryError::GlobExpansionLimitExceeded`]
+    /// whose `pattern` is `docker*` — the pattern the engine exploded, not
+    /// just the field and the count.
+    #[test]
+    fn an_over_broad_prefix_refuses_typed_and_names_the_glob() {
+        let content = (0..32)
+            .map(|index| format!("docker{index:02}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let config = crate::QuillConfig {
+            glob_expansion_limit: 8,
+            ..crate::QuillConfig::default()
+        };
+
+        asupersync::test_utils::run_test_with_cx(move |cx| async move {
+            let directory = tempfile::tempdir().expect("cass index directory");
+            let index = crate::index::QuillIndex::create_with_schema(
+                &cx,
+                directory.path(),
+                crate::schema::CASS_SEMANTIC_SCHEMA,
+                crate::QuillConfig::default(),
+            )
+            .await
+            .expect("create a CASS-schema index");
+
+            let document = sample_document("broad", 0, "claude", "many dockers", &content)
+                .to_schema_document();
+            index
+                .index_schema_documents(&cx, std::slice::from_ref(&document))
+                .await
+                .expect("ingest the broad-prefix document");
+            index.commit(&cx).await.expect("publish the document");
+
+            let reader = crate::index::QuillSearchIndex::open_with_schema(
+                &cx,
+                directory.path(),
+                crate::schema::CASS_SEMANTIC_SCHEMA,
+                config,
+            )
+            .await
+            .expect("open the reader");
+
+            let parser = crate::query::CassQueryParser::new(crate::schema::CASS_SEMANTIC_SCHEMA)
+                .expect("build the CASS parser");
+            let filters = crate::query::CassQueryFilters::default();
+            let parsed = parser.parse("docker", &filters);
+            let error = reader
+                .search_preparsed_paginated(&cx, &parsed.query, 10, 0, true)
+                .expect_err("the over-broad prefix must refuse, not under-match");
+            match error {
+                crate::index::QuillIndexError::Dictionary(
+                    crate::grimoire::TermDictionaryError::GlobExpansionLimitExceeded {
+                        pattern,
+                        field_ord: _,
+                        limit,
+                        actual: _,
+                    },
+                ) => {
+                    assert_eq!(limit, 8, "the refusal must carry the configured cap");
+                    assert_eq!(
+                        pattern, "docker*",
+                        "the refusal must name the glob it exploded"
+                    );
+                }
+                other => panic!("the refusal must be the typed glob limit, got {other}"),
+            }
+        });
+    }
+
+    /// A two-arm query that cannot afford its own work refuses with the
+    /// typed fuel error, and a budget that fits completes the same query —
+    /// so the refusal is budget-driven, not data-driven.
+    #[test]
+    fn an_unaffordable_two_arm_query_refuses_with_the_typed_fuel_error() {
+        let content = (0..32)
+            .map(|index| format!("docker{index:02}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        asupersync::test_utils::run_test_with_cx(move |cx| async move {
+            let directory = tempfile::tempdir().expect("cass index directory");
+            let index = crate::index::QuillIndex::create_with_schema(
+                &cx,
+                directory.path(),
+                crate::schema::CASS_SEMANTIC_SCHEMA,
+                crate::QuillConfig::default(),
+            )
+            .await
+            .expect("create a CASS-schema index");
+
+            let document =
+                sample_document("fuel", 0, "claude", "many dockers", &content).to_schema_document();
+            index
+                .index_schema_documents(&cx, std::slice::from_ref(&document))
+                .await
+                .expect("ingest the fuel document");
+            index.commit(&cx).await.expect("publish the document");
+
+            let parser = crate::query::CassQueryParser::new(crate::schema::CASS_SEMANTIC_SCHEMA)
+                .expect("build the CASS parser");
+            let filters = crate::query::CassQueryFilters::default();
+            let parsed = parser.parse("docker", &filters);
+
+            let starved = crate::QuillConfig {
+                query_fuel_budget: 1,
+                ..crate::QuillConfig::default()
+            };
+            let reader = crate::index::QuillSearchIndex::open_with_schema(
+                &cx,
+                directory.path(),
+                crate::schema::CASS_SEMANTIC_SCHEMA,
+                starved,
+            )
+            .await
+            .expect("open the starved reader");
+            match reader.search_preparsed_paginated(&cx, &parsed.query, 10, 0, true) {
+                Err(crate::index::QuillIndexError::QueryFuelExhausted { budget, .. }) => {
+                    assert_eq!(budget, 1, "the refusal must carry the configured budget");
+                }
+                Err(other) => {
+                    panic!("the starved query must refuse as fuel exhaustion, got {other}")
+                }
+                Ok(result) => panic!(
+                    "a fuel budget of 1 cannot afford the two-arm query, yet it returned {} hits",
+                    result.total_count.unwrap_or_default()
+                ),
+            }
+
+            let fed = crate::index::QuillSearchIndex::open_with_schema(
+                &cx,
+                directory.path(),
+                crate::schema::CASS_SEMANTIC_SCHEMA,
+                crate::QuillConfig::default(),
+            )
+            .await
+            .expect("open the fed reader");
+            let result = fed
+                .search_preparsed_paginated(&cx, &parsed.query, 10, 0, true)
+                .expect("the default budget must afford the same query");
+            assert_eq!(
+                result.total_count,
+                Some(1),
+                "the default budget must afford the same query and find the document"
+            );
+        });
+    }
+
+    /// The CJK bigram lowering and the suffix/substring regex globs keep
+    /// their incumbent behavior under the two-arm exact/prefix lowering.
+    ///
+    /// A CJK query still decomposes to exact bigram terms over the four
+    /// searchable fields (no glob arm), and a `*`-suffix glob still matches
+    /// through the regex path over `content` and `title` — including for a
+    /// token past the prefix window.
+    #[test]
+    fn cjk_bigrams_and_regex_globs_keep_their_lowerings() {
+        let deep = deep_window_content("containerfile");
+
+        asupersync::test_utils::run_test_with_cx(move |cx| async move {
+            let directory = tempfile::tempdir().expect("cass index directory");
+            let index = crate::index::QuillIndex::create_with_schema(
+                &cx,
+                directory.path(),
+                crate::schema::CASS_SEMANTIC_SCHEMA,
+                crate::QuillConfig::default(),
+            )
+            .await
+            .expect("create a CASS-schema index");
+
+            let cjk = sample_document("cjk", 0, "claude", "搜索引擎", "这是一个搜索引擎测试")
+                .to_schema_document();
+            let deep =
+                sample_document("deep", 1, "codex", "unrelated title", &deep).to_schema_document();
+            index
+                .index_schema_documents(&cx, &[cjk, deep])
+                .await
+                .expect("ingest the regression documents");
+            index.commit(&cx).await.expect("publish the documents");
+
+            let reader = crate::index::QuillSearchIndex::open_with_schema(
+                &cx,
+                directory.path(),
+                crate::schema::CASS_SEMANTIC_SCHEMA,
+                crate::QuillConfig::default(),
+            )
+            .await
+            .expect("open the reader");
+
+            let parser = crate::query::CassQueryParser::new(crate::schema::CASS_SEMANTIC_SCHEMA)
+                .expect("build the CASS parser");
+            let filters = crate::query::CassQueryFilters::default();
+            for (raw, expected) in [
+                ("搜索引擎", 1_u64),
+                ("*file", 1),
+                ("containerfile", 1),
+                ("*ocker*", 0),
+            ] {
+                let parsed = parser.parse(raw, &filters);
+                let result = reader
+                    .search_preparsed_paginated(&cx, &parsed.query, 10, 0, true)
+                    .unwrap_or_else(|error| panic!("search {raw} must lower and run: {error}"));
+                assert_eq!(
+                    result.total_count,
+                    Some(expected),
+                    "regression query {raw:?} must keep its incumbent result"
+                );
+            }
+        });
+    }
+
     /// Ingest and query throughput for the CASS schema path.
     ///
     /// Opt-in (`--ignored`) and release-only to be meaningful. This is a
@@ -1202,7 +1586,10 @@ mod tests {
 
     /// An explicit prefix searches the full positional fields, including
     /// completions outside both historical edge-ngram bounds. The plain term
-    /// keeps its existing exact/edge-ngram behavior.
+    /// and its quoted-star normalization also match prefix extensions of the
+    /// term over the unwindowed content field through the two-arm glob arm
+    /// (amendment 1.0.4), so both name every content extension the explicit
+    /// prefix finds.
     #[test]
     fn explicit_ascii_prefixes_search_complete_fields_with_filters_and_pagination() {
         use std::collections::BTreeSet;
@@ -1287,7 +1674,6 @@ mod tests {
                 .map(|ordinal| documents[ordinal].id.clone())
                 .collect();
             let excluded: BTreeSet<_> = documents[82..].iter().map(|doc| doc.id.clone()).collect();
-            let exact = BTreeSet::from([documents[80].id.clone(), documents[81].id.clone()]);
             let compound = BTreeSet::from([documents[80].id.clone()]);
             let single_character: BTreeSet<_> = selected
                 .iter()
@@ -1314,8 +1700,8 @@ mod tests {
                     ("auth*".to_owned(), &scoped, &filtered),
                     ("a*".to_owned(), &scoped, &filtered),
                     (format!("sharedmarker NOT {PREFIX}*"), &defaults, &excluded),
-                    (PREFIX.to_owned(), &defaults, &exact),
-                    (format!("\"{PREFIX}*\""), &defaults, &exact),
+                    (PREFIX.to_owned(), &defaults, &selected),
+                    (format!("\"{PREFIX}*\""), &defaults, &selected),
                 ] {
                     let parsed = parser.parse(&raw, filters);
                     for exact_count in [false, true] {
