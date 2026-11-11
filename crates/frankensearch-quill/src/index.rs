@@ -8,7 +8,8 @@
 use std::borrow::Cow;
 #[cfg(test)]
 use std::cell::Cell;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
 use std::ops::{Bound, Deref};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -16656,12 +16657,180 @@ fn lower_leaf_string_predicate<'a>(
     }
 }
 
+/// One live cursor in a glob arm's doc-id merge. These are the same
+/// validated, checkpoint-metered movement adapters the per-term scorers
+/// drive ([`ValidatedArrivalCursor`] for sealed leaves,
+/// [`CheckpointPostingCursor`] for Delta leaves), held by their concrete
+/// types so the merge loop pays no per-document scorer dispatch on top of
+/// the cursor's own movement.
+enum GlobDocCursor<'a> {
+    Sealed(Box<ValidatedArrivalCursor<'a>>),
+    Delta(CheckpointPostingCursor<'a>),
+}
+
+impl GlobDocCursor<'_> {
+    fn doc(&self) -> Option<u32> {
+        match self {
+            Self::Sealed(cursor) => PostingCursor::doc(cursor),
+            Self::Delta(cursor) => PostingCursor::doc(cursor),
+        }
+    }
+
+    fn segment_num_docs(&self) -> u32 {
+        match self {
+            Self::Sealed(cursor) => PostingCursor::segment_num_docs(cursor),
+            Self::Delta(cursor) => PostingCursor::segment_num_docs(cursor),
+        }
+    }
+
+    fn size_hint(&self) -> u32 {
+        match self {
+            Self::Sealed(cursor) => PostingCursor::size_hint(cursor),
+            Self::Delta(cursor) => PostingCursor::size_hint(cursor),
+        }
+    }
+
+    fn next(&mut self) -> Result<Option<u32>, QuillIndexError> {
+        match self {
+            Self::Sealed(cursor) => cursor.next().map_err(QuillIndexError::from),
+            Self::Delta(cursor) => cursor.next().map_err(QuillIndexError::from),
+        }
+    }
+}
+
+/// Collect the exact unique document set of one glob arm's expansion on one
+/// leaf and field: a single ascending merge over the expanded terms' posting
+/// cursors, materialized straight into the document-id vector
+/// [`ReferenceScorer::constant_score_from_docids`] consumes.
+///
+/// The replaced lowering drove one term scorer per expansion through an
+/// unscored union and then drained that union through
+/// [`ReferenceScorer::constant_score`] — every posting paid the union's heap
+/// merge plus the drain's per-document dispatch, monotonicity check and
+/// vector-growth probe, all to produce a set whose members the cursors had
+/// already yielded. The merge here walks the same cursors with the same
+/// per-move fuel admissions, so the glob arm's cost tracks its posting-block
+/// decode work; a common-term arm costs the decode instead of a full
+/// scorer-chain materialization (profiled on the owner archive: decode was
+/// ~1% of the glob arm's lowered walk).
+///
+/// The typed [`TermDictionaryError::GlobExpansionLimitExceeded`] cap is
+/// unchanged: it is enforced by [`leaf_glob_terms`] before this collector
+/// runs, and a cancellation or fuel refusal during the walk propagates from
+/// the same cursor admissions the term scorers paid.
+///
+/// # Errors
+///
+/// Returns a typed error for an invalid string field, cursor or allocation
+/// failure, or a checkpoint refusal (cancellation or fuel exhaustion).
+fn collect_leaf_glob_docids(
+    checkpoint: &QueryCheckpointHandle<'_>,
+    leaf: QueryLeaf<'_>,
+    schema: SchemaDescriptor,
+    field_ord: u16,
+    terms: &[Vec<u8>],
+) -> Result<(Vec<u32>, u32), QuillIndexError> {
+    let mut cursors = Vec::new();
+    cursors
+        .try_reserve_exact(terms.len())
+        .map_err(|_| invalid_state("could not allocate glob doc cursors"))?;
+    for term in terms {
+        match leaf {
+            QueryLeaf::Sealed(segment) => {
+                // The open mirrors `lower_leaf_term`'s sealed arm admission
+                // for the dictionary lookup, so fuel and cancellation observe
+                // the same units at the same points.
+                checkpoint.admit(QueryWorkKind::DictionaryBlock, 1)?;
+                let (cursor, _fieldnorms) =
+                    open_sealed_term_cursor(segment, schema, field_ord, term, false, checkpoint)?;
+                #[cfg(feature = "profile-internals")]
+                checkpoint.record_term_dictionary_view();
+                cursors.push(GlobDocCursor::Sealed(Box::new(
+                    ValidatedArrivalCursor::new(
+                        cursor,
+                        clone_query_checkpoint_for_argus(checkpoint),
+                    ),
+                )));
+            }
+            QueryLeaf::Delta(delta) => {
+                let cursor =
+                    DeltaPostingCursor::new_admitted(delta, field_ord, term, checkpoint.as_ref())?;
+                cursors.push(GlobDocCursor::Delta(CheckpointPostingCursor::new(
+                    cursor,
+                    clone_query_checkpoint_for_argus(checkpoint),
+                )?));
+            }
+        }
+    }
+    if cursors.is_empty() {
+        return Ok((Vec::new(), 0));
+    }
+    // All cursors of one leaf share the same segment document count, which is
+    // the value the drained union reported through
+    // `shared_segment_num_docs`.
+    let segment_num_docs = cursors[0].segment_num_docs();
+    let total_hint: u64 = cursors
+        .iter()
+        .map(GlobDocCursor::size_hint)
+        .map(u64::from)
+        .sum();
+    let mut docids = Vec::new();
+    docids
+        .try_reserve(
+            usize::try_from(total_hint.min(1 << 20))
+                .map_err(|_| invalid_state("glob docid merge capacity does not fit usize"))?,
+        )
+        .map_err(|_| {
+            QuillIndexError::from(ArgusError::Allocation {
+                resource: "glob docid merge",
+                count: usize::try_from(total_hint).unwrap_or(usize::MAX),
+            })
+        })?;
+    // Ascending k-way merge: pop the smallest head, advance its cursor,
+    // reinsert the next doc. Duplicate heads collapse into one doc id, so
+    // every member contributes the arm's constant score exactly once —
+    // the same dedup the drained union performed.
+    let mut heap: BinaryHeap<Reverse<(u32, usize)>> = BinaryHeap::new();
+    for (slot, cursor) in cursors.iter().enumerate() {
+        if let Some(doc) = cursor.doc() {
+            heap.push(Reverse((doc, slot)));
+        }
+    }
+    let mut last: Option<u32> = None;
+    let mut since_poll = 0_u64;
+    while let Some(Reverse((doc, slot))) = heap.pop() {
+        if last != Some(doc) {
+            if docids.len() == docids.capacity() {
+                docids.try_reserve(1).map_err(|_| {
+                    QuillIndexError::from(ArgusError::Allocation {
+                        resource: "glob docid merge",
+                        count: docids.len().saturating_add(1),
+                    })
+                })?;
+            }
+            docids.push(doc);
+            last = Some(doc);
+        }
+        if let Some(next_doc) = cursors[slot].next()? {
+            heap.push(Reverse((next_doc, slot)));
+        }
+        since_poll += 1;
+        // The merge itself moves no cursor block, but a large expansion can
+        // spend real time here; surface cancellation on the same cadence the
+        // dictionary walks use.
+        if since_poll % 16 == 0 {
+            checkpoint.admit(QueryWorkKind::PostingBlock, 0)?;
+        }
+    }
+    Ok((docids, segment_num_docs))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn lower_leaf_glob<'a>(
     checkpoint: &QueryCheckpointHandle<'a>,
     leaf: QueryLeaf<'a>,
-    snapshot: &QuillSearchSnapshot,
-    prepared_doc_freqs: Option<&PreparedSnapshotDocFreqs>,
+    _snapshot: &QuillSearchSnapshot,
+    _prepared_doc_freqs: Option<&PreparedSnapshotDocFreqs>,
     schema: SchemaDescriptor,
     field_ids: &[u16],
     pattern: &[u8],
@@ -16682,17 +16851,11 @@ fn lower_leaf_glob<'a>(
             pattern,
             expansion_limit,
         )?;
-        let field_scorer = lower_leaf_string_predicate(
-            checkpoint,
-            leaf,
-            snapshot,
-            prepared_doc_freqs,
-            schema,
-            field_ord,
-            terms,
-            boost,
-            mode,
-        )?;
+        let (docids, segment_num_docs) =
+            collect_leaf_glob_docids(checkpoint, leaf, schema, field_ord, &terms)?;
+        let field_scorer =
+            ReferenceScorer::constant_score_from_docids(docids, segment_num_docs, boost)
+                .map_err(QuillIndexError::from)?;
         fields.push(ScorerClause::should(field_scorer));
     }
     lower_boolean(
@@ -31808,10 +31971,21 @@ mod tests {
     #[test]
     fn adversarial_glob_and_phrase_queries_exhaust_fuel_deterministically() {
         run_with_cx(|cx| async move {
+            // The glob leg pins the boundary from both sides. The bulk glob
+            // collector stopped charging the per-expanded-term
+            // doc-frequency probe the drained union paid for BM25 figures
+            // the constant score then discarded, so the fixture glob's
+            // boundary moved from budget 4 (old tuple `(4, 4, 1, 3, 0, 0)`
+            // refused) down to budget 3: the refusal consumes the segment
+            // touch, the expansion walk and the single term open (two
+            // dictionary blocks), and the completion leg below proves one
+            // more unit of budget finishes the same ranked query — so a
+            // future change that re-inflates glob admissions fails the
+            // completion leg instead of quietly shifting the boundary.
             let queries = [
                 (
-                    4,
-                    (4, 4, 1, 3, 0, 0),
+                    3,
+                    (3, 3, 1, 2, 0, 0),
                     Query::glob(Vec::from([CONTENT_FIELD]), "rust*".to_owned()),
                 ),
                 (
@@ -31853,6 +32027,38 @@ mod tests {
                 assert_eq!(fuel_diagnostics(&second), first, "query={query:?}");
                 assert_eq!(first, *expected, "query={query:?}");
             }
+
+            // Completion leg: one unit of budget past the glob boundary
+            // (budget 3 refuses above) must rank the whole fixture result
+            // with the arm's constant score.
+            let boundary = QuillIndex::in_memory(QuillConfig {
+                query_fuel_budget: 4,
+                deterministic_ingest: true,
+                ..QuillConfig::default()
+            })
+            .expect("memory index at the glob fuel boundary");
+            boundary
+                .index_documents(&cx, &fixture_documents())
+                .await
+                .expect("accumulate boundary fixture");
+            boundary
+                .commit(&cx)
+                .await
+                .expect("publish boundary fixture");
+            let boundary_snapshot = boundary
+                .search_snapshot()
+                .expect("boundary snapshot is authoritative");
+            let glob_query = &queries[0].2;
+            let completed = boundary
+                .execute_ranked_query(&cx, glob_query, &boundary_snapshot, 10, 0, true, Vec::new())
+                .expect("one unit past the boundary must complete the glob");
+            assert_eq!(completed.total_count, Some(2));
+            assert!(
+                completed
+                    .hits
+                    .iter()
+                    .all(|hit| hit.score.to_bits() == 1.0_f32.to_bits())
+            );
 
             let default = QuillIndex::in_memory(deterministic_config()).expect("memory index");
             default
