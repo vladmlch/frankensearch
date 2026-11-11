@@ -4245,6 +4245,53 @@ impl<'a> ReferenceScorer<'a> {
         })
     }
 
+    /// Build the same constant-score node [`Self::constant_score`] produces,
+    /// from a caller-collected document-id set instead of a drained child.
+    ///
+    /// The set must be strictly increasing — the exact invariant the drain
+    /// enforces on its child — and every member must be a live global document
+    /// id as reported by the validated cursors that produced it. This is the
+    /// bulk companion to the drain: the glob lowering collects matching doc
+    /// ids directly from the posting cursors (one tight merge walk, no
+    /// per-document scorer dispatch), so a common-term glob arm costs its
+    /// decode work instead of a full union-driven materialization.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a non-finite score or a set that is not strictly increasing.
+    pub fn constant_score_from_docids(
+        docids: Vec<u32>,
+        segment_num_docs: u32,
+        score: f32,
+    ) -> Result<Self, ArgusError> {
+        if !score.is_finite() {
+            return Err(ArgusError::InvalidConstantBoost {
+                boost_bits: score.to_bits(),
+            });
+        }
+        for pair in docids.windows(2) {
+            if pair[0] >= pair[1] {
+                return Err(ArgusError::CursorInvariant(
+                    "constant-score docids did not advance monotonically",
+                ));
+            }
+        }
+        if docids.is_empty() {
+            return Ok(Self::empty());
+        }
+        Ok(Self {
+            node: ScorerNode::ConstantScore(ConstantScoreScorer {
+                docids,
+                index: 0,
+                segment_num_docs,
+                score,
+            }),
+            subtree_nodes: 1,
+            #[cfg(feature = "pruning-conformance")]
+            construction_ordinal: None,
+        })
+    }
+
     /// Replace one movement-only scorer tree's score with a finite constant.
     ///
     /// This is the canonical lowering for predicates such as a bounded glob:
@@ -10035,6 +10082,60 @@ mod tests {
         assert!(matches!(
             ReferenceScorer::all_with_boost(7, 10, 2, f32::INFINITY),
             Err(ArgusError::InvalidAllBoost { boost_bits })
+                if boost_bits == f32::INFINITY.to_bits()
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn constant_score_from_docids_walks_the_set_and_rejects_bad_input()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut scorer = ReferenceScorer::constant_score_from_docids(vec![7, 9, 12], 4, 1.0)?;
+        assert_eq!(scorer.doc(), Some(7));
+        assert_eq!(scorer.cost(), 3);
+        assert_eq!(scorer.size_hint(), 3);
+        assert_eq!(scorer.segment_num_docs(), 4);
+        assert_eq!(scorer.score()?.to_bits(), 1.0_f32.to_bits());
+        assert_eq!(scorer.advance(8)?, Some(9));
+        assert_eq!(scorer.next()?, Some(12));
+        assert_eq!(scorer.next()?, None);
+        assert_eq!(scorer.next()?, None, "exhaustion is fused");
+        assert_eq!(
+            scorer.advance(0)?,
+            None,
+            "an exhausted scorer cannot resurrect"
+        );
+        assert!(matches!(
+            scorer.score(),
+            Err(ArgusError::CursorInvariant(
+                "cannot score an exhausted constant-score predicate"
+            ))
+        ));
+
+        let mut empty = ReferenceScorer::constant_score_from_docids(Vec::new(), 4, 1.0)?;
+        assert_eq!(empty.doc(), None);
+        assert_eq!(empty.next()?, None, "the empty set stays exhausted");
+
+        assert!(matches!(
+            ReferenceScorer::constant_score_from_docids(vec![9, 7], 4, 1.0),
+            Err(ArgusError::CursorInvariant(
+                "constant-score docids did not advance monotonically"
+            ))
+        ));
+        assert!(matches!(
+            ReferenceScorer::constant_score_from_docids(vec![7, 7], 4, 1.0),
+            Err(ArgusError::CursorInvariant(
+                "constant-score docids did not advance monotonically"
+            ))
+        ));
+        assert!(matches!(
+            ReferenceScorer::constant_score_from_docids(vec![7], 4, f32::NAN),
+            Err(ArgusError::InvalidConstantBoost { boost_bits })
+                if boost_bits == f32::NAN.to_bits()
+        ));
+        assert!(matches!(
+            ReferenceScorer::constant_score_from_docids(vec![7], 4, f32::INFINITY),
+            Err(ArgusError::InvalidConstantBoost { boost_bits })
                 if boost_bits == f32::INFINITY.to_bits()
         ));
         Ok(())
