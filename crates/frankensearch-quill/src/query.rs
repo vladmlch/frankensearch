@@ -5463,10 +5463,21 @@ impl CassQueryParser {
                     // `GlobExpansionLimitExceeded` refusal naming the pattern
                     // and a query whose expansion work exceeds the fuel
                     // budget is a typed `QueryFuelExhausted` refusal - never
-                    // a silent under-match. CJK literals keep the bigram
-                    // lowering below: the decomposition already covers the
-                    // unwindowed `content` field, and bigram globs would
-                    // explode the expansion.
+                    // a silent under-match. Because this exact arm walks the
+                    // same token over the full `content` field, the lowering
+                    // recognizes this two-arm shape (`two_arm_variants_glob`
+                    // in `index.rs`) and drops the glob arm's own literal term
+                    // from the expansion: every document that literal names
+                    // is already matched by the Term arm, and decoding its
+                    // posting list again was the single largest cost of a
+                    // common-term arm. The arm's constant boost therefore
+                    // lands on documents a proper extension of the term
+                    // pulled in (`errors`, not `error`); a document whose
+                    // only globset membership was the literal keeps its
+                    // Term-arm match and BM25 and loses only the flat boost.
+                    // CJK literals keep the bigram lowering below: the
+                    // decomposition already covers the unwindowed `content`
+                    // field, and bigram globs would explode the expansion.
                     return Ok(Some(Query::boolean(
                         Vec::from([
                             BooleanClause::new(
@@ -5475,10 +5486,7 @@ impl CassQueryParser {
                             ),
                             BooleanClause::new(
                                 Occur::Should,
-                                Query::glob(
-                                    Vec::from([self.fields.content]),
-                                    format!("{term}*"),
-                                ),
+                                Query::glob(Vec::from([self.fields.content]), format!("{term}*")),
                             ),
                         ]),
                         Some(BooleanOperator::Or),

@@ -92,8 +92,8 @@ use crate::keeper::{
 };
 use crate::query::{
     BooleanClause, BooleanOperator, DefaultQueryParser, Occur, Query, QueryCapabilityError,
-    QueryDiagnostic, QueryExplanation, QueryNode, QueryNodeId, QueryParserConfigError, QueryValue,
-    canonicalize_query, classify_query, validate_index_capabilities,
+    QueryClause, QueryDiagnostic, QueryExplanation, QueryNode, QueryNodeId, QueryParserConfigError,
+    QueryValue, canonicalize_query, classify_query, validate_index_capabilities,
 };
 use crate::quiver::{
     BlockMaxError, DocLenCodecError, DocLenField, DocLenSection, EncodedNumericSection,
@@ -17329,6 +17329,56 @@ fn lower_boolean<'a>(
     .map_err(QuillIndexError::from)
 }
 
+/// Detect the two-arm exact-or-glob Boolean that cass's grammar lowers
+/// every non-CJK exact and prefix literal into (see `lower_term_part` in
+/// `query.rs`): an explicit `Or` of one `Should(Term)` and one
+/// `Should(Glob)` over exactly one field, where that field is one of the
+/// Term arm's fields and the glob's pattern is the Term's own text plus a
+/// single trailing star. Returns the glob child's id.
+///
+/// Only for that shape — where the exact Term arm is guaranteed to walk the
+/// same token over the glob's one field, whatever schema number that field
+/// carries (the CASS schema's `content` is field 7, the engine default
+/// schema's is 1, so the check is by set membership, never by a hardcoded
+/// field constant) — may the glob arm drop its own literal term from the
+/// expansion: every document the literal's posting list names is already
+/// matched by the Boolean `Or`'s Term arm, so decoding it again only
+/// re-derived admitted documents, and it is the single largest posting
+/// list of a common-term expansion (on the owner archive, `error`'s
+/// literal term dominated its whole arm). The drop changes no matched
+/// document; it removes the arm's constant boost from documents whose only
+/// globset membership was the literal itself, which keep their Term-arm
+/// match and BM25 unchanged.
+///
+/// A shape this detector does not recognize — wrong operator, wrong
+/// occurrence, clause order swapped, a Term arm that skips the glob's
+/// field, a multi-field glob, a pattern with interior stars — returns
+/// `None` and the glob child lowers through the plain path with its
+/// literal intact, so the drop can never fire without its exact-arm
+/// guarantee.
+fn two_arm_variants_glob(
+    clauses: &[QueryClause],
+    query: &Query,
+    operator: Option<BooleanOperator>,
+) -> Option<QueryNodeId> {
+    if clauses.len() != 2
+        || operator != Some(BooleanOperator::Or)
+        || clauses.iter().any(|clause| clause.occur != Occur::Should)
+    {
+        return None;
+    }
+    let QueryNode::Term { fields, text } = query.node(clauses[0].query) else {
+        return None;
+    };
+    let QueryNode::Glob { field_ids, pattern } = query.node(clauses[1].query) else {
+        return None;
+    };
+    if field_ids.len() != 1 || !fields.iter().any(|field| field.field_id == field_ids[0]) {
+        return None;
+    }
+    (trailing_star_prefix(pattern.as_bytes()) == Some(text.as_bytes())).then_some(clauses[1].query)
+}
+
 fn lower_query_with_mode<'a>(
     cx: &Cx,
     checkpoint: &QueryCheckpointHandle<'a>,
@@ -17345,6 +17395,16 @@ fn lower_query_with_mode<'a>(
 ) -> Result<ReferenceScorer<'a>, QuillIndexError> {
     enum LowerTask {
         Visit {
+            node: QueryNodeId,
+            boost: f32,
+            topdocs_root: bool,
+        },
+        /// Visit a Glob child whose own literal term an accompanying exact
+        /// Term arm already walks over the glob's one field — the two-arm
+        /// shape cass's grammar lowers every non-CJK exact and prefix
+        /// literal into (see [`two_arm_variants_glob`]). The glob arm may
+        /// then drop that literal from its expansion.
+        VisitGlobVariants {
             node: QueryNodeId,
             boost: f32,
             topdocs_root: bool,
@@ -17379,37 +17439,41 @@ fn lower_query_with_mode<'a>(
         topdocs_root,
     });
     while let Some(task) = pending.pop() {
-        let LowerTask::Visit {
-            node,
-            boost: inherited_boost,
-            topdocs_root,
-        } = task
-        else {
-            let LowerTask::BuildBoolean { node, topdocs_root } = task else {
-                return Err(invalid_state("invalid query lowering task"));
-            };
-            let QueryNode::Boolean { clauses, .. } = query.node(node) else {
-                return Err(invalid_state("Boolean lowering task lost its query node"));
-            };
-            let mut lowered = Vec::new();
-            lowered
-                .try_reserve_exact(clauses.len())
-                .map_err(|_| invalid_state("could not allocate Boolean clauses"))?;
-            for clause in clauses.iter().rev() {
-                let scorer = values
-                    .pop()
-                    .ok_or_else(|| invalid_state("Boolean lowering lost a child scorer"))?;
-                lowered.push(ScorerClause::new(clause.occur, scorer));
-            }
-            lowered.reverse();
-            values.push(lower_boolean(
-                lowered,
-                mode,
+        let (node, inherited_boost, topdocs_root, exclude_glob_literal) = match task {
+            LowerTask::Visit {
+                node,
+                boost,
                 topdocs_root,
-                #[cfg(feature = "pruning-conformance")]
-                Some(checkpoint),
-            )?);
-            continue;
+            } => (node, boost, topdocs_root, false),
+            LowerTask::VisitGlobVariants {
+                node,
+                boost,
+                topdocs_root,
+            } => (node, boost, topdocs_root, true),
+            LowerTask::BuildBoolean { node, topdocs_root } => {
+                let QueryNode::Boolean { clauses, .. } = query.node(node) else {
+                    return Err(invalid_state("Boolean lowering task lost its query node"));
+                };
+                let mut lowered = Vec::new();
+                lowered
+                    .try_reserve_exact(clauses.len())
+                    .map_err(|_| invalid_state("could not allocate Boolean clauses"))?;
+                for clause in clauses.iter().rev() {
+                    let scorer = values
+                        .pop()
+                        .ok_or_else(|| invalid_state("Boolean lowering lost a child scorer"))?;
+                    lowered.push(ScorerClause::new(clause.occur, scorer));
+                }
+                lowered.reverse();
+                values.push(lower_boolean(
+                    lowered,
+                    mode,
+                    topdocs_root,
+                    #[cfg(feature = "pruning-conformance")]
+                    Some(checkpoint),
+                )?);
+                continue;
+            }
         };
 
         let scorer = match query.node(node) {
@@ -17574,12 +17638,33 @@ fn lower_query_with_mode<'a>(
                     )?
                 }
             }
-            QueryNode::Boolean { clauses, .. } => {
+            QueryNode::Boolean { clauses, operator } => {
                 pending.push(LowerTask::BuildBoolean { node, topdocs_root });
-                pending.extend(clauses.iter().rev().map(|clause| LowerTask::Visit {
-                    node: clause.query,
-                    boost: inherited_boost,
-                    topdocs_root: false,
+                // The two-arm exact-or-glob shape (see `two_arm_variants_glob`
+                // below) is the one place a glob arm's literal term is
+                // guaranteed covered by an accompanying exact Term walking
+                // the same token over the glob's field. Route its glob
+                // child through `VisitGlobVariants` so `lower_leaf_glob`
+                // can skip re-enumerating that literal — the single largest
+                // posting list of a common-term expansion, whose every
+                // document the Term arm already matched. A shape the
+                // detector does not recognize keeps the plain `Visit`, so
+                // the drop can never fire without its exact-arm guarantee.
+                let variants_glob = two_arm_variants_glob(clauses, query, *operator);
+                pending.extend(clauses.iter().rev().map(|clause| {
+                    if variants_glob == Some(clause.query) {
+                        LowerTask::VisitGlobVariants {
+                            node: clause.query,
+                            boost: inherited_boost,
+                            topdocs_root: false,
+                        }
+                    } else {
+                        LowerTask::Visit {
+                            node: clause.query,
+                            boost: inherited_boost,
+                            topdocs_root: false,
+                        }
+                    }
                 }));
                 continue;
             }
@@ -17631,6 +17716,7 @@ fn lower_query_with_mode<'a>(
                 inherited_boost,
                 glob_expansion_limit,
                 mode,
+                exclude_glob_literal,
             )?,
             QueryNode::Set { field_id, values } => lower_leaf_set(
                 checkpoint,
@@ -18491,19 +18577,32 @@ fn collect_leaf_glob_docids(
                 count: usize::try_from(total_hint).unwrap_or(usize::MAX),
             })
         })?;
-    // Ascending k-way merge: pop the smallest head, advance its cursor,
-    // reinsert the next doc. Duplicate heads collapse into one doc id, so
-    // every member contributes the arm's constant score exactly once —
-    // the same dedup the drained union performed.
-    let mut heap: BinaryHeap<Reverse<(u32, usize)>> = BinaryHeap::new();
+    // Ascending k-way merge over the smallest head. The head is read as an
+    // owned pair (no heap borrow crosses the loop body), its cursor
+    // advances, and on the common path the replacement doc id is written
+    // straight into the heap root through `peek_mut`, whose sift-down then
+    // early-exits whenever the same stream still holds the minimum — the
+    // hot shape for a common-term arm, where one term dominates the
+    // expansion and a pop-then-reinsert loop paid two full heap sifts per
+    // posting of exactly that stream (profiled on the owner archive: the
+    // reinsert push alone was ~65% of the arm's lowered walk). Duplicate
+    // heads collapse into one doc id, so every member contributes the arm's
+    // constant score exactly once — the same dedup the drained union
+    // performed. The slot rides the heap as a `u32`, keeping each entry
+    // eight bytes.
+    let mut heap: BinaryHeap<Reverse<(u32, u32)>> = BinaryHeap::new();
     for (slot, cursor) in cursors.iter().enumerate() {
-        if let Some(doc) = cursor.doc() {
-            heap.push(Reverse((doc, slot)));
-        }
+        let Some(doc) = cursor.doc() else {
+            continue;
+        };
+        let slot = u32::try_from(slot)
+            .map_err(|_| invalid_state("glob doc merge cursor slot overflows u32"))?;
+        heap.push(Reverse((doc, slot)));
     }
     let mut last: Option<u32> = None;
     let mut since_poll = 0_u64;
-    while let Some(Reverse((doc, slot))) = heap.pop() {
+    while let Some((doc, slot)) = heap.peek().map(|&Reverse(pair)| pair) {
+        let cursor_slot = slot as usize;
         if last != Some(doc) {
             if docids.len() == docids.capacity() {
                 docids.try_reserve(1).map_err(|_| {
@@ -18516,8 +18615,16 @@ fn collect_leaf_glob_docids(
             docids.push(doc);
             last = Some(doc);
         }
-        if let Some(next_doc) = cursors[slot].next()? {
-            heap.push(Reverse((next_doc, slot)));
+        match cursors[cursor_slot].next()? {
+            Some(next_doc) => {
+                let mut top = heap
+                    .peek_mut()
+                    .ok_or_else(|| invalid_state("glob doc merge lost its heap root"))?;
+                *top = Reverse((next_doc, slot));
+            }
+            None => {
+                heap.pop();
+            }
         }
         since_poll += 1;
         // The merge itself moves no cursor block, but a large expansion can
@@ -18542,13 +18649,14 @@ fn lower_leaf_glob<'a>(
     boost: f32,
     expansion_limit: usize,
     mode: QueryLoweringMode,
+    exclude_exact_literal: bool,
 ) -> Result<ReferenceScorer<'a>, QuillIndexError> {
     let mut fields = Vec::new();
     fields
         .try_reserve_exact(field_ids.len())
         .map_err(|_| invalid_state("could not allocate glob field clauses"))?;
     for &field_ord in field_ids {
-        let terms = leaf_glob_terms(
+        let mut terms = leaf_glob_terms(
             checkpoint,
             leaf,
             schema,
@@ -18556,6 +18664,22 @@ fn lower_leaf_glob<'a>(
             pattern,
             expansion_limit,
         )?;
+        if exclude_exact_literal {
+            // The accompanying exact arm (`two_arm_variants_glob` checked the
+            // two-arm shape before routing here) walks this same literal over
+            // the glob's one field, so every document the literal's posting
+            // list names is already matched by the Boolean `Or`'s Term arm.
+            // Dropping it skips the single largest posting decode of a
+            // common-term expansion; the arm's constant boost no longer
+            // lands on documents whose only globset membership was the
+            // literal itself, whose match and BM25 come from the Term arm
+            // unchanged. The expansion cap still fired on the unfiltered
+            // expansion inside `leaf_glob_terms`, so the typed
+            // `GlobExpansionLimitExceeded` contract is untouched.
+            if let Some(literal) = trailing_star_prefix(pattern) {
+                terms.retain(|term| term.as_slice() != literal);
+            }
+        }
         let (docids, segment_num_docs) =
             collect_leaf_glob_docids(checkpoint, leaf, schema, field_ord, &terms)?;
         let field_scorer =
@@ -34295,6 +34419,152 @@ mod tests {
                 }
             }
         });
+    }
+
+    #[test]
+    fn two_arm_variants_glob_recognizes_only_the_exact_arm_shape() {
+        use crate::query::QueryField;
+
+        // The CASS grammar's two-arm shape: Term over a field set that
+        // includes the glob's single field, glob pattern = the term plus one
+        // trailing star, explicit Or, both clauses Should, Term first.
+        let canonical_term = Query::term(
+            Vec::from([
+                QueryField::new(6, 1.0),
+                QueryField::new(7, 1.0),
+                QueryField::new(8, 1.0),
+                QueryField::new(9, 1.0),
+            ]),
+            "error".to_owned(),
+        );
+        let canonical_glob = Query::glob(Vec::from([7]), "error*".to_owned());
+        let arena = Query::boolean(
+            Vec::from([
+                BooleanClause::new(Occur::Should, canonical_term),
+                BooleanClause::new(Occur::Should, canonical_glob),
+            ]),
+            Some(BooleanOperator::Or),
+        );
+        let QueryNode::Boolean { clauses, operator } = arena.node(arena.root_id()) else {
+            panic!("the fixture must build a Boolean root");
+        };
+        assert_eq!(
+            two_arm_variants_glob(clauses, &arena, *operator),
+            Some(clauses[1].query),
+            "the canonical two-arm shape must route its glob child through the literal drop"
+        );
+
+        // Every near-miss keeps its literal: the detector only fires when
+        // the exact arm's coverage is guaranteed by the shape itself.
+        let term_over = |field_ids: &[u16], text: &str| {
+            Query::term(
+                field_ids
+                    .iter()
+                    .copied()
+                    .map(|field_id| QueryField::new(field_id, 1.0))
+                    .collect(),
+                text.to_owned(),
+            )
+        };
+        let glob_over =
+            |field_ids: &[u16], pattern: &str| Query::glob(field_ids.to_vec(), pattern.to_owned());
+        let near_misses = [
+            // Explicit And, and no explicit operator at all.
+            (
+                term_over(&[6, 7], "error"),
+                glob_over(&[7], "error*"),
+                Some(BooleanOperator::And),
+                Occur::Should,
+            ),
+            (
+                term_over(&[6, 7], "error"),
+                glob_over(&[7], "error*"),
+                None,
+                Occur::Should,
+            ),
+            // Required or forbidden Term arm.
+            (
+                term_over(&[6, 7], "error"),
+                glob_over(&[7], "error*"),
+                Some(BooleanOperator::Or),
+                Occur::Must,
+            ),
+            (
+                term_over(&[6, 7], "error"),
+                glob_over(&[7], "error*"),
+                Some(BooleanOperator::Or),
+                Occur::MustNot,
+            ),
+            // Term arm that skips the glob's field.
+            (
+                term_over(&[6], "error"),
+                glob_over(&[7], "error*"),
+                Some(BooleanOperator::Or),
+                Occur::Should,
+            ),
+            // Multi-field glob.
+            (
+                term_over(&[6, 7], "error"),
+                glob_over(&[7, 6], "error*"),
+                Some(BooleanOperator::Or),
+                Occur::Should,
+            ),
+            // Pattern is not the term plus one trailing star.
+            (
+                term_over(&[6, 7], "error"),
+                glob_over(&[7], "errors*"),
+                Some(BooleanOperator::Or),
+                Occur::Should,
+            ),
+            (
+                term_over(&[6, 7], "error"),
+                glob_over(&[7], "err*r"),
+                Some(BooleanOperator::Or),
+                Occur::Should,
+            ),
+            (
+                term_over(&[6, 7], "error"),
+                glob_over(&[7], "error"),
+                Some(BooleanOperator::Or),
+                Occur::Should,
+            ),
+        ];
+        for (term, glob, operator, occur) in near_misses {
+            let arena = Query::boolean(
+                Vec::from([
+                    BooleanClause::new(occur, term),
+                    BooleanClause::new(Occur::Should, glob),
+                ]),
+                operator,
+            );
+            let QueryNode::Boolean { clauses, operator } = arena.node(arena.root_id()) else {
+                panic!("the fixture must build a Boolean root");
+            };
+            assert_eq!(
+                two_arm_variants_glob(clauses, &arena, *operator),
+                None,
+                "a shape without the exact-arm guarantee must keep its glob literal"
+            );
+        }
+
+        // Clause order swapped: glob first must not fire either — the
+        // detector pins the grammar's construction order, and a miss is
+        // always the conservative plain path.
+        let arena = Query::boolean(
+            Vec::from([
+                BooleanClause::new(Occur::Should, glob_over(&[7], "error*")),
+                BooleanClause::new(Occur::Should, term_over(&[6, 7], "error")),
+            ]),
+            Some(BooleanOperator::Or),
+        );
+        let QueryNode::Boolean { clauses, operator } = arena.node(arena.root_id()) else {
+            panic!("the fixture must build a Boolean root");
+        };
+        assert_eq!(
+            two_arm_variants_glob(clauses, &arena, *operator),
+            None,
+            "a swapped clause order must keep its glob literal"
+        );
     }
 
     #[test]
