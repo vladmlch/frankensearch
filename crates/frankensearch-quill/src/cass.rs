@@ -782,6 +782,119 @@ mod tests {
         });
     }
 
+    /// The two-arm glob arm skips its own literal term, not its matches.
+    ///
+    /// Two deep-tail documents past the 4 KiB window: one whose only
+    /// matching token is the query literal itself (`error`) and one whose
+    /// only match is a proper extension (`errors`). The bare-term query
+    /// must keep finding both — the literal document through the exact
+    /// Term arm over the unwindowed `content` field, the variant document
+    /// through the glob arm. Because the exact arm accompanies it, the
+    /// glob arm drops its own literal from the expansion
+    /// (`two_arm_variants_glob` in `index.rs`): the flat boost lands only
+    /// on the variant document, and the literal document's whole two-arm
+    /// score equals the exact arm alone — the same BM25 a content-only
+    /// Term query reports — where the arm used to add the flat boost to
+    /// every literal document as well.
+    #[test]
+    fn two_arm_glob_arm_skips_its_literal_not_its_matches() {
+        let literal_content = deep_window_content("error");
+        let variant_content = deep_window_content("errors");
+
+        asupersync::test_utils::run_test_with_cx(move |cx| async move {
+            let directory = tempfile::tempdir().expect("cass index directory");
+            let index = crate::index::QuillIndex::create_with_schema(
+                &cx,
+                directory.path(),
+                crate::schema::CASS_SEMANTIC_SCHEMA,
+                crate::QuillConfig::default(),
+            )
+            .await
+            .expect("create a CASS-schema index");
+
+            let literal = sample_document(
+                "literalhit",
+                0,
+                "claude",
+                "unrelated title",
+                &literal_content,
+            )
+            .to_schema_document();
+            let variant =
+                sample_document("varianthit", 1, "codex", "another title", &variant_content)
+                    .to_schema_document();
+            index
+                .index_schema_documents(&cx, &[literal, variant])
+                .await
+                .expect("ingest both deep-tail documents");
+            index.commit(&cx).await.expect("publish the documents");
+
+            let reader = crate::index::QuillSearchIndex::open_with_schema(
+                &cx,
+                directory.path(),
+                crate::schema::CASS_SEMANTIC_SCHEMA,
+                crate::QuillConfig::default(),
+            )
+            .await
+            .expect("open the reader");
+
+            let parser = crate::query::CassQueryParser::new(crate::schema::CASS_SEMANTIC_SCHEMA)
+                .expect("build the CASS parser");
+            let filters = crate::query::CassQueryFilters::default();
+            let parsed = parser.parse("error", &filters);
+            let page = reader
+                .search_preparsed_paginated(&cx, &parsed.query, 10, 0, true)
+                .expect("the bare term must lower and run");
+            assert_eq!(
+                page.total_count,
+                Some(2),
+                "the literal and the variant deep-tail documents must both stay hits"
+            );
+
+            let literal_score = page
+                .hits
+                .iter()
+                .find(|hit| hit.document_id.starts_with("literalhit#"))
+                .expect("the literal-only document must be a hit")
+                .score;
+            let variant_score = page
+                .hits
+                .iter()
+                .find(|hit| hit.document_id.starts_with("varianthit#"))
+                .expect("the variant-only document must be a hit")
+                .score;
+            assert_eq!(
+                variant_score.to_bits(),
+                1.0_f32.to_bits(),
+                "the variant document matches through the glob arm alone and must carry exactly its flat boost"
+            );
+
+            // The exact arm alone — a Term over just the unwindowed `content`
+            // field — reports the literal document's whole two-arm score:
+            // its title and windowed prefix columns carry no `error` token
+            // or gram, and the glob arm's post-drop expansion (`errors`)
+            // does not contain it.
+            let content_term = crate::query::Query::term(
+                Vec::from([crate::query::QueryField::new(field::CONTENT, 1.0)]),
+                "error".to_owned(),
+            );
+            let oracle = reader
+                .search_preparsed_paginated(&cx, &content_term, 10, 0, true)
+                .expect("the content-term oracle must run");
+            let oracle_score = oracle
+                .hits
+                .iter()
+                .find(|hit| hit.document_id.starts_with("literalhit#"))
+                .expect("the content term must match the literal document")
+                .score;
+            assert_eq!(
+                literal_score.to_bits(),
+                oracle_score.to_bits(),
+                "the literal-only document's two-arm score must equal the exact arm alone"
+            );
+        });
+    }
+
     /// An over-broad prefix whose expansion crosses the per-leaf cap is a
     /// typed refusal that names the glob, never a silently truncated match
     /// set.
