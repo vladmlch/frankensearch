@@ -1798,12 +1798,10 @@ dependencies = [
 name = "frankensearch-durability"
 version = "0.4.0"
 dependencies = [
+ "asupersync",
  "crc32fast",
  "criterion",
  "frankensearch-core 0.4.0",
- "fsqlite-core",
- "fsqlite-error",
- "fsqlite-types",
  "libc",
  "memmap2",
  "raptorq",

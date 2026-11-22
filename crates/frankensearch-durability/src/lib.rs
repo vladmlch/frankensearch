@@ -3,7 +3,7 @@
 //! Durability primitives for frankensearch.
 //!
 //! This crate provides a thin, library-focused integration layer around
-//! `FrankenSQLite`'s `RaptorQ` abstractions (`SymbolCodec`) plus:
+//! local `RaptorQ` symbol-codec abstractions (`SymbolCodec`) plus:
 //! - binary repair-trailer I/O,
 //! - file protection / verification / repair orchestration,
 //! - durability telemetry counters.
@@ -29,9 +29,9 @@ pub mod metrics;
 pub mod repair_trailer;
 
 pub use codec::{
-    CodecFacade, DecodeFailureClass, DecodedPayload, DefaultSymbolCodec, EncodedData,
-    EncodedPayload, RepairCodec, RepairCodecConfig, RepairData, VerifyResult,
-    classify_decode_failure,
+    CodecCx, CodecDecodeResult, CodecEncodeResult, CodecFacade, DecodeFailureClass,
+    DecodeFailureReason, DecodedPayload, DefaultSymbolCodec, EncodedData, EncodedPayload,
+    RepairCodec, RepairCodecConfig, RepairData, SymbolCodec, VerifyResult, classify_decode_failure,
 };
 pub use config::DurabilityConfig;
 pub use file_protector::{

@@ -3,17 +3,98 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Instant;
 
+use asupersync::Cx;
+use asupersync::cx::cap;
 use frankensearch_core::{SearchError, SearchResult};
-use fsqlite_core::raptorq_integration::{
-    CodecDecodeResult, CodecEncodeResult, DecodeFailureReason, SymbolCodec,
-};
-use fsqlite_types::cx::Cx;
 use raptorq::{Decoder, Encoder, EncodingPacket, ObjectTransmissionInformation, PayloadId};
 use tracing::{debug, warn};
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::config::DurabilityConfig;
 use crate::metrics::{DecodeOutcomeClass, DurabilityMetrics};
+
+/// Capability-free view of the ambient [`Cx`] handed to codec implementations.
+///
+/// Codecs need cancellation observability (`checkpoint()`), not runtime
+/// effect capabilities, so the trait is typed at `cap::None`. [`CodecFacade`]
+/// sources this from the ambient runtime context via `restrict` when one is
+/// installed — preserving cancellation propagation — and otherwise falls back
+/// to [`Cx::detached_cancel_context`], mirroring how `frankensearch-storage`
+/// bridges a native `Cx` into foreign codec contexts.
+pub type CodecCx = Cx<cap::None>;
+
+/// Abstraction over the actual `RaptorQ` encode/decode engine.
+///
+/// Production codecs wrap the `raptorq` crate (or asupersync's `RaptorQ`
+/// pipeline); tests may substitute mocks.
+pub trait SymbolCodec: Send + Sync + fmt::Debug {
+    /// Encode source data into source + repair symbols.
+    fn encode(
+        &self,
+        cx: &CodecCx,
+        source_data: &[u8],
+        symbol_size: u32,
+        repair_overhead: f64,
+    ) -> SearchResult<CodecEncodeResult>;
+
+    /// Decode from received symbols.
+    fn decode(
+        &self,
+        cx: &CodecCx,
+        symbols: &[(u32, Vec<u8>)],
+        k_source: u32,
+        symbol_size: u32,
+    ) -> SearchResult<CodecDecodeResult>;
+}
+
+/// Raw encode result from the codec.
+#[derive(Debug, Clone)]
+pub struct CodecEncodeResult {
+    /// Source symbols: `(esi, data)`.
+    pub source_symbols: Vec<(u32, Vec<u8>)>,
+    /// Repair symbols: `(esi, data)`.
+    pub repair_symbols: Vec<(u32, Vec<u8>)>,
+    /// Number of source symbols K.
+    pub k_source: u32,
+}
+
+/// Raw decode result from the codec.
+#[derive(Debug, Clone)]
+pub enum CodecDecodeResult {
+    /// Decode succeeded.
+    Success {
+        /// Recovered source data.
+        data: Vec<u8>,
+        /// Number of symbols consumed.
+        symbols_used: u32,
+        /// Symbols resolved by peeling.
+        peeled_count: u32,
+        /// Symbols resolved by Gaussian elimination (inactive subsystem).
+        inactivated_count: u32,
+    },
+    /// Decode failed.
+    Failure {
+        /// Reason for failure.
+        reason: DecodeFailureReason,
+        /// Number of symbols that were received.
+        symbols_received: u32,
+        /// Source symbols required.
+        k_required: u32,
+    },
+}
+
+/// Reasons a decode can fail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodeFailureReason {
+    /// Fewer symbols than K available.
+    InsufficientSymbols,
+    /// The decoding matrix is singular (rank deficient).
+    SingularMatrix,
+    /// Symbol sizes do not match the expected T.
+    SymbolSizeMismatch,
+    /// Cancelled via `Cx::checkpoint()`.
+    Cancelled,
+}
 
 /// Encoded source+repair symbols and metadata.
 #[derive(Debug, Clone)]
@@ -60,33 +141,36 @@ impl DefaultSymbolCodec {
 impl SymbolCodec for DefaultSymbolCodec {
     fn encode(
         &self,
-        _cx: &Cx,
+        _cx: &CodecCx,
         source_data: &[u8],
         symbol_size: u32,
         repair_overhead: f64,
-    ) -> fsqlite_error::Result<CodecEncodeResult> {
+    ) -> SearchResult<CodecEncodeResult> {
         if symbol_size == 0 {
-            return Err(fsqlite_error::FrankenError::OutOfRange {
-                what: "symbol_size".to_owned(),
+            return Err(SearchError::InvalidConfig {
+                field: "symbol_size".to_owned(),
                 value: "0".to_owned(),
+                reason: "must be greater than zero".to_owned(),
             });
         }
         let symbol_size_u16 =
-            u16::try_from(symbol_size).map_err(|_| fsqlite_error::FrankenError::OutOfRange {
-                what: "symbol_size as u16".to_owned(),
+            u16::try_from(symbol_size).map_err(|_| SearchError::InvalidConfig {
+                field: "symbol_size".to_owned(),
                 value: symbol_size.to_string(),
+                reason: "cannot convert symbol_size to u16".to_owned(),
             })?;
 
         let k_source = source_data.len().div_ceil(symbol_size as usize).max(1);
-        let k_source_u32 =
-            u32::try_from(k_source).map_err(|_| fsqlite_error::FrankenError::OutOfRange {
-                what: "k_source as u32".to_owned(),
-                value: k_source.to_string(),
-            })?;
+        let k_source_u32 = u32::try_from(k_source).map_err(|_| SearchError::InvalidConfig {
+            field: "k_source".to_owned(),
+            value: k_source.to_string(),
+            reason: "cannot convert k_source to u32".to_owned(),
+        })?;
         if k_source_u32 > MAX_SOURCE_SYMBOLS_PER_BLOCK {
-            return Err(fsqlite_error::FrankenError::OutOfRange {
-                what: "k_source (exceeds single RaptorQ source block limit)".to_owned(),
+            return Err(SearchError::InvalidConfig {
+                field: "k_source".to_owned(),
                 value: k_source_u32.to_string(),
+                reason: "exceeds single RaptorQ source block limit".to_owned(),
             });
         }
 
@@ -105,21 +189,23 @@ impl SymbolCodec for DefaultSymbolCodec {
         // zero-padded by the encoder. The caller truncates decoded output back
         // to the original `source_data.len()` using the stored source hash.
         let transfer_length = u64::try_from(k_source.saturating_mul(symbol_size as usize))
-            .map_err(|_| fsqlite_error::FrankenError::OutOfRange {
-                what: "transfer_length".to_owned(),
+            .map_err(|_| SearchError::InvalidConfig {
+                field: "transfer_length".to_owned(),
                 value: format!("{}*{}", k_source, symbol_size),
+                reason: "cannot convert transfer_length to u64".to_owned(),
             })?;
         let config = Self::object_transmission_info(transfer_length, symbol_size_u16);
         let encoder = Encoder::new(source_data, config);
 
         let requested_repair = if repair_overhead.is_finite() && repair_overhead > 0.0 {
             let requested = (f64::from(k_source_u32) * repair_overhead).ceil();
-            format!("{requested:.0}").parse::<u32>().map_err(|_| {
-                fsqlite_error::FrankenError::OutOfRange {
-                    what: "requested_repair as u32".to_owned(),
+            format!("{requested:.0}")
+                .parse::<u32>()
+                .map_err(|_| SearchError::InvalidConfig {
+                    field: "requested_repair".to_owned(),
                     value: requested.to_string(),
-                }
-            })?
+                    reason: "cannot convert requested_repair count to u32".to_owned(),
+                })?
         } else {
             0
         };
@@ -150,11 +236,11 @@ impl SymbolCodec for DefaultSymbolCodec {
 
     fn decode(
         &self,
-        _cx: &Cx,
+        _cx: &CodecCx,
         symbols: &[(u32, Vec<u8>)],
         k_source: u32,
         symbol_size: u32,
-    ) -> fsqlite_error::Result<CodecDecodeResult> {
+    ) -> SearchResult<CodecDecodeResult> {
         if k_source == 0 {
             return Ok(CodecDecodeResult::Failure {
                 reason: DecodeFailureReason::InsufficientSymbols,
@@ -171,9 +257,10 @@ impl SymbolCodec for DefaultSymbolCodec {
             });
         }
         let symbol_size_u16 =
-            u16::try_from(symbol_size).map_err(|_| fsqlite_error::FrankenError::OutOfRange {
-                what: "symbol_size as u16".to_owned(),
+            u16::try_from(symbol_size).map_err(|_| SearchError::InvalidConfig {
+                field: "symbol_size".to_owned(),
                 value: symbol_size.to_string(),
+                reason: "cannot convert symbol_size to u16".to_owned(),
             })?;
         let symbol_size_usize = symbol_size as usize;
 
@@ -318,7 +405,7 @@ impl CodecFacade {
 
     pub fn encode(&self, source_data: &[u8]) -> SearchResult<EncodedPayload> {
         let t0 = Instant::now();
-        let cx = Cx::new();
+        let cx = codec_cx();
         let mut result = self
             .codec
             .encode(
@@ -450,7 +537,7 @@ impl CodecFacade {
             ));
         }
 
-        let cx = Cx::new();
+        let cx = codec_cx();
         let outcome = self
             .codec
             .decode(&cx, symbols, k_source, symbol_size)
@@ -733,6 +820,19 @@ pub const fn classify_decode_failure(reason: DecodeFailureReason) -> DecodeFailu
     }
 }
 
+/// Capability-free codec context for one encode/decode call.
+///
+/// Prefers the ambient runtime `Cx` narrowed to `cap::None` so caller
+/// cancellation still reaches `checkpoint()`; outside a runtime task (sync
+/// callers, tests) falls back to a detached cancel context. asupersync exposes
+/// no public `Cx<cap::All>` constructor outside `test-internals`, and codecs
+/// need no effect capabilities anyway.
+fn codec_cx() -> CodecCx {
+    Cx::current().map_or_else(Cx::<cap::None>::detached_cancel_context, |cx| {
+        cx.restrict::<cap::None>()
+    })
+}
+
 fn map_codec_error<E>(error: E) -> SearchError
 where
     E: std::error::Error + Send + Sync + 'static,
@@ -861,11 +961,11 @@ fn saturating_u64_from_u128(value: u128) -> u64 {
 mod tests {
     use std::sync::Arc;
 
-    use fsqlite_core::raptorq_integration::{CodecDecodeResult, CodecEncodeResult, SymbolCodec};
-    use fsqlite_error::FrankenError;
+    use frankensearch_core::{SearchError, SearchResult};
 
     use super::{
-        CodecFacade, Cx, DecodeFailureClass, DecodedPayload, DefaultSymbolCodec, RepairData,
+        CodecCx, CodecDecodeResult, CodecEncodeResult, CodecFacade, DecodeFailureClass,
+        DecodeFailureReason, DecodedPayload, DefaultSymbolCodec, RepairData, SymbolCodec,
         VerifyResult, classify_decode_failure,
     };
     use crate::config::DurabilityConfig;
@@ -873,17 +973,17 @@ mod tests {
 
     #[derive(Debug)]
     struct MockCodec {
-        fail_decode_reason: Option<fsqlite_core::raptorq_integration::DecodeFailureReason>,
+        fail_decode_reason: Option<DecodeFailureReason>,
     }
 
     impl SymbolCodec for MockCodec {
         fn encode(
             &self,
-            _cx: &Cx,
+            _cx: &CodecCx,
             source_data: &[u8],
             symbol_size: u32,
             _repair_overhead: f64,
-        ) -> fsqlite_error::Result<CodecEncodeResult> {
+        ) -> SearchResult<CodecEncodeResult> {
             let symbol_size_usize = usize::try_from(symbol_size).unwrap_or(1);
             let k_source_usize = source_data.len().div_ceil(symbol_size_usize).max(1);
             let k_source = u32::try_from(k_source_usize).unwrap_or(u32::MAX);
@@ -919,11 +1019,11 @@ mod tests {
 
         fn decode(
             &self,
-            _cx: &Cx,
+            _cx: &CodecCx,
             symbols: &[(u32, Vec<u8>)],
             k_source: u32,
             symbol_size: u32,
-        ) -> fsqlite_error::Result<CodecDecodeResult> {
+        ) -> SearchResult<CodecDecodeResult> {
             if let Some(reason) = self.fail_decode_reason {
                 return Ok(CodecDecodeResult::Failure {
                     reason,
@@ -938,8 +1038,7 @@ mod tests {
                 .any(|(_, data)| data.len() != symbol_size_usize)
             {
                 return Ok(CodecDecodeResult::Failure {
-                    reason:
-                        fsqlite_core::raptorq_integration::DecodeFailureReason::SymbolSizeMismatch,
+                    reason: DecodeFailureReason::SymbolSizeMismatch,
                     symbols_received: u32::try_from(symbols.len()).unwrap_or(u32::MAX),
                     k_required: k_source,
                 });
@@ -947,8 +1046,7 @@ mod tests {
 
             if symbols.is_empty() {
                 return Ok(CodecDecodeResult::Failure {
-                    reason:
-                        fsqlite_core::raptorq_integration::DecodeFailureReason::InsufficientSymbols,
+                    reason: DecodeFailureReason::InsufficientSymbols,
                     symbols_received: 0,
                     k_required: k_source,
                 });
@@ -969,22 +1067,22 @@ mod tests {
     impl SymbolCodec for ErrorCodec {
         fn encode(
             &self,
-            _cx: &Cx,
+            _cx: &CodecCx,
             _source_data: &[u8],
             _symbol_size: u32,
             _repair_overhead: f64,
-        ) -> fsqlite_error::Result<CodecEncodeResult> {
-            Err(FrankenError::Internal("encode boom".to_owned()))
+        ) -> SearchResult<CodecEncodeResult> {
+            Err(SearchError::Io(std::io::Error::other("encode boom")))
         }
 
         fn decode(
             &self,
-            _cx: &Cx,
+            _cx: &CodecCx,
             _symbols: &[(u32, Vec<u8>)],
             _k_source: u32,
             _symbol_size: u32,
-        ) -> fsqlite_error::Result<CodecDecodeResult> {
-            Err(FrankenError::Internal("decode boom".to_owned()))
+        ) -> SearchResult<CodecDecodeResult> {
+            Err(SearchError::Io(std::io::Error::other("decode boom")))
         }
     }
 
@@ -1056,7 +1154,7 @@ mod tests {
             decoded,
             DecodedPayload::Failure {
                 class: DecodeFailureClass::Recoverable,
-                reason: fsqlite_core::raptorq_integration::DecodeFailureReason::InsufficientSymbols,
+                reason: DecodeFailureReason::InsufficientSymbols,
                 ..
             }
         ));
@@ -1084,7 +1182,7 @@ mod tests {
             decoded,
             DecodedPayload::Failure {
                 class: DecodeFailureClass::Unrecoverable,
-                reason: fsqlite_core::raptorq_integration::DecodeFailureReason::SymbolSizeMismatch,
+                reason: DecodeFailureReason::SymbolSizeMismatch,
                 ..
             }
         ));
@@ -1137,9 +1235,7 @@ mod tests {
         let metrics = Arc::new(DurabilityMetrics::default());
         let facade = CodecFacade::new(
             Arc::new(MockCodec {
-                fail_decode_reason: Some(
-                    fsqlite_core::raptorq_integration::DecodeFailureReason::InsufficientSymbols,
-                ),
+                fail_decode_reason: Some(DecodeFailureReason::InsufficientSymbols),
             }),
             DurabilityConfig::default(),
             Arc::clone(&metrics),
@@ -1420,9 +1516,7 @@ mod tests {
     fn repair_returns_error_for_decode_failures() {
         let facade = CodecFacade::new(
             Arc::new(MockCodec {
-                fail_decode_reason: Some(
-                    fsqlite_core::raptorq_integration::DecodeFailureReason::SymbolSizeMismatch,
-                ),
+                fail_decode_reason: Some(DecodeFailureReason::SymbolSizeMismatch),
             }),
             DurabilityConfig::default(),
             Arc::new(DurabilityMetrics::default()),
@@ -1545,15 +1639,11 @@ mod tests {
     #[test]
     fn failure_reason_classification_is_stable() {
         assert_eq!(
-            classify_decode_failure(
-                fsqlite_core::raptorq_integration::DecodeFailureReason::InsufficientSymbols
-            ),
+            classify_decode_failure(DecodeFailureReason::InsufficientSymbols),
             DecodeFailureClass::Recoverable
         );
         assert_eq!(
-            classify_decode_failure(
-                fsqlite_core::raptorq_integration::DecodeFailureReason::SymbolSizeMismatch
-            ),
+            classify_decode_failure(DecodeFailureReason::SymbolSizeMismatch),
             DecodeFailureClass::Unrecoverable
         );
     }
@@ -1691,9 +1781,7 @@ mod tests {
     #[test]
     fn singular_matrix_failure_is_recoverable() {
         assert_eq!(
-            classify_decode_failure(
-                fsqlite_core::raptorq_integration::DecodeFailureReason::SingularMatrix
-            ),
+            classify_decode_failure(DecodeFailureReason::SingularMatrix),
             DecodeFailureClass::Recoverable
         );
     }
@@ -1701,9 +1789,7 @@ mod tests {
     #[test]
     fn cancelled_failure_is_recoverable() {
         assert_eq!(
-            classify_decode_failure(
-                fsqlite_core::raptorq_integration::DecodeFailureReason::Cancelled
-            ),
+            classify_decode_failure(DecodeFailureReason::Cancelled),
             DecodeFailureClass::Recoverable
         );
     }

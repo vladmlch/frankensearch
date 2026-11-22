@@ -11,11 +11,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use frankensearch_core::{SearchError, SearchResult};
-use fsqlite_core::raptorq_integration::SymbolCodec;
 use memmap2::Mmap;
 use tracing::{debug, info, warn};
 use xxhash_rust::xxh3::xxh3_64;
 
+use crate::codec::SymbolCodec;
 use crate::config::DurabilityConfig;
 use crate::file_protector::{FileProtector, FileRepairOutcome};
 use crate::metrics::DurabilityMetrics;
@@ -473,10 +473,12 @@ mod tests {
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use fsqlite_core::raptorq_integration::{CodecDecodeResult, CodecEncodeResult, SymbolCodec};
-    use fsqlite_types::cx::Cx;
+    use frankensearch_core::SearchResult;
 
     use super::{FsviProtector, FsviVerifyResult, acquire_shared_fsvi_map_lock};
+    use crate::codec::{
+        CodecCx, CodecDecodeResult, CodecEncodeResult, DecodeFailureReason, SymbolCodec,
+    };
     use crate::config::DurabilityConfig;
 
     /// Mock codec that creates simple repair symbols for testing.
@@ -486,11 +488,11 @@ mod tests {
     impl SymbolCodec for MockCodec {
         fn encode(
             &self,
-            _cx: &Cx,
+            _cx: &CodecCx,
             source_data: &[u8],
             symbol_size: u32,
             _repair_overhead: f64,
-        ) -> fsqlite_error::Result<CodecEncodeResult> {
+        ) -> SearchResult<CodecEncodeResult> {
             let symbol_size_usize = usize::try_from(symbol_size).unwrap_or(1);
             let mut source_symbols = Vec::new();
             let mut repair_symbols = Vec::new();
@@ -515,11 +517,11 @@ mod tests {
 
         fn decode(
             &self,
-            _cx: &Cx,
+            _cx: &CodecCx,
             symbols: &[(u32, Vec<u8>)],
             k_source: u32,
             _symbol_size: u32,
-        ) -> fsqlite_error::Result<CodecDecodeResult> {
+        ) -> SearchResult<CodecDecodeResult> {
             let mut reconstructed = Vec::new();
             for source_esi in 0..k_source {
                 let primary = symbols
@@ -535,8 +537,7 @@ mod tests {
                     Some(data) => reconstructed.extend_from_slice(&data),
                     None => {
                         return Ok(CodecDecodeResult::Failure {
-                            reason:
-                                fsqlite_core::raptorq_integration::DecodeFailureReason::InsufficientSymbols,
+                            reason: DecodeFailureReason::InsufficientSymbols,
                             symbols_received: u32::try_from(symbols.len()).unwrap_or(u32::MAX),
                             k_required: k_source,
                         });
@@ -560,11 +561,11 @@ mod tests {
     impl SymbolCodec for NoRepairCodec {
         fn encode(
             &self,
-            _cx: &Cx,
+            _cx: &CodecCx,
             source_data: &[u8],
             symbol_size: u32,
             _repair_overhead: f64,
-        ) -> fsqlite_error::Result<CodecEncodeResult> {
+        ) -> SearchResult<CodecEncodeResult> {
             let symbol_size_usize = usize::try_from(symbol_size).unwrap_or(1);
             let mut source_symbols = Vec::new();
 
@@ -587,15 +588,14 @@ mod tests {
 
         fn decode(
             &self,
-            _cx: &Cx,
+            _cx: &CodecCx,
             symbols: &[(u32, Vec<u8>)],
             k_source: u32,
             _symbol_size: u32,
-        ) -> fsqlite_error::Result<CodecDecodeResult> {
+        ) -> SearchResult<CodecDecodeResult> {
             if symbols.len() < k_source as usize {
                 return Ok(CodecDecodeResult::Failure {
-                    reason:
-                        fsqlite_core::raptorq_integration::DecodeFailureReason::InsufficientSymbols,
+                    reason: DecodeFailureReason::InsufficientSymbols,
                     symbols_received: u32::try_from(symbols.len()).unwrap_or(u32::MAX),
                     k_required: k_source,
                 });

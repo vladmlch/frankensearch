@@ -22,10 +22,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use frankensearch_core::{SearchError, SearchResult};
-use fsqlite_core::raptorq_integration::SymbolCodec;
 use tantivy::Index;
 use tracing::{debug, info, warn};
 
+use crate::codec::SymbolCodec;
 use crate::config::DurabilityConfig;
 use crate::file_protector::{
     FileHealth, FileProtectionResult, FileProtector, FileRepairOutcome, FileVerifyResult,
@@ -520,14 +520,16 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use fsqlite_core::raptorq_integration::{CodecDecodeResult, CodecEncodeResult, SymbolCodec};
-    use fsqlite_types::cx::Cx;
     use tantivy::Index;
     use tantivy::schema::{STORED, STRING, Schema, TEXT};
 
     use super::{DurableTantivyIndex, TantivySegmentProtector};
+    use crate::codec::{
+        CodecCx, CodecDecodeResult, CodecEncodeResult, DecodeFailureReason, SymbolCodec,
+    };
     use crate::config::DurabilityConfig;
     use crate::file_protector::FileProtector;
+    use frankensearch_core::SearchResult;
 
     #[derive(Debug)]
     struct MockCodec;
@@ -535,11 +537,11 @@ mod tests {
     impl SymbolCodec for MockCodec {
         fn encode(
             &self,
-            _cx: &Cx,
+            _cx: &CodecCx,
             source_data: &[u8],
             symbol_size: u32,
             _repair_overhead: f64,
-        ) -> fsqlite_error::Result<CodecEncodeResult> {
+        ) -> SearchResult<CodecEncodeResult> {
             let symbol_size_usize = usize::try_from(symbol_size).unwrap_or(1);
             let mut source_symbols = Vec::new();
             let mut repair_symbols = Vec::new();
@@ -564,11 +566,11 @@ mod tests {
 
         fn decode(
             &self,
-            _cx: &Cx,
+            _cx: &CodecCx,
             symbols: &[(u32, Vec<u8>)],
             k_source: u32,
             _symbol_size: u32,
-        ) -> fsqlite_error::Result<CodecDecodeResult> {
+        ) -> SearchResult<CodecDecodeResult> {
             let mut reconstructed = Vec::new();
             for source_esi in 0..k_source {
                 let primary = symbols
@@ -585,7 +587,7 @@ mod tests {
                     None => {
                         return Ok(CodecDecodeResult::Failure {
                             reason:
-                                fsqlite_core::raptorq_integration::DecodeFailureReason::InsufficientSymbols,
+                                DecodeFailureReason::InsufficientSymbols,
                             symbols_received: u32::try_from(symbols.len()).unwrap_or(u32::MAX),
                             k_required: k_source,
                         });

@@ -155,6 +155,10 @@ ahash = "0.8"
 # Stable durable hashing (xxh3); never substitute process-seeded ahash here.
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
+# SQLite engine pinned exactly: CASS parses the `=` pin in its dependency-pin
+# test, and an unpinned floor could drift the lockfile on fresh resolves.
+rusqlite = { version = "=0.40.2", features = ["bundled", "modern_sqlite"] }
+
 # Unicode normalization
 unicode-normalization = "0.1"
 
