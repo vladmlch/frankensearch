@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use frankensearch_core::{SearchError, SearchResult};
-use fsqlite::{AsyncConnection, Row};
-use fsqlite_types::value::SqliteValue;
+use rusqlite::types::Value;
+use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
 
 use crate::connection::{Storage, map_storage_error, retry_transient_storage};
@@ -354,15 +354,15 @@ impl PersistentJobQueue {
         // Use BEGIN IMMEDIATE for defense-in-depth (acquires a write lock
         // eagerly on backends that support cross-connection locking).
         //
-        // IMPORTANT: FrankenSQLite connections maintain isolated in-memory
-        // snapshots. Multiple connections to the same database file will NOT
-        // see each other's committed writes within the same process.
-        // Callers MUST route all claim_batch calls through a single
-        // PersistentJobQueue instance backed by one Storage connection to
-        // prevent duplicate assignments.
+        // IMPORTANT: Storage serializes all access through a single shared
+        // connection behind a mutex. Multiple Storage instances pointed at
+        // the same database file rely on BEGIN IMMEDIATE plus the
+        // status/claim_epoch CAS predicates below to prevent duplicate
+        // assignments.
         let claimed = self.storage.immediate_transaction(|conn| {
-            let claim_params = [SqliteValue::Integer(now_ms), SqliteValue::Integer(limit)];
-            let candidates = conn.query_with_params_sync("SELECT job_id, doc_id, embedder_id, priority, retry_count, max_retries, content_hash, submitted_at, claim_epoch \
+            let mut stmt = conn
+                .prepare(
+                    "SELECT job_id, doc_id, embedder_id, priority, retry_count, max_retries, content_hash, submitted_at, claim_epoch \
              FROM embedding_jobs \
              WHERE status = 'pending' \
                AND submitted_at <= ?1 \
@@ -374,28 +374,59 @@ impl PersistentJobQueue {
                ) \
              ORDER BY priority DESC, submitted_at ASC \
              LIMIT ?2;",
-            &claim_params,)
+                )
+                .map_err(map_storage_error)?;
+            let mut rows = stmt
+                .query(params![now_ms, limit])
                 .map_err(map_storage_error)?;
 
+            let mut candidates = Vec::new();
+            while let Some(row) = rows.next().map_err(map_storage_error)? {
+                candidates.push((
+                    row_i64(row, 0, "embedding_jobs.job_id")?,
+                    row_i64(row, 8, "embedding_jobs.claim_epoch")?,
+                    row_text(row, 1, "embedding_jobs.doc_id")?,
+                    row_text(row, 2, "embedding_jobs.embedder_id")?,
+                    row_i32(row, 3, "embedding_jobs.priority")?,
+                    row_u32(row, 4, "embedding_jobs.retry_count")?,
+                    row_u32(row, 5, "embedding_jobs.max_retries")?,
+                    row_optional_blob_32(row, 6, "embedding_jobs.content_hash")?,
+                    row_i64(row, 7, "embedding_jobs.submitted_at")?,
+                ));
+            }
+            drop(rows);
+            drop(stmt);
+
             let mut claimed = Vec::with_capacity(candidates.len());
-            for row in &candidates {
-                let job_id = row_i64(row, 0, "embedding_jobs.job_id")?;
-                let old_epoch = row_i64(row, 8, "embedding_jobs.claim_epoch")?;
+            for (
+                job_id,
+                old_epoch,
+                doc_id,
+                embedder_id,
+                priority,
+                retry_count,
+                max_retries,
+                content_hash,
+                submitted_at,
+            ) in candidates
+            {
                 let claim_epoch = old_epoch.checked_add(1).filter(|_| old_epoch >= 0).ok_or_else(|| {
                     queue_error(QueueErrorKind::Validation, "embedding job claim epoch exhausted or invalid".to_owned())
                 })?;
-                let update_params = [
-                    SqliteValue::Text(JobStatus::Processing.as_str().to_owned().into()),
-                    SqliteValue::Integer(now_ms),
-                    SqliteValue::Text(worker_id.to_owned().into()),
-                    SqliteValue::Integer(job_id),
-                    SqliteValue::Integer(claim_epoch),
-                    SqliteValue::Integer(old_epoch),
-                ];
-                let updated = conn.execute_with_params_sync("UPDATE embedding_jobs \
+                let updated = conn
+                    .execute(
+                        "UPDATE embedding_jobs \
                  SET status = ?1, started_at = ?2, worker_id = ?3, error_message = NULL, claim_epoch = ?5 \
                  WHERE job_id = ?4 AND status = 'pending' AND claim_epoch = ?6;",
-                &update_params,)
+                        params![
+                            JobStatus::Processing.as_str(),
+                            now_ms,
+                            worker_id,
+                            job_id,
+                            claim_epoch,
+                            old_epoch,
+                        ],
+                    )
                     .map_err(map_storage_error)?;
                 if updated != 1 {
                     continue;
@@ -405,13 +436,13 @@ impl PersistentJobQueue {
                     job_id,
                     claim_epoch,
                     worker_id: worker_id.to_owned(),
-                    doc_id: row_text(row, 1, "embedding_jobs.doc_id")?.to_owned(),
-                    embedder_id: row_text(row, 2, "embedding_jobs.embedder_id")?.to_owned(),
-                    priority: row_i32(row, 3, "embedding_jobs.priority")?,
-                    retry_count: row_u32(row, 4, "embedding_jobs.retry_count")?,
-                    max_retries: row_u32(row, 5, "embedding_jobs.max_retries")?,
-                    content_hash: row_optional_blob_32(row, 6, "embedding_jobs.content_hash")?,
-                    submitted_at: row_i64(row, 7, "embedding_jobs.submitted_at")?,
+                    doc_id,
+                    embedder_id,
+                    priority,
+                    retry_count,
+                    max_retries,
+                    content_hash,
+                    submitted_at,
                 });
             }
             Ok(claimed)
@@ -474,34 +505,32 @@ impl PersistentJobQueue {
             };
 
             let target_status = JobStatus::Completed.as_str();
-            let delete_params = [
-                SqliteValue::Text(state.doc_id.clone().into()),
-                SqliteValue::Text(state.embedder_id.clone().into()),
-                SqliteValue::Text(target_status.to_owned().into()),
-            ];
-            conn.execute_with_params_sync(
+            conn.execute(
                 "DELETE FROM embedding_jobs \
              WHERE doc_id = ?1 AND embedder_id = ?2 AND status = ?3;",
-                &delete_params,
+                params![
+                    state.doc_id.clone(),
+                    state.embedder_id.clone(),
+                    target_status
+                ],
             )
             .map_err(map_storage_error)?;
 
-            let params = [
-                SqliteValue::Text(target_status.to_owned().into()),
-                SqliteValue::Integer(now_ms),
-                SqliteValue::Integer(job_id),
-                SqliteValue::Integer(claim.claim_epoch),
-                SqliteValue::Text(claim.worker_id.clone().into()),
-                SqliteValue::Text(claim.doc_id.clone().into()),
-                SqliteValue::Text(claim.embedder_id.clone().into()),
-            ];
             let updated = conn
-                .execute_with_params_sync(
+                .execute(
                     "UPDATE embedding_jobs \
              SET status = ?1, completed_at = ?2, worker_id = NULL, error_message = NULL \
              WHERE job_id = ?3 AND status = 'processing' AND claim_epoch = ?4 \
                AND worker_id = ?5 AND doc_id = ?6 AND embedder_id = ?7;",
-                    &params,
+                    params![
+                        target_status,
+                        now_ms,
+                        job_id,
+                        claim.claim_epoch,
+                        claim.worker_id.clone(),
+                        claim.doc_id.clone(),
+                        claim.embedder_id.clone(),
+                    ],
                 )
                 .map_err(map_storage_error)?;
             if updated != 1 {
@@ -559,32 +588,31 @@ impl PersistentJobQueue {
             let retry_count = state.retry_count.saturating_add(1);
             if retry_count > state.max_retries {
                 let target_status = JobStatus::Failed.as_str();
-                let delete_params = [
-                    SqliteValue::Text(state.doc_id.clone().into()),
-                    SqliteValue::Text(state.embedder_id.clone().into()),
-                    SqliteValue::Text(target_status.to_owned().into()),
-                ];
-                conn.execute_with_params_sync("DELETE FROM embedding_jobs \
+                conn.execute(
+                    "DELETE FROM embedding_jobs \
                  WHERE doc_id = ?1 AND embedder_id = ?2 AND status = ?3;",
-                &delete_params,)
+                    params![state.doc_id.clone(), state.embedder_id.clone(), target_status],
+                )
                 .map_err(map_storage_error)?;
 
-                let params = [
-                    SqliteValue::Text(target_status.to_owned().into()),
-                    SqliteValue::Integer(i64::from(retry_count)),
-                    SqliteValue::Integer(now_ms),
-                    SqliteValue::Text(error.to_owned().into()),
-                    SqliteValue::Integer(job_id),
-                    SqliteValue::Integer(claim.claim_epoch),
-                    SqliteValue::Text(claim.worker_id.clone().into()),
-                    SqliteValue::Text(claim.doc_id.clone().into()),
-                    SqliteValue::Text(claim.embedder_id.clone().into()),
-                ];
-                let updated = conn.execute_with_params_sync("UPDATE embedding_jobs \
+                let updated = conn
+                    .execute(
+                        "UPDATE embedding_jobs \
                  SET status = ?1, retry_count = ?2, completed_at = ?3, error_message = ?4, worker_id = NULL \
                  WHERE job_id = ?5 AND status = 'processing' AND claim_epoch = ?6 \
                    AND worker_id = ?7 AND doc_id = ?8 AND embedder_id = ?9;",
-                &params,)
+                        params![
+                            target_status,
+                            i64::from(retry_count),
+                            now_ms,
+                            error,
+                            job_id,
+                            claim.claim_epoch,
+                            claim.worker_id.clone(),
+                            claim.doc_id.clone(),
+                            claim.embedder_id.clone(),
+                        ],
+                    )
                     .map_err(map_storage_error)?;
                 if updated != 1 {
                     return Err(conflict_error(format!(
@@ -604,23 +632,25 @@ impl PersistentJobQueue {
                 compute_retry_delay_ms(retry_base_delay_ms, retry_count.saturating_sub(1));
             let next_attempt_at_ms = now_ms.saturating_add(i64::try_from(delay_ms).unwrap_or(i64::MAX));
 
-            let params = [
-                SqliteValue::Text(JobStatus::Pending.as_str().to_owned().into()),
-                SqliteValue::Integer(i64::from(retry_count)),
-                SqliteValue::Integer(next_attempt_at_ms),
-                SqliteValue::Text(error.to_owned().into()),
-                SqliteValue::Integer(job_id),
-                SqliteValue::Integer(claim.claim_epoch),
-                SqliteValue::Text(claim.worker_id.clone().into()),
-                SqliteValue::Text(claim.doc_id.clone().into()),
-                SqliteValue::Text(claim.embedder_id.clone().into()),
-            ];
-            let updated = conn.execute_with_params_sync("UPDATE embedding_jobs \
+            let updated = conn
+                .execute(
+                    "UPDATE embedding_jobs \
              SET status = ?1, retry_count = ?2, submitted_at = ?3, started_at = NULL, completed_at = NULL, \
                  error_message = ?4, worker_id = NULL \
              WHERE job_id = ?5 AND status = 'processing' AND claim_epoch = ?6 \
                AND worker_id = ?7 AND doc_id = ?8 AND embedder_id = ?9;",
-            &params,)
+                    params![
+                        JobStatus::Pending.as_str(),
+                        i64::from(retry_count),
+                        next_attempt_at_ms,
+                        error,
+                        job_id,
+                        claim.claim_epoch,
+                        claim.worker_id.clone(),
+                        claim.doc_id.clone(),
+                        claim.embedder_id.clone(),
+                    ],
+                )
                 .map_err(map_storage_error)?;
             if updated != 1 {
                 return Err(conflict_error(format!(
@@ -678,35 +708,33 @@ impl PersistentJobQueue {
             };
 
             let target_status = JobStatus::Skipped.as_str();
-            let delete_params = [
-                SqliteValue::Text(state.doc_id.clone().into()),
-                SqliteValue::Text(state.embedder_id.clone().into()),
-                SqliteValue::Text(target_status.to_owned().into()),
-            ];
-            conn.execute_with_params_sync(
+            conn.execute(
                 "DELETE FROM embedding_jobs \
              WHERE doc_id = ?1 AND embedder_id = ?2 AND status = ?3;",
-                &delete_params,
+                params![
+                    state.doc_id.clone(),
+                    state.embedder_id.clone(),
+                    target_status
+                ],
             )
             .map_err(map_storage_error)?;
 
-            let params = [
-                SqliteValue::Text(target_status.to_owned().into()),
-                SqliteValue::Integer(now_ms),
-                SqliteValue::Text(reason.to_owned().into()),
-                SqliteValue::Integer(job_id),
-                SqliteValue::Integer(claim.claim_epoch),
-                SqliteValue::Text(claim.worker_id.clone().into()),
-                SqliteValue::Text(claim.doc_id.clone().into()),
-                SqliteValue::Text(claim.embedder_id.clone().into()),
-            ];
             let updated = conn
-                .execute_with_params_sync(
+                .execute(
                     "UPDATE embedding_jobs \
              SET status = ?1, completed_at = ?2, worker_id = NULL, error_message = ?3 \
              WHERE job_id = ?4 AND status = 'processing' AND claim_epoch = ?5 \
                AND worker_id = ?6 AND doc_id = ?7 AND embedder_id = ?8;",
-                    &params,
+                    params![
+                        target_status,
+                        now_ms,
+                        reason,
+                        job_id,
+                        claim.claim_epoch,
+                        claim.worker_id.clone(),
+                        claim.doc_id.clone(),
+                        claim.embedder_id.clone(),
+                    ],
                 )
                 .map_err(map_storage_error)?;
             if updated != 1 {
@@ -742,22 +770,31 @@ impl PersistentJobQueue {
             .min(self.config.stale_job_threshold_ms);
         let cutoff = now_ms.saturating_sub(i64::try_from(reclaim_after_ms).unwrap_or(i64::MAX));
         let (reclaimed_pending, superseded) = self.storage.immediate_transaction(|conn| {
-            let stale_params = [SqliteValue::Integer(cutoff)];
-            let stale_rows = conn.query_with_params_sync("SELECT job_id, doc_id, embedder_id, content_hash \
+            let mut stmt = conn
+                .prepare(
+                    "SELECT job_id, doc_id, embedder_id, content_hash \
              FROM embedding_jobs \
              WHERE status = 'processing' \
                AND (started_at IS NULL OR started_at <= ?1);",
-            &stale_params,)
+                )
                 .map_err(map_storage_error)?;
+            let mut rows = stmt.query(params![cutoff]).map_err(map_storage_error)?;
+
+            let mut stale_jobs = Vec::new();
+            while let Some(row) = rows.next().map_err(map_storage_error)? {
+                stale_jobs.push((
+                    row_i64(row, 0, "embedding_jobs.job_id")?,
+                    row_text(row, 1, "embedding_jobs.doc_id")?,
+                    row_text(row, 2, "embedding_jobs.embedder_id")?,
+                    row_optional_blob_32(row, 3, "embedding_jobs.content_hash")?,
+                ));
+            }
+            drop(rows);
+            drop(stmt);
 
             let mut reclaimed_pending = 0_usize;
             let mut superseded = 0_usize;
-            for row in &stale_rows {
-                let job_id = row_i64(row, 0, "embedding_jobs.job_id")?;
-                let doc_id = row_text(row, 1, "embedding_jobs.doc_id")?.to_owned();
-                let embedder_id = row_text(row, 2, "embedding_jobs.embedder_id")?.to_owned();
-
-                let claimed_hash = row_optional_blob_32(row, 3, "embedding_jobs.content_hash")?;
+            for (job_id, doc_id, embedder_id, claimed_hash) in stale_jobs {
                 let document = get_document_inner(conn, &doc_id)?;
                 let can_retry = match document {
                     Some(document) if claimed_hash.as_ref().is_none_or(|hash| *hash == document.content_hash) => {
@@ -767,26 +804,30 @@ impl PersistentJobQueue {
                 };
 
                 if !can_retry {
-                    let delete_params = [SqliteValue::Integer(job_id)];
-                    let deleted = conn.execute_with_params_sync("DELETE FROM embedding_jobs \
+                    let deleted = conn
+                        .execute(
+                            "DELETE FROM embedding_jobs \
                      WHERE job_id = ?1 AND status = 'processing';",
-                    &delete_params,)
+                            params![job_id],
+                        )
                         .map_err(map_storage_error)?;
                     if deleted == 1 {
                         superseded += 1;
                     }
                 } else {
-                    let update_params = [
-                        SqliteValue::Text(JobStatus::Pending.as_str().to_owned().into()),
-                        SqliteValue::Integer(now_ms),
-                        SqliteValue::Text("reclaimed stale lease".to_owned().into()),
-                        SqliteValue::Integer(job_id),
-                    ];
-                    let updated = conn.execute_with_params_sync("UPDATE embedding_jobs \
+                    let updated = conn
+                        .execute(
+                            "UPDATE embedding_jobs \
                      SET status = ?1, submitted_at = ?2, started_at = NULL, worker_id = NULL, error_message = ?3, \
                          retry_count = retry_count + 1 \
                      WHERE job_id = ?4 AND status = 'processing';",
-                    &update_params,)
+                            params![
+                                JobStatus::Pending.as_str(),
+                                now_ms,
+                                "reclaimed stale lease",
+                                job_id,
+                            ],
+                        )
                         .map_err(map_storage_error)?;
                     if updated == 1 {
                         reclaimed_pending += 1;
@@ -833,7 +874,10 @@ impl PersistentJobQueue {
 
     pub fn queue_depth(&self) -> SearchResult<QueueDepth> {
         retry_transient_storage(
-            || fetch_queue_depth(self.storage.connection()),
+            || {
+                let conn = self.storage.connection()?;
+                fetch_queue_depth(&conn)
+            },
             "queue depth",
         )
     }
@@ -847,20 +891,14 @@ impl PersistentJobQueue {
     pub fn resurrect_terminal_failures(&self, embedder_id: &str) -> SearchResult<usize> {
         let now_ms = unix_timestamp_ms()?;
         let resurrected = self.storage.transaction(|conn| {
-            let params = [
-                SqliteValue::Text(embedder_id.to_owned().into()),
-                SqliteValue::Integer(now_ms),
-            ];
-            let count = conn
-                .execute_with_params_sync(
-                    "UPDATE embedding_jobs \
+            conn.execute(
+                "UPDATE embedding_jobs \
              SET status = 'pending', retry_count = 0, error_message = NULL, \
                  started_at = NULL, submitted_at = ?2 \
              WHERE embedder_id = ?1 AND status = 'failed';",
-                    &params,
-                )
-                .map_err(map_storage_error)?;
-            Ok(count)
+                params![embedder_id, now_ms],
+            )
+            .map_err(map_storage_error)
         })?;
 
         if resurrected > 0 {
@@ -890,15 +928,16 @@ impl PersistentJobQueue {
     }
 }
 
-pub(crate) fn fetch_queue_depth(conn: &AsyncConnection) -> SearchResult<QueueDepth> {
+pub(crate) fn fetch_queue_depth(conn: &Connection) -> SearchResult<QueueDepth> {
     let mut depth = QueueDepth::default();
-    let rows = conn
-        .query_sync("SELECT status, COUNT(*) FROM embedding_jobs GROUP BY status;")
+    let mut stmt = conn
+        .prepare("SELECT status, COUNT(*) FROM embedding_jobs GROUP BY status;")
         .map_err(map_storage_error)?;
-    for row in &rows {
+    let mut rows = stmt.query([]).map_err(map_storage_error)?;
+    while let Some(row) = rows.next().map_err(map_storage_error)? {
         let status = row_text(row, 0, "embedding_jobs.status")?;
         let count = i64_to_usize(row_i64(row, 1, "embedding_jobs.count")?)?;
-        match JobStatus::from_str(status) {
+        match JobStatus::from_str(&status) {
             Some(JobStatus::Pending) => depth.pending = count,
             Some(JobStatus::Processing) => depth.processing = count,
             Some(JobStatus::Completed) => depth.completed = count,
@@ -912,18 +951,18 @@ pub(crate) fn fetch_queue_depth(conn: &AsyncConnection) -> SearchResult<QueueDep
             }
         }
     }
+    drop(rows);
+    drop(stmt);
 
     let now_ms = unix_timestamp_ms()?;
-    let ready_params = [SqliteValue::Integer(now_ms)];
-    let ready_rows = conn
-        .query_with_params_sync(
+    depth.ready_pending = i64_to_usize(
+        conn.query_row(
             "SELECT COUNT(*) FROM embedding_jobs WHERE status = 'pending' AND submitted_at <= ?1;",
-            &ready_params,
+            params![now_ms],
+            |row| row.get::<_, i64>(0),
         )
-        .map_err(map_storage_error)?;
-    if let Some(row) = ready_rows.first() {
-        depth.ready_pending = i64_to_usize(row_i64(row, 0, "embedding_jobs.ready_pending")?)?;
-    }
+        .map_err(map_storage_error)?,
+    )?;
 
     Ok(depth)
 }
@@ -961,7 +1000,7 @@ struct JobState {
 }
 
 fn check_claim_inner(
-    conn: &AsyncConnection,
+    conn: &Connection,
     claim: &ClaimedJob,
     expected_document_hash: Option<&[u8; 32]>,
 ) -> SearchResult<ClaimOutcome<(JobState, DocumentRecord)>> {
@@ -994,18 +1033,17 @@ fn check_claim_inner(
     Ok(ClaimOutcome::Superseded)
 }
 
-fn retire_owned_claim(conn: &AsyncConnection, claim: &ClaimedJob) -> SearchResult<()> {
-    let params = [
-        SqliteValue::Integer(claim.job_id),
-        SqliteValue::Integer(claim.claim_epoch),
-        SqliteValue::Text(claim.worker_id.clone().into()),
-        SqliteValue::Text(claim.doc_id.clone().into()),
-        SqliteValue::Text(claim.embedder_id.clone().into()),
-    ];
-    conn.execute_with_params_sync(
+fn retire_owned_claim(conn: &Connection, claim: &ClaimedJob) -> SearchResult<()> {
+    conn.execute(
         "DELETE FROM embedding_jobs WHERE job_id = ?1 AND status = 'processing' \
          AND claim_epoch = ?2 AND worker_id = ?3 AND doc_id = ?4 AND embedder_id = ?5;",
-        &params,
+        params![
+            claim.job_id,
+            claim.claim_epoch,
+            claim.worker_id.clone(),
+            claim.doc_id.clone(),
+            claim.embedder_id.clone(),
+        ],
     )
     .map_err(map_storage_error)?;
     Ok(())
@@ -1014,7 +1052,7 @@ fn retire_owned_claim(conn: &AsyncConnection, claim: &ClaimedJob) -> SearchResul
 /// Free the unique pending slot only when its revision is provably obsolete.
 /// A pending current revision or a legacy unknown hash remains authoritative.
 fn clear_stale_pending_for_retry(
-    conn: &AsyncConnection,
+    conn: &Connection,
     claim: &ClaimedJob,
     current_document_hash: &[u8; 32],
 ) -> SearchResult<bool> {
@@ -1027,34 +1065,40 @@ fn clear_stale_pending_for_retry(
 }
 
 fn clear_stale_pending_for_document(
-    conn: &AsyncConnection,
+    conn: &Connection,
     doc_id: &str,
     embedder_id: &str,
     current_document_hash: &[u8; 32],
 ) -> SearchResult<bool> {
-    let params = [
-        SqliteValue::Text(doc_id.to_owned().into()),
-        SqliteValue::Text(embedder_id.to_owned().into()),
-    ];
-    let rows = conn
-        .query_with_params_sync(
+    let mut stmt = conn
+        .prepare(
             "SELECT job_id, content_hash FROM embedding_jobs \
          WHERE doc_id = ?1 AND embedder_id = ?2 AND status = 'pending';",
-            &params,
         )
         .map_err(map_storage_error)?;
-    for row in rows {
-        let pending_hash = row_optional_blob_32(&row, 1, "embedding_jobs.content_hash")?;
+    let mut rows = stmt
+        .query(params![doc_id, embedder_id])
+        .map_err(map_storage_error)?;
+    let mut pending_jobs = Vec::new();
+    while let Some(row) = rows.next().map_err(map_storage_error)? {
+        pending_jobs.push((
+            row_i64(row, 0, "embedding_jobs.job_id")?,
+            row_optional_blob_32(row, 1, "embedding_jobs.content_hash")?,
+        ));
+    }
+    drop(rows);
+    drop(stmt);
+
+    for (job_id, pending_hash) in pending_jobs {
         if pending_hash
             .as_ref()
             .is_none_or(|hash| hash == current_document_hash)
         {
             return Ok(false);
         }
-        let job_id = row_i64(&row, 0, "embedding_jobs.job_id")?;
-        conn.execute_with_params_sync(
+        conn.execute(
             "DELETE FROM embedding_jobs WHERE job_id = ?1 AND status = 'pending';",
-            &[SqliteValue::Integer(job_id)],
+            params![job_id],
         )
         .map_err(map_storage_error)?;
     }
@@ -1062,7 +1106,7 @@ fn clear_stale_pending_for_document(
 }
 
 pub(crate) fn enqueue_inner(
-    conn: &AsyncConnection,
+    conn: &Connection,
     request: &EnqueueRequest,
     submitted_at: i64,
     max_retries: u32,
@@ -1078,50 +1122,52 @@ pub(crate) fn enqueue_inner(
         return Ok(EnqueueOutcome::HashEmbedderSkipped);
     }
 
-    let active_params = [
-        SqliteValue::Text(request.doc_id.clone().into()),
-        SqliteValue::Text(request.embedder_id.clone().into()),
-    ];
-    let active_rows = conn
-        .query_with_params_sync(
+    let mut stmt = conn
+        .prepare(
             "SELECT job_id, content_hash \
      FROM embedding_jobs \
      WHERE doc_id = ?1 AND embedder_id = ?2 AND status IN ('pending', 'processing');",
-            &active_params,
         )
         .map_err(map_storage_error)?;
+    let mut rows = stmt
+        .query(params![request.doc_id.clone(), request.embedder_id.clone()])
+        .map_err(map_storage_error)?;
+    let mut active_hashes = Vec::new();
+    while let Some(row) = rows.next().map_err(map_storage_error)? {
+        active_hashes.push(row_optional_blob_32(row, 1, "embedding_jobs.content_hash")?);
+    }
+    drop(rows);
+    drop(stmt);
 
-    let mut has_active_job = false;
-    for row in &active_rows {
-        has_active_job = true;
-        let existing_hash = row_optional_blob_32(row, 1, "embedding_jobs.content_hash")?;
-        if existing_hash.as_ref() == Some(&request.content_hash) {
-            return Ok(EnqueueOutcome::Deduplicated);
-        }
+    let has_active_job = !active_hashes.is_empty();
+    if active_hashes
+        .iter()
+        .any(|hash| hash.as_ref() == Some(&request.content_hash))
+    {
+        return Ok(EnqueueOutcome::Deduplicated);
     }
 
     if has_active_job {
-        conn.execute_with_params_sync(
+        conn.execute(
             "DELETE FROM embedding_jobs \
          WHERE doc_id = ?1 AND embedder_id = ?2 AND status = 'pending';",
-            &active_params,
+            params![request.doc_id.clone(), request.embedder_id.clone()],
         )
         .map_err(map_storage_error)?;
     }
 
-    let insert_params = [
-        SqliteValue::Text(request.doc_id.clone().into()),
-        SqliteValue::Text(request.embedder_id.clone().into()),
-        SqliteValue::Integer(i64::from(request.priority)),
-        SqliteValue::Integer(submitted_at),
-        SqliteValue::Integer(i64::from(max_retries)),
-        SqliteValue::Blob(request.content_hash.to_vec().into()),
-    ];
-    conn.execute_with_params_sync(
+    conn.execute(
         "INSERT INTO embedding_jobs (\
         doc_id, embedder_id, priority, submitted_at, status, retry_count, max_retries, content_hash\
      ) VALUES (?1, ?2, ?3, ?4, 'pending', 0, ?5, ?6);",
-        &insert_params,
+        params![
+            request.doc_id.clone(),
+            request.embedder_id.clone(),
+            i64::from(request.priority),
+            submitted_at,
+            i64::from(max_retries),
+            request.content_hash.to_vec(),
+        ],
     )
     .map_err(map_storage_error)?;
 
@@ -1132,23 +1178,22 @@ pub(crate) fn enqueue_inner(
     })
 }
 
-fn load_job_state(conn: &AsyncConnection, job_id: i64) -> SearchResult<Option<JobState>> {
-    let params = [SqliteValue::Integer(job_id)];
-    let rows = conn
-        .query_with_params_sync(
+fn load_job_state(conn: &Connection, job_id: i64) -> SearchResult<Option<JobState>> {
+    let mut stmt = conn
+        .prepare(
             "SELECT status, retry_count, max_retries, started_at, doc_id, embedder_id, claim_epoch, worker_id, content_hash \
      FROM embedding_jobs \
      WHERE job_id = ?1 \
      LIMIT 1;",
-            &params,
         )
         .map_err(map_storage_error)?;
-    let Some(row) = rows.first() else {
+    let mut rows = stmt.query(params![job_id]).map_err(map_storage_error)?;
+    let Some(row) = rows.next().map_err(map_storage_error)? else {
         return Ok(None);
     };
 
     let status_value = row_text(row, 0, "embedding_jobs.status")?;
-    let status = JobStatus::from_str(status_value).ok_or_else(|| {
+    let status = JobStatus::from_str(&status_value).ok_or_else(|| {
         queue_error(
             QueueErrorKind::Validation,
             format!("unknown queue status value: {status_value:?}"),
@@ -1160,26 +1205,26 @@ fn load_job_state(conn: &AsyncConnection, job_id: i64) -> SearchResult<Option<Jo
         retry_count: row_u32(row, 1, "embedding_jobs.retry_count")?,
         max_retries: row_u32(row, 2, "embedding_jobs.max_retries")?,
         started_at: row_optional_i64(row, 3)?,
-        doc_id: row_text(row, 4, "embedding_jobs.doc_id")?.to_owned(),
-        embedder_id: row_text(row, 5, "embedding_jobs.embedder_id")?.to_owned(),
+        doc_id: row_text(row, 4, "embedding_jobs.doc_id")?,
+        embedder_id: row_text(row, 5, "embedding_jobs.embedder_id")?,
         claim_epoch: row_i64(row, 6, "embedding_jobs.claim_epoch")?,
-        worker_id: match row.get(7) {
-            Some(SqliteValue::Null) => None,
-            _ => Some(row_text(row, 7, "embedding_jobs.worker_id")?.to_owned()),
+        worker_id: match row_value(row, 7)? {
+            Some(Value::Null) | None => None,
+            _ => Some(row_text(row, 7, "embedding_jobs.worker_id")?),
         },
         content_hash: row_optional_blob_32(row, 8, "embedding_jobs.content_hash")?,
     }))
 }
 
-fn document_exists(conn: &AsyncConnection, doc_id: &str) -> SearchResult<bool> {
-    let params = [SqliteValue::Text(doc_id.to_owned().into())];
-    let rows = conn
-        .query_with_params_sync(
-            "SELECT doc_id FROM documents WHERE doc_id = ?1 LIMIT 1;",
-            &params,
-        )
-        .map_err(map_storage_error)?;
-    Ok(!rows.is_empty())
+fn document_exists(conn: &Connection, doc_id: &str) -> SearchResult<bool> {
+    conn.query_row(
+        "SELECT doc_id FROM documents WHERE doc_id = ?1 LIMIT 1;",
+        params![doc_id],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .map(|row| row.is_some())
+    .map_err(map_storage_error)
 }
 
 fn is_hash_embedder(embedder_id: &str) -> bool {
@@ -1220,16 +1265,24 @@ fn queue_error(kind: QueueErrorKind, message: String) -> SearchError {
     }
 }
 
-fn row_text<'a>(row: &'a Row, index: usize, field: &str) -> SearchResult<&'a str> {
-    match row.get(index) {
-        Some(SqliteValue::Text(value)) => Ok(value),
-        Some(other) => Err(SearchError::SubsystemError {
-            subsystem: SUBSYSTEM,
-            source: Box::new(io::Error::other(format!(
-                "unexpected type for {field}: {:?}",
-                other
-            ))),
-        }),
+fn unexpected_type_error(field: &str, other: &Value) -> SearchError {
+    SearchError::SubsystemError {
+        subsystem: SUBSYSTEM,
+        source: Box::new(io::Error::other(format!(
+            "unexpected type for {field}: {other:?}"
+        ))),
+    }
+}
+
+fn row_value(row: &Row<'_>, index: usize) -> SearchResult<Option<Value>> {
+    row.get::<_, Option<Value>>(index)
+        .map_err(map_storage_error)
+}
+
+fn row_text(row: &Row<'_>, index: usize, field: &str) -> SearchResult<String> {
+    match row_value(row, index)? {
+        Some(Value::Text(value)) => Ok(value),
+        Some(other) => Err(unexpected_type_error(field, &other)),
         None => Err(SearchError::SubsystemError {
             subsystem: SUBSYSTEM,
             source: Box::new(io::Error::other(format!("missing column for {field}"))),
@@ -1237,16 +1290,10 @@ fn row_text<'a>(row: &'a Row, index: usize, field: &str) -> SearchResult<&'a str
     }
 }
 
-fn row_i64(row: &Row, index: usize, field: &str) -> SearchResult<i64> {
-    match row.get(index) {
-        Some(SqliteValue::Integer(value)) => Ok(*value),
-        Some(other) => Err(SearchError::SubsystemError {
-            subsystem: SUBSYSTEM,
-            source: Box::new(io::Error::other(format!(
-                "unexpected type for {field}: {:?}",
-                other
-            ))),
-        }),
+fn row_i64(row: &Row<'_>, index: usize, field: &str) -> SearchResult<i64> {
+    match row_value(row, index)? {
+        Some(Value::Integer(value)) => Ok(value),
+        Some(other) => Err(unexpected_type_error(field, &other)),
         None => Err(SearchError::SubsystemError {
             subsystem: SUBSYSTEM,
             source: Box::new(io::Error::other(format!("missing column for {field}"))),
@@ -1254,7 +1301,7 @@ fn row_i64(row: &Row, index: usize, field: &str) -> SearchResult<i64> {
     }
 }
 
-fn row_i32(row: &Row, index: usize, field: &str) -> SearchResult<i32> {
+fn row_i32(row: &Row<'_>, index: usize, field: &str) -> SearchResult<i32> {
     let value = row_i64(row, index, field)?;
     i32::try_from(value).map_err(|_| {
         queue_error(
@@ -1264,7 +1311,7 @@ fn row_i32(row: &Row, index: usize, field: &str) -> SearchResult<i32> {
     })
 }
 
-fn row_u32(row: &Row, index: usize, field: &str) -> SearchResult<u32> {
+fn row_u32(row: &Row<'_>, index: usize, field: &str) -> SearchResult<u32> {
     let value = row_i64(row, index, field)?;
     u32::try_from(value).map_err(|_| {
         queue_error(
@@ -1274,23 +1321,26 @@ fn row_u32(row: &Row, index: usize, field: &str) -> SearchResult<u32> {
     })
 }
 
-fn row_optional_i64(row: &Row, index: usize) -> SearchResult<Option<i64>> {
-    match row.get(index) {
-        Some(SqliteValue::Integer(value)) => Ok(Some(*value)),
-        Some(SqliteValue::Null) | None => Ok(None),
+fn row_optional_i64(row: &Row<'_>, index: usize) -> SearchResult<Option<i64>> {
+    match row_value(row, index)? {
+        Some(Value::Integer(value)) => Ok(Some(value)),
+        Some(Value::Null) | None => Ok(None),
         Some(other) => Err(SearchError::SubsystemError {
             subsystem: SUBSYSTEM,
             source: Box::new(io::Error::other(format!(
-                "unexpected optional i64 type: {:?}",
-                other
+                "unexpected optional i64 type: {other:?}"
             ))),
         }),
     }
 }
 
-fn row_optional_blob_32(row: &Row, index: usize, field: &str) -> SearchResult<Option<[u8; 32]>> {
-    match row.get(index) {
-        Some(SqliteValue::Blob(value)) => {
+fn row_optional_blob_32(
+    row: &Row<'_>,
+    index: usize,
+    field: &str,
+) -> SearchResult<Option<[u8; 32]>> {
+    match row_value(row, index)? {
+        Some(Value::Blob(value)) => {
             if value.len() != 32 {
                 return Err(queue_error(
                     QueueErrorKind::Validation,
@@ -1298,15 +1348,14 @@ fn row_optional_blob_32(row: &Row, index: usize, field: &str) -> SearchResult<Op
                 ));
             }
             let mut hash = [0_u8; 32];
-            hash.copy_from_slice(value);
+            hash.copy_from_slice(&value);
             Ok(Some(hash))
         }
-        Some(SqliteValue::Null) | None => Ok(None),
+        Some(Value::Null) | None => Ok(None),
         Some(other) => Err(SearchError::SubsystemError {
             subsystem: SUBSYSTEM,
             source: Box::new(io::Error::other(format!(
-                "unexpected optional blob type for {field}: {:?}",
-                other
+                "unexpected optional blob type for {field}: {other:?}"
             ))),
         }),
     }
@@ -1360,9 +1409,9 @@ mod tests {
     use std::sync::{Arc, Barrier, mpsc};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use fsqlite_types::value::SqliteValue;
+    use rusqlite::{params, types::Value};
 
-    use crate::connection::{Storage, StorageConfig};
+    use crate::connection::{Storage, StorageConfig, map_storage_error};
     use crate::document::DocumentRecord;
 
     use super::{
@@ -1433,36 +1482,33 @@ mod tests {
     }
 
     fn status_counts(storage: &Storage) -> QueueDepth {
-        let rows = storage
-            .connection()
-            .query_sync("SELECT status, COUNT(*) FROM embedding_jobs GROUP BY status;")
-            .expect("status query should succeed");
-        let mut depth = QueueDepth::default();
-        for row in &rows {
-            let status = row
-                .get(0)
-                .and_then(|value| match value {
-                    SqliteValue::Text(text) => Some(text.to_string()),
-                    _ => None,
-                })
-                .expect("status column should be text");
-            let raw_count = row
-                .get(1)
-                .and_then(|value| match value {
-                    SqliteValue::Integer(count) => Some(*count),
-                    _ => None,
-                })
-                .expect("count column should be integer");
-            let count = usize::try_from(raw_count).expect("count value should fit into usize");
-            match JobStatus::from_str(&status).expect("queue status should be known") {
-                JobStatus::Pending => depth.pending = count,
-                JobStatus::Processing => depth.processing = count,
-                JobStatus::Completed => depth.completed = count,
-                JobStatus::Failed => depth.failed = count,
-                JobStatus::Skipped => depth.skipped = count,
-            }
-        }
-        depth
+        storage
+            .with_connection(|conn| {
+                let mut stmt = conn
+                    .prepare("SELECT status, COUNT(*) FROM embedding_jobs GROUP BY status;")
+                    .expect("status query should prepare");
+                let mut rows = stmt.query([]).expect("status query should run");
+                let mut depth = QueueDepth::default();
+                while let Some(row) = rows.next().expect("status row should read") {
+                    let status = row
+                        .get::<_, String>(0)
+                        .expect("status column should be text");
+                    let raw_count = row
+                        .get::<_, i64>(1)
+                        .expect("count column should be integer");
+                    let count =
+                        usize::try_from(raw_count).expect("count value should fit into usize");
+                    match JobStatus::from_str(&status).expect("queue status should be known") {
+                        JobStatus::Pending => depth.pending = count,
+                        JobStatus::Processing => depth.processing = count,
+                        JobStatus::Completed => depth.completed = count,
+                        JobStatus::Failed => depth.failed = count,
+                        JobStatus::Skipped => depth.skipped = count,
+                    }
+                }
+                Ok(depth)
+            })
+            .expect("status counts query should succeed")
     }
 
     fn claim_single(queue: &PersistentJobQueue, worker_id: &str) -> ClaimedJob {
@@ -1476,28 +1522,50 @@ mod tests {
             .expect("claim result should contain a job")
     }
 
-    fn queue_rows(storage: &Storage) -> Vec<Vec<SqliteValue>> {
-        storage.connection().query_sync(
-            "SELECT job_id, doc_id, embedder_id, priority, submitted_at, started_at, completed_at, \
+    fn queue_rows(storage: &Storage) -> Vec<Vec<Value>> {
+        storage
+            .with_connection(|conn| {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT job_id, doc_id, embedder_id, priority, submitted_at, started_at, completed_at, \
              status, retry_count, max_retries, error_message, content_hash, worker_id, claim_epoch \
              FROM embedding_jobs ORDER BY job_id;",
-        ).unwrap().iter().map(|row| {
-            (0..14).map(|column| row.get(column).unwrap().clone()).collect()
-        }).collect()
+                    )
+                    .expect("queue rows query should prepare");
+                let mut rows = stmt.query([]).expect("queue rows query should run");
+                let mut out = Vec::new();
+                while let Some(row) = rows.next().expect("queue row should read") {
+                    out.push(
+                        (0..14)
+                            .map(|column| {
+                                row.get::<_, Value>(column).expect("column should read")
+                            })
+                            .collect(),
+                    );
+                }
+                Ok(out)
+            })
+            .expect("queue rows query should succeed")
     }
 
-    fn catalog_status_rows(storage: &Storage) -> Vec<Vec<SqliteValue>> {
+    fn catalog_status_rows(storage: &Storage) -> Vec<Vec<Value>> {
         storage
-            .connection()
-            .query_sync("SELECT * FROM embedding_status ORDER BY doc_id, embedder_id;")
-            .unwrap()
-            .iter()
-            .map(|row| {
-                (0..7)
-                    .map(|column| row.get(column).unwrap().clone())
-                    .collect()
+            .with_connection(|conn| {
+                let mut stmt = conn
+                    .prepare("SELECT * FROM embedding_status ORDER BY doc_id, embedder_id;")
+                    .expect("catalog rows query should prepare");
+                let mut rows = stmt.query([]).expect("catalog rows query should run");
+                let mut out = Vec::new();
+                while let Some(row) = rows.next().expect("catalog row should read") {
+                    out.push(
+                        (0..7)
+                            .map(|column| row.get::<_, Value>(column).expect("column should read"))
+                            .collect(),
+                    );
+                }
+                Ok(out)
             })
-            .collect()
+            .expect("catalog rows query should succeed")
     }
 
     #[test]
@@ -1514,7 +1582,8 @@ mod tests {
             assert_eq!(old.claim_epoch, 1);
             storage
                 .connection()
-                .execute_sync(
+                .expect("connection should open")
+                .execute_batch(
                     "UPDATE embedding_jobs SET started_at = 0 WHERE status = 'processing';",
                 )
                 .unwrap();
@@ -1656,9 +1725,10 @@ mod tests {
                 .unwrap();
             storage
                 .connection()
-                .execute_with_params_sync(
+                .expect("connection should open")
+                .execute(
                     "UPDATE embedding_jobs SET claim_epoch = ?1 WHERE doc_id = 'claim-overflow';",
-                    &[SqliteValue::Integer(invalid_epoch)],
+                    params![invalid_epoch],
                 )
                 .unwrap();
             let before = queue_rows(&storage);
@@ -1722,7 +1792,8 @@ mod tests {
         queue.enqueue("legacy-hash", "emb", &[39; 32], 0).unwrap();
         storage
             .connection()
-            .execute_sync("UPDATE embedding_jobs SET content_hash = NULL;")
+            .expect("connection should open")
+            .execute_batch("UPDATE embedding_jobs SET content_hash = NULL;")
             .unwrap();
         let claim = claim_single(&queue, "worker");
         assert_eq!(claim.content_hash, None);
@@ -1751,15 +1822,18 @@ mod tests {
         // cascading foreign key. Exercise that path explicitly.
         storage
             .connection()
-            .execute_sync("PRAGMA foreign_keys=OFF;")
+            .expect("connection should open")
+            .execute_batch("PRAGMA foreign_keys=OFF;")
             .unwrap();
         storage
             .connection()
-            .execute_sync("DELETE FROM documents WHERE doc_id = 'removed-document';")
+            .expect("connection should open")
+            .execute_batch("DELETE FROM documents WHERE doc_id = 'removed-document';")
             .unwrap();
         storage
             .connection()
-            .execute_sync("PRAGMA foreign_keys=ON;")
+            .expect("connection should open")
+            .execute_batch("PRAGMA foreign_keys=ON;")
             .unwrap();
         assert_eq!(queue.queue_depth().unwrap().processing, 1);
         let metrics = queue.metrics().snapshot();
@@ -1791,7 +1865,8 @@ mod tests {
             if reclaim {
                 storage
                     .connection()
-                    .execute_sync(
+                    .expect("connection should open")
+                    .execute_batch(
                         "UPDATE embedding_jobs SET started_at = 0 WHERE status = 'processing';",
                     )
                     .unwrap();
@@ -1827,11 +1902,15 @@ mod tests {
                 .unwrap();
             let processing = claim_single(&queue, "worker");
             // An imported or legacy pending row can coexist with the current attempt.
-            storage.connection().execute_with_params_sync(
-                "INSERT INTO embedding_jobs(doc_id, embedder_id, submitted_at, status, content_hash) \
+            storage
+                .connection()
+                .expect("connection should open")
+                .execute(
+                    "INSERT INTO embedding_jobs(doc_id, embedder_id, submitted_at, status, content_hash) \
                  VALUES ('preserve-pending', 'emb', 0, 'pending', ?1);",
-                &[pending_hash.map_or(SqliteValue::Null, |hash| SqliteValue::Blob(hash.to_vec().into()))],
-            ).unwrap();
+                    params![pending_hash.map(|hash| hash.to_vec())],
+                )
+                .unwrap();
             let metrics = queue.metrics().snapshot();
             assert_eq!(
                 queue.fail(&processing, &[43; 32], "retry").unwrap(),
@@ -1863,11 +1942,15 @@ mod tests {
                 "fail" => "failed",
                 _ => "skipped",
             };
-            storage.connection().execute_with_params_sync(
-                "INSERT INTO embedding_jobs(doc_id, embedder_id, submitted_at, status, content_hash) \
+            storage
+                .connection()
+                .expect("connection should open")
+                .execute(
+                    "INSERT INTO embedding_jobs(doc_id, embedder_id, submitted_at, status, content_hash) \
                  VALUES ('atomic-status', 'emb', 0, ?1, ?2);",
-                &[SqliteValue::Text(history_status.to_owned().into()), SqliteValue::Blob(vec![44; 32].into())],
-            ).unwrap();
+                    params![history_status, vec![44_u8; 32]],
+                )
+                .unwrap();
             storage
                 .mark_failed("atomic-status", "emb", "existing catalog history")
                 .unwrap();
@@ -1875,7 +1958,8 @@ mod tests {
             // Make only the final catalog write fail, after queue history and status mutations.
             storage
                 .connection()
-                .execute_sync(
+                .expect("connection should open")
+                .execute_batch(
                     "ALTER TABLE embedding_status RENAME COLUMN status TO unavailable_status;",
                 )
                 .unwrap();
@@ -1906,7 +1990,8 @@ mod tests {
             assert_eq!(queue.metrics().snapshot(), metrics);
             storage
                 .connection()
-                .execute_sync(
+                .expect("connection should open")
+                .execute_batch(
                     "ALTER TABLE embedding_status RENAME COLUMN unavailable_status TO status;",
                 )
                 .unwrap();
@@ -1969,20 +2054,17 @@ mod tests {
         );
         assert_eq!(depth.processing, 0);
 
-        let params = [SqliteValue::Text("doc-2".to_owned().into())];
-        let rows = storage
-            .connection().query_with_params_sync("SELECT content_hash FROM embedding_jobs WHERE doc_id = ?1 AND status = 'pending' LIMIT 1;",
-        &params,)
-            .expect("pending row query should succeed");
-        assert_eq!(rows.len(), 1);
-        let pending_hash = rows[0]
-            .get(0)
-            .and_then(|value| match value {
-                SqliteValue::Blob(bytes) => Some(bytes.to_vec()),
-                _ => None,
+        let pending_hash: Option<Vec<u8>> = storage
+            .with_connection(|conn| {
+                conn.query_row(
+                    "SELECT content_hash FROM embedding_jobs WHERE doc_id = ?1 AND status = 'pending' LIMIT 1;",
+                    params!["doc-2"],
+                    |row| row.get(0),
+                )
+                .map_err(map_storage_error)
             })
-            .expect("pending hash should be blob");
-        assert_eq!(pending_hash, hash_b.to_vec());
+            .expect("pending row query should succeed");
+        assert_eq!(pending_hash, Some(hash_b.to_vec()));
     }
 
     #[test]
@@ -2160,15 +2242,12 @@ mod tests {
         let stale_started_at = unix_timestamp_ms()
             .expect("timestamp should resolve")
             .saturating_sub(1_000);
-        let params = [
-            SqliteValue::Integer(stale_started_at),
-            SqliteValue::Integer(claim.job_id),
-        ];
         storage
             .connection()
-            .execute_with_params_sync(
+            .expect("connection should open")
+            .execute(
                 "UPDATE embedding_jobs SET started_at = ?1 WHERE job_id = ?2;",
-                &params,
+                params![stale_started_at, claim.job_id],
             )
             .expect("stale timestamp update should succeed");
 
@@ -2203,15 +2282,12 @@ mod tests {
         let stale_started_at = unix_timestamp_ms()
             .expect("timestamp should resolve")
             .saturating_sub(1_000);
-        let params = [
-            SqliteValue::Integer(stale_started_at),
-            SqliteValue::Integer(claim.job_id),
-        ];
         storage
             .connection()
-            .execute_with_params_sync(
+            .expect("connection should open")
+            .execute(
                 "UPDATE embedding_jobs SET started_at = ?1 WHERE job_id = ?2;",
-                &params,
+                params![stale_started_at, claim.job_id],
             )
             .expect("stale timestamp update should succeed");
 
@@ -2243,15 +2319,12 @@ mod tests {
         let stale_started_at = unix_timestamp_ms()
             .expect("timestamp should resolve")
             .saturating_sub(5_000);
-        let params = [
-            SqliteValue::Integer(stale_started_at),
-            SqliteValue::Integer(claim.job_id),
-        ];
         storage_a
             .connection()
-            .execute_with_params_sync(
+            .expect("connection should open")
+            .execute(
                 "UPDATE embedding_jobs SET started_at = ?1 WHERE job_id = ?2;",
-                &params,
+                params![stale_started_at, claim.job_id],
             )
             .expect("stale timestamp update should succeed");
         drop(queue_a);
@@ -2302,15 +2375,12 @@ mod tests {
         let stale_started_at = unix_timestamp_ms()
             .expect("timestamp should resolve")
             .saturating_sub(5_000);
-        let params = [
-            SqliteValue::Integer(stale_started_at),
-            SqliteValue::Integer(claim.job_id),
-        ];
         storage
             .connection()
-            .execute_with_params_sync(
+            .expect("connection should open")
+            .execute(
                 "UPDATE embedding_jobs SET started_at = ?1 WHERE job_id = ?2;",
-                &params,
+                params![stale_started_at, claim.job_id],
             )
             .expect("stale timestamp update should succeed");
 
@@ -2590,7 +2660,7 @@ mod tests {
     ///
     /// The test uses a channel pattern: worker threads send claim requests
     /// to a dispatcher that serializes queue operations through the storage
-    /// instance's dedicated `FrankenSQLite` worker, matching the production
+    /// instance's dedicated `rusqlite` worker, matching the production
     /// single-queue ownership contract.
     #[test]
     fn concurrent_claim_once_through_shared_queue_has_no_double_assignment() {

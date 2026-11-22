@@ -4,8 +4,8 @@ use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use frankensearch_core::{SearchError, SearchResult};
-use fsqlite::{AsyncConnection, Row};
-use fsqlite_types::value::SqliteValue;
+use rusqlite::types::Value;
+use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
 
 use crate::connection::{Storage, retry_transient_storage};
@@ -148,7 +148,10 @@ impl Storage {
     pub fn get_document(&self, doc_id: &str) -> SearchResult<Option<DocumentRecord>> {
         ensure_non_empty(doc_id, "doc_id")?;
         retry_transient_storage(
-            || get_document_inner(self.connection(), doc_id),
+            || {
+                let conn = self.connection()?;
+                get_document_inner(&conn, doc_id)
+            },
             "document fetch",
         )
     }
@@ -176,22 +179,22 @@ impl Storage {
              ORDER BY d.updated_at DESC \
              LIMIT ?2;";
 
-        let params = [
-            SqliteValue::Text(embedder_id.to_owned().into()),
-            SqliteValue::Integer(limit_i64),
-        ];
-        let rows = retry_transient_storage(
+        let doc_ids = retry_transient_storage(
             || {
-                self.connection()
-                    .query_with_params_sync(sql, &params)
-                    .map_err(storage_error)
+                self.with_connection(|conn| {
+                    let mut stmt = conn.prepare(sql).map_err(storage_error)?;
+                    let mut rows = stmt
+                        .query(params![embedder_id, limit_i64])
+                        .map_err(storage_error)?;
+                    let mut doc_ids = Vec::new();
+                    while let Some(row) = rows.next().map_err(storage_error)? {
+                        doc_ids.push(row_text(row, 0, "documents.doc_id")?);
+                    }
+                    Ok(doc_ids)
+                })
             },
             "pending embedding query",
         )?;
-        let mut doc_ids = Vec::with_capacity(rows.len());
-        for row in &rows {
-            doc_ids.push(row_text(row, 0, "documents.doc_id")?.to_owned());
-        }
 
         tracing::debug!(
             target: "frankensearch.storage",
@@ -266,29 +269,37 @@ impl Storage {
     pub fn count_by_status(&self, embedder_id: &str) -> SearchResult<StatusCounts> {
         ensure_non_empty(embedder_id, "embedder_id")?;
 
-        let params = [SqliteValue::Text(embedder_id.to_owned().into())];
         let rows = retry_transient_storage(
             || {
-                self.connection()
-                    .query_with_params_sync(
-                        "SELECT e.status, COUNT(*) \
+                self.with_connection(|conn| {
+                    let mut stmt = conn
+                        .prepare(
+                            "SELECT e.status, COUNT(*) \
          FROM embedding_status e \
          INNER JOIN documents d ON d.doc_id = e.doc_id \
          WHERE e.embedder_id = ?1 \
          GROUP BY status;",
-                        &params,
-                    )
-                    .map_err(storage_error)
+                        )
+                        .map_err(storage_error)?;
+                    let mut rows = stmt.query(params![embedder_id]).map_err(storage_error)?;
+                    let mut decoded = Vec::new();
+                    while let Some(row) = rows.next().map_err(storage_error)? {
+                        decoded.push((
+                            row_text(row, 0, "embedding_status.status")?,
+                            row_i64(row, 1, "embedding_status.count")?,
+                        ));
+                    }
+                    Ok(decoded)
+                })
             },
             "embedding status count",
         )?;
 
-        let total_docs = i64_to_u64(count_documents(self.connection())?)?;
+        let total_docs = i64_to_u64(count_documents(&*self.connection()?)?)?;
         let mut counts = StatusCounts::default();
-        for row in &rows {
-            let status = row_text(row, 0, "embedding_status.status")?;
-            let count = i64_to_u64(row_i64(row, 1, "embedding_status.count")?)?;
-            match EmbeddingStatus::from_str(status) {
+        for (status, count) in rows {
+            let count = i64_to_u64(count)?;
+            match EmbeddingStatus::from_str(&status) {
                 Some(EmbeddingStatus::Pending) => {
                     counts.pending = counts.pending.saturating_add(count);
                 }
@@ -331,11 +342,10 @@ impl Storage {
     pub fn delete_document(&self, doc_id: &str) -> SearchResult<bool> {
         ensure_non_empty(doc_id, "doc_id")?;
 
-        let params = [SqliteValue::Text(doc_id.to_owned().into())];
         let deleted = retry_transient_storage(
             || {
-                self.connection()
-                    .execute_with_params_sync("DELETE FROM documents WHERE doc_id = ?1;", &params)
+                let conn = self.connection()?;
+                conn.execute("DELETE FROM documents WHERE doc_id = ?1;", params![doc_id])
                     .map_err(storage_error)
             },
             "document delete",
@@ -400,22 +410,13 @@ impl Storage {
     }
 }
 
-pub fn upsert_document(conn: &AsyncConnection, doc: &DocumentRecord) -> SearchResult<usize> {
+pub fn upsert_document(conn: &Connection, doc: &DocumentRecord) -> SearchResult<usize> {
     validate_document(doc)?;
     let content_length = usize_to_i64(doc.content_length, "content_length")?;
     let metadata_json = metadata_to_json(doc.metadata.as_ref())?;
 
     if document_exists(conn, &doc.doc_id)? {
-        let params = [
-            SqliteValue::Text(doc.doc_id.clone().into()),
-            sqlite_text_opt(doc.source_path.as_deref()),
-            SqliteValue::Text(doc.content_preview.clone().into()),
-            SqliteValue::Blob(doc.content_hash.to_vec().into()),
-            SqliteValue::Integer(content_length),
-            SqliteValue::Integer(doc.updated_at),
-            sqlite_text_opt(metadata_json.as_deref()),
-        ];
-        conn.execute_with_params_sync(
+        conn.execute(
             "UPDATE documents SET \
          source_path = ?2, \
          content_preview = ?3, \
@@ -424,43 +425,50 @@ pub fn upsert_document(conn: &AsyncConnection, doc: &DocumentRecord) -> SearchRe
          updated_at = ?6, \
          metadata_json = ?7 \
          WHERE doc_id = ?1;",
-            &params,
+            params![
+                doc.doc_id.clone(),
+                doc.source_path.as_deref(),
+                doc.content_preview.clone(),
+                doc.content_hash.to_vec(),
+                content_length,
+                doc.updated_at,
+                metadata_json.as_deref(),
+            ],
         )
         .map_err(storage_error)
     } else {
-        let params = [
-            SqliteValue::Text(doc.doc_id.clone().into()),
-            sqlite_text_opt(doc.source_path.as_deref()),
-            SqliteValue::Text(doc.content_preview.clone().into()),
-            SqliteValue::Blob(doc.content_hash.to_vec().into()),
-            SqliteValue::Integer(content_length),
-            SqliteValue::Integer(doc.created_at),
-            SqliteValue::Integer(doc.updated_at),
-            sqlite_text_opt(metadata_json.as_deref()),
-        ];
-
-        conn.execute_with_params_sync("INSERT INTO documents \
+        conn.execute(
+            "INSERT INTO documents \
          (doc_id, source_path, content_preview, content_hash, content_length, created_at, updated_at, metadata_json) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8);",
-        &params,)
+            params![
+                doc.doc_id.clone(),
+                doc.source_path.as_deref(),
+                doc.content_preview.clone(),
+                doc.content_hash.to_vec(),
+                content_length,
+                doc.created_at,
+                doc.updated_at,
+                metadata_json.as_deref(),
+            ],
+        )
         .map_err(storage_error)
     }
 }
 
 /// Read one document on the caller's transaction connection.
 pub(crate) fn get_document_inner(
-    conn: &AsyncConnection,
+    conn: &Connection,
     doc_id: &str,
 ) -> SearchResult<Option<DocumentRecord>> {
-    let params = [SqliteValue::Text(doc_id.to_owned().into())];
-    let rows = conn
-        .query_with_params_sync(
+    let mut stmt = conn
+        .prepare(
             "SELECT doc_id, source_path, content_preview, content_hash, content_length, \
          created_at, updated_at, metadata_json FROM documents WHERE doc_id = ?1 LIMIT 1;",
-            &params,
         )
         .map_err(storage_error)?;
-    let Some(row) = rows.first() else {
+    let mut rows = stmt.query(params![doc_id]).map_err(storage_error)?;
+    let Some(row) = rows.next().map_err(storage_error)? else {
         return Ok(None);
     };
     let metadata_json = row_optional_text(row, 7)?;
@@ -470,9 +478,9 @@ pub(crate) fn get_document_inner(
         .transpose()
         .map_err(storage_error)?;
     Ok(Some(DocumentRecord {
-        doc_id: row_text(row, 0, "documents.doc_id")?.to_owned(),
+        doc_id: row_text(row, 0, "documents.doc_id")?,
         source_path: row_optional_text(row, 1)?,
-        content_preview: row_text(row, 2, "documents.content_preview")?.to_owned(),
+        content_preview: row_text(row, 2, "documents.content_preview")?,
         content_hash: row_blob_32(row, 3, "documents.content_hash")?,
         content_length: i64_to_usize(row_i64(row, 4, "documents.content_length")?)?,
         created_at: row_i64(row, 5, "documents.created_at")?,
@@ -482,7 +490,7 @@ pub(crate) fn get_document_inner(
 }
 
 pub(crate) fn mark_embedded_inner(
-    conn: &AsyncConnection,
+    conn: &Connection,
     doc_id: &str,
     embedder_id: &str,
     finished_at: i64,
@@ -490,26 +498,25 @@ pub(crate) fn mark_embedded_inner(
     if !document_exists(conn, doc_id)? {
         return Err(not_found_error("documents", doc_id));
     }
-    let params = [
-        SqliteValue::Text(doc_id.to_owned().into()),
-        SqliteValue::Text(embedder_id.to_owned().into()),
-        SqliteValue::Text(EmbeddingStatus::Embedded.as_str().to_owned().into()),
-        SqliteValue::Integer(finished_at),
-    ];
-    conn.execute_with_params_sync(
+    conn.execute(
         "INSERT INTO embedding_status \
         (doc_id, embedder_id, embedder_revision, status, embedded_at, error_message, retry_count) \
         VALUES (?1, ?2, NULL, ?3, ?4, NULL, 0) \
         ON CONFLICT(doc_id, embedder_id) DO UPDATE SET status = excluded.status, \
         embedded_at = excluded.embedded_at, error_message = NULL;",
-        &params,
+        params![
+            doc_id,
+            embedder_id,
+            EmbeddingStatus::Embedded.as_str(),
+            finished_at,
+        ],
     )
     .map_err(storage_error)?;
     Ok(())
 }
 
 pub(crate) fn mark_failed_inner(
-    conn: &AsyncConnection,
+    conn: &Connection,
     doc_id: &str,
     embedder_id: &str,
     error_message: &str,
@@ -517,27 +524,26 @@ pub(crate) fn mark_failed_inner(
     if !document_exists(conn, doc_id)? {
         return Err(not_found_error("documents", doc_id));
     }
-    let params = [
-        SqliteValue::Text(doc_id.to_owned().into()),
-        SqliteValue::Text(embedder_id.to_owned().into()),
-        SqliteValue::Text(EmbeddingStatus::Failed.as_str().to_owned().into()),
-        SqliteValue::Text(error_message.to_owned().into()),
-    ];
-    conn.execute_with_params_sync(
+    conn.execute(
         "INSERT INTO embedding_status \
         (doc_id, embedder_id, embedder_revision, status, embedded_at, error_message, retry_count) \
         VALUES (?1, ?2, NULL, ?3, NULL, ?4, 1) \
         ON CONFLICT(doc_id, embedder_id) DO UPDATE SET status = excluded.status, \
         embedded_at = NULL, error_message = excluded.error_message, \
         retry_count = embedding_status.retry_count + 1;",
-        &params,
+        params![
+            doc_id,
+            embedder_id,
+            EmbeddingStatus::Failed.as_str(),
+            error_message,
+        ],
     )
     .map_err(storage_error)?;
     Ok(())
 }
 
 pub(crate) fn mark_skipped_inner(
-    conn: &AsyncConnection,
+    conn: &Connection,
     doc_id: &str,
     embedder_id: &str,
     reason: &str,
@@ -545,25 +551,24 @@ pub(crate) fn mark_skipped_inner(
     if !document_exists(conn, doc_id)? {
         return Err(not_found_error("documents", doc_id));
     }
-    let params = [
-        SqliteValue::Text(doc_id.to_owned().into()),
-        SqliteValue::Text(embedder_id.to_owned().into()),
-        SqliteValue::Text(EmbeddingStatus::Skipped.as_str().to_owned().into()),
-        SqliteValue::Text(reason.to_owned().into()),
-    ];
-    conn.execute_with_params_sync(
+    conn.execute(
         "INSERT INTO embedding_status \
         (doc_id, embedder_id, embedder_revision, status, embedded_at, error_message, retry_count) \
         VALUES (?1, ?2, NULL, ?3, NULL, ?4, 0) \
         ON CONFLICT(doc_id, embedder_id) DO UPDATE SET status = excluded.status, \
         embedded_at = NULL, error_message = excluded.error_message;",
-        &params,
+        params![
+            doc_id,
+            embedder_id,
+            EmbeddingStatus::Skipped.as_str(),
+            reason,
+        ],
     )
     .map_err(storage_error)?;
     Ok(())
 }
 
-pub fn list_document_ids(conn: &AsyncConnection, limit: usize) -> SearchResult<Vec<String>> {
+pub fn list_document_ids(conn: &Connection, limit: usize) -> SearchResult<Vec<String>> {
     if limit == 0 {
         return Ok(Vec::new());
     }
@@ -573,45 +578,38 @@ pub fn list_document_ids(conn: &AsyncConnection, limit: usize) -> SearchResult<V
         value: limit.to_string(),
         reason: "limit does not fit in sqlite integer".to_owned(),
     })?;
-    let params = [SqliteValue::Integer(limit_i64)];
-    let rows = retry_transient_storage(
+    let ids = retry_transient_storage(
         || {
-            conn.query_with_params_sync(
-                "SELECT doc_id FROM documents ORDER BY updated_at DESC LIMIT ?1;",
-                &params,
-            )
-            .map_err(storage_error)
+            let mut stmt = conn
+                .prepare("SELECT doc_id FROM documents ORDER BY updated_at DESC LIMIT ?1;")
+                .map_err(storage_error)?;
+            let mut rows = stmt.query(params![limit_i64]).map_err(storage_error)?;
+            let mut ids = Vec::new();
+            while let Some(row) = rows.next().map_err(storage_error)? {
+                ids.push(row_text(row, 0, "documents.doc_id")?);
+            }
+            Ok(ids)
         },
         "document id list",
     )?;
-    let mut ids = Vec::with_capacity(rows.len());
-
-    for row in &rows {
-        ids.push(row_text(row, 0, "documents.doc_id")?.to_owned());
-    }
 
     Ok(ids)
 }
 
-pub fn count_documents(conn: &AsyncConnection) -> SearchResult<i64> {
-    let rows = retry_transient_storage(
+pub fn count_documents(conn: &Connection) -> SearchResult<i64> {
+    retry_transient_storage(
         || {
-            conn.query_sync("SELECT COUNT(*) FROM documents;")
-                .map_err(storage_error)
+            conn.query_row("SELECT COUNT(*) FROM documents;", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map_err(storage_error)
         },
         "document count",
-    )?;
-    let row = rows.first().ok_or_else(|| SearchError::SubsystemError {
-        subsystem: "storage",
-        source: Box::new(std::io::Error::other(
-            "documents count query returned no row",
-        )),
-    })?;
-    row_i64(row, 0, "documents.count")
+    )
 }
 
 fn upsert_document_with_outcome(
-    conn: &AsyncConnection,
+    conn: &Connection,
     doc: &DocumentRecord,
 ) -> SearchResult<UpsertOutcome> {
     validate_document(doc)?;
@@ -668,41 +666,34 @@ fn ensure_non_empty(value: &str, field: &'static str) -> SearchResult<()> {
     Ok(())
 }
 
-fn sqlite_text_opt(value: Option<&str>) -> SqliteValue {
-    value.map_or(SqliteValue::Null, |v| {
-        SqliteValue::Text(v.to_owned().into())
-    })
+fn document_exists(conn: &Connection, doc_id: &str) -> SearchResult<bool> {
+    conn.query_row(
+        "SELECT doc_id FROM documents WHERE doc_id = ?1 LIMIT 1;",
+        params![doc_id],
+        |_| Ok(()),
+    )
+    .optional()
+    .map_err(storage_error)
+    .map(|row| row.is_some())
 }
 
-fn document_exists(conn: &AsyncConnection, doc_id: &str) -> SearchResult<bool> {
-    let params = [SqliteValue::Text(doc_id.to_owned().into())];
-    let rows = conn
-        .query_with_params_sync(
-            "SELECT doc_id FROM documents WHERE doc_id = ?1 LIMIT 1;",
-            &params,
-        )
+fn fetch_content_hash(conn: &Connection, doc_id: &str) -> SearchResult<Option<[u8; 32]>> {
+    let mut stmt = conn
+        .prepare("SELECT content_hash FROM documents WHERE doc_id = ?1 LIMIT 1;")
         .map_err(storage_error)?;
-    Ok(!rows.is_empty())
-}
-
-fn fetch_content_hash(conn: &AsyncConnection, doc_id: &str) -> SearchResult<Option<[u8; 32]>> {
-    let params = [SqliteValue::Text(doc_id.to_owned().into())];
-    let rows = conn
-        .query_with_params_sync(
-            "SELECT content_hash FROM documents WHERE doc_id = ?1 LIMIT 1;",
-            &params,
-        )
-        .map_err(storage_error)?;
-    let Some(row) = rows.first() else {
+    let mut rows = stmt.query(params![doc_id]).map_err(storage_error)?;
+    let Some(row) = rows.next().map_err(storage_error)? else {
         return Ok(None);
     };
     row_blob_32(row, 0, "documents.content_hash").map(Some)
 }
 
-fn reset_embedding_status(conn: &AsyncConnection, doc_id: &str) -> SearchResult<()> {
-    let params = [SqliteValue::Text(doc_id.to_owned().into())];
-    conn.execute_with_params_sync("DELETE FROM embedding_status WHERE doc_id = ?1;", &params)
-        .map_err(storage_error)?;
+fn reset_embedding_status(conn: &Connection, doc_id: &str) -> SearchResult<()> {
+    conn.execute(
+        "DELETE FROM embedding_status WHERE doc_id = ?1;",
+        params![doc_id],
+    )
+    .map_err(storage_error)?;
     Ok(())
 }
 
@@ -745,14 +736,21 @@ fn i64_to_u64(value: i64) -> SearchResult<u64> {
     })
 }
 
-fn row_text<'a>(row: &'a Row, index: usize, field: &str) -> SearchResult<&'a str> {
-    match row.get(index) {
-        Some(SqliteValue::Text(value)) => Ok(value),
+fn row_value(row: &Row<'_>, index: usize) -> SearchResult<Option<Value>> {
+    match row.get::<_, Value>(index) {
+        Ok(value) => Ok(Some(value)),
+        Err(rusqlite::Error::InvalidColumnIndex(_)) => Ok(None),
+        Err(error) => Err(storage_error(error)),
+    }
+}
+
+fn row_text(row: &Row<'_>, index: usize, field: &str) -> SearchResult<String> {
+    match row_value(row, index)? {
+        Some(Value::Text(value)) => Ok(value),
         Some(other) => Err(SearchError::SubsystemError {
             subsystem: "storage",
             source: Box::new(io::Error::other(format!(
-                "unexpected type for {field}: {:?}",
-                other
+                "unexpected type for {field}: {other:?}"
             ))),
         }),
         None => Err(SearchError::SubsystemError {
@@ -762,29 +760,27 @@ fn row_text<'a>(row: &'a Row, index: usize, field: &str) -> SearchResult<&'a str
     }
 }
 
-fn row_optional_text(row: &Row, index: usize) -> SearchResult<Option<String>> {
-    match row.get(index) {
-        Some(SqliteValue::Text(value)) => Ok(Some(value.to_string())),
-        Some(SqliteValue::Null) | None => Ok(None),
+fn row_optional_text(row: &Row<'_>, index: usize) -> SearchResult<Option<String>> {
+    match row_value(row, index)? {
+        Some(Value::Text(value)) => Ok(Some(value)),
+        Some(Value::Null) | None => Ok(None),
         Some(other) => Err(SearchError::SubsystemError {
             subsystem: "storage",
             source: Box::new(io::Error::other(format!(
-                "unexpected optional text type: {:?}",
-                other
+                "unexpected optional text type: {other:?}"
             ))),
         }),
     }
 }
 
-fn row_blob_32(row: &Row, index: usize, field: &str) -> SearchResult<[u8; 32]> {
-    let blob = match row.get(index) {
-        Some(SqliteValue::Blob(blob)) => blob,
+fn row_blob_32(row: &Row<'_>, index: usize, field: &str) -> SearchResult<[u8; 32]> {
+    let blob = match row_value(row, index)? {
+        Some(Value::Blob(blob)) => blob,
         Some(other) => {
             return Err(SearchError::SubsystemError {
                 subsystem: "storage",
                 source: Box::new(io::Error::other(format!(
-                    "unexpected type for {field}: {:?}",
-                    other
+                    "unexpected type for {field}: {other:?}"
                 ))),
             });
         }
@@ -807,18 +803,17 @@ fn row_blob_32(row: &Row, index: usize, field: &str) -> SearchResult<[u8; 32]> {
     }
 
     let mut out = [0_u8; 32];
-    out.copy_from_slice(blob);
+    out.copy_from_slice(&blob);
     Ok(out)
 }
 
-fn row_i64(row: &Row, index: usize, field: &str) -> SearchResult<i64> {
-    match row.get(index) {
-        Some(SqliteValue::Integer(value)) => Ok(*value),
+fn row_i64(row: &Row<'_>, index: usize, field: &str) -> SearchResult<i64> {
+    match row_value(row, index)? {
+        Some(Value::Integer(value)) => Ok(value),
         Some(other) => Err(SearchError::SubsystemError {
             subsystem: "storage",
             source: Box::new(io::Error::other(format!(
-                "unexpected type for {field}: {:?}",
-                other
+                "unexpected type for {field}: {other:?}"
             ))),
         }),
         None => Err(SearchError::SubsystemError {
@@ -908,11 +903,13 @@ mod tests {
             .expect("document should exist");
         assert_eq!(fetched, doc);
         assert_eq!(
-            list_document_ids(storage.connection(), 10).expect("list ids should succeed"),
+            list_document_ids(&storage.connection().expect("connection"), 10)
+                .expect("list ids should succeed"),
             vec!["doc-1".to_owned()]
         );
         assert_eq!(
-            count_documents(storage.connection()).expect("count should succeed"),
+            count_documents(&storage.connection().expect("connection"))
+                .expect("count should succeed"),
             1
         );
     }
@@ -933,7 +930,8 @@ mod tests {
                 .expect("same-hash upsert should succeed")
         );
         assert_eq!(
-            count_documents(storage.connection()).expect("count should succeed"),
+            count_documents(&storage.connection().expect("connection"))
+                .expect("count should succeed"),
             1
         );
     }
@@ -1043,7 +1041,8 @@ mod tests {
         assert_eq!(second.updated, 1);
         assert_eq!(second.unchanged, 1);
         assert_eq!(
-            count_documents(storage.connection()).expect("count should succeed"),
+            count_documents(&storage.connection().expect("connection"))
+                .expect("count should succeed"),
             3
         );
     }
@@ -1068,7 +1067,8 @@ mod tests {
         assert_eq!(first.updated, 0);
         assert_eq!(first.unchanged, 0);
         assert_eq!(
-            count_documents(storage.connection()).expect("count should succeed"),
+            count_documents(&storage.connection().expect("connection"))
+                .expect("count should succeed"),
             i64::try_from(DOC_COUNT).expect("doc count should fit i64")
         );
 
@@ -1097,7 +1097,8 @@ mod tests {
                 .expect("delete should succeed")
         );
         assert_eq!(
-            count_documents(storage.connection()).expect("count should succeed"),
+            count_documents(&storage.connection().expect("connection"))
+                .expect("count should succeed"),
             0
         );
 
@@ -1241,7 +1242,8 @@ mod tests {
         }
 
         assert_eq!(
-            count_documents(storage.connection()).expect("count should succeed"),
+            count_documents(&storage.connection().expect("connection"))
+                .expect("count should succeed"),
             i64::try_from(unicode_ids.len()).expect("len fits i64")
         );
     }
@@ -1352,7 +1354,8 @@ mod tests {
             assert_eq!(counts.pending, 1);
 
             assert_eq!(
-                count_documents(storage.connection()).expect("count should succeed"),
+                count_documents(&storage.connection().expect("connection"))
+                    .expect("count should succeed"),
                 2
             );
         }
@@ -1620,7 +1623,8 @@ mod tests {
         storage
             .upsert_document(&sample_document("doc-1", 1))
             .expect("insert should succeed");
-        let ids = list_document_ids(storage.connection(), 0).expect("limit 0 should succeed");
+        let ids = list_document_ids(&storage.connection().expect("connection"), 0)
+            .expect("limit 0 should succeed");
         assert!(ids.is_empty());
     }
 

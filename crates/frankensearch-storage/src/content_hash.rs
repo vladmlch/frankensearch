@@ -3,8 +3,8 @@ use std::fmt::Write;
 use std::io;
 
 use frankensearch_core::{SearchError, SearchResult};
-use fsqlite::{AsyncConnection, Row};
-use fsqlite_types::value::SqliteValue;
+use rusqlite::types::Value;
+use rusqlite::{Connection, Row, params, params_from_iter};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -87,7 +87,7 @@ pub fn sha256_hex(content: &str) -> String {
 }
 
 pub fn record_content_hash(
-    conn: &AsyncConnection,
+    conn: &Connection,
     content_hash: &str,
     doc_id: &str,
     seen_at: i64,
@@ -99,45 +99,37 @@ pub fn record_content_hash(
             seen_count = content_hashes.seen_count + 1, \
             last_seen_at = excluded.last_seen_at;";
 
-    let params = [
-        SqliteValue::Text(content_hash.to_owned().into()),
-        SqliteValue::Text(doc_id.to_owned().into()),
-        SqliteValue::Integer(seen_at),
-        SqliteValue::Integer(seen_at),
-    ];
-
-    conn.execute_with_params_sync(sql, &params)
+    conn.execute(sql, params![content_hash, doc_id, seen_at, seen_at])
         .map_err(storage_error)
 }
 
 pub fn lookup_content_hash(
-    conn: &AsyncConnection,
+    conn: &Connection,
     content_hash: &str,
 ) -> SearchResult<Option<ContentHashRecord>> {
-    let params = [SqliteValue::Text(content_hash.to_owned().into())];
-    let rows = retry_transient_storage(
+    retry_transient_storage(
         || {
-            conn.query_with_params_sync(
-                "SELECT content_hash, first_doc_id, seen_count, first_seen_at, last_seen_at \
-             FROM content_hashes WHERE content_hash = ?1;",
-                &params,
-            )
-            .map_err(storage_error)
+            let mut stmt = conn
+                .prepare(
+                    "SELECT content_hash, first_doc_id, seen_count, first_seen_at, last_seen_at \
+                 FROM content_hashes WHERE content_hash = ?1;",
+                )
+                .map_err(storage_error)?;
+            let mut rows = stmt.query(params![content_hash]).map_err(storage_error)?;
+            let Some(row) = rows.next().map_err(storage_error)? else {
+                return Ok(None);
+            };
+
+            Ok(Some(ContentHashRecord {
+                content_hash: row_text(row, 0, "content_hashes.content_hash")?,
+                first_doc_id: row_text(row, 1, "content_hashes.first_doc_id")?,
+                seen_count: row_i64(row, 2, "content_hashes.seen_count")?,
+                first_seen_at: row_i64(row, 3, "content_hashes.first_seen_at")?,
+                last_seen_at: row_i64(row, 4, "content_hashes.last_seen_at")?,
+            }))
         },
         "content hash lookup",
-    )?;
-
-    let Some(row) = rows.first() else {
-        return Ok(None);
-    };
-
-    Ok(Some(ContentHashRecord {
-        content_hash: row_text(row, 0, "content_hashes.content_hash")?.to_owned(),
-        first_doc_id: row_text(row, 1, "content_hashes.first_doc_id")?.to_owned(),
-        seen_count: row_i64(row, 2, "content_hashes.seen_count")?,
-        first_seen_at: row_i64(row, 3, "content_hashes.first_seen_at")?,
-        last_seen_at: row_i64(row, 4, "content_hashes.last_seen_at")?,
-    }))
+    )
 }
 
 impl Storage {
@@ -221,7 +213,7 @@ impl Storage {
 }
 
 fn fetch_existing_dedup_rows(
-    conn: &AsyncConnection,
+    conn: &Connection,
     items: &[(String, [u8; 32])],
     embedder_id: &str,
 ) -> SearchResult<HashMap<String, DedupRow>> {
@@ -242,19 +234,20 @@ fn fetch_existing_dedup_rows(
     sql.push_str(");");
 
     let mut params = Vec::with_capacity(items.len() + 1);
-    params.push(SqliteValue::Text(embedder_id.to_owned().into()));
+    params.push(Value::Text(embedder_id.to_owned()));
     for (doc_id, _) in items {
         ensure_non_empty(doc_id, "doc_id")?;
-        params.push(SqliteValue::Text(doc_id.clone().into()));
+        params.push(Value::Text(doc_id.clone()));
     }
 
-    let rows = conn
-        .query_with_params_sync(&sql, &params)
+    let mut stmt = conn.prepare(&sql).map_err(storage_error)?;
+    let mut rows = stmt
+        .query(params_from_iter(params))
         .map_err(storage_error)?;
-    let mut existing = HashMap::with_capacity(rows.len());
+    let mut existing = HashMap::new();
 
-    for row in &rows {
-        let doc_id = row_text(row, 0, "documents.doc_id")?.to_owned();
+    while let Some(row) = rows.next().map_err(storage_error)? {
+        let doc_id = row_text(row, 0, "documents.doc_id")?;
         let content_hash = row_blob_32(row, 1, "documents.content_hash")?;
         let raw_status = row_optional_text(row, 2)?;
         let status = raw_status.as_deref().and_then(EmbeddingStatus::from_str);
@@ -332,15 +325,22 @@ fn validation_error(field: &'static str, reason: impl AsRef<str>) -> SearchError
     }
 }
 
-fn row_optional_text(row: &Row, index: usize) -> SearchResult<Option<String>> {
-    match row.get(index) {
-        Some(SqliteValue::Text(value)) => Ok(Some(value.to_string())),
-        Some(SqliteValue::Null) => Ok(None),
+fn row_value(row: &Row<'_>, index: usize) -> SearchResult<Option<Value>> {
+    match row.get::<_, Value>(index) {
+        Ok(value) => Ok(Some(value)),
+        Err(rusqlite::Error::InvalidColumnIndex(_)) => Ok(None),
+        Err(error) => Err(storage_error(error)),
+    }
+}
+
+fn row_optional_text(row: &Row<'_>, index: usize) -> SearchResult<Option<String>> {
+    match row_value(row, index)? {
+        Some(Value::Text(value)) => Ok(Some(value)),
+        Some(Value::Null) => Ok(None),
         Some(other) => Err(SearchError::SubsystemError {
             subsystem: "storage",
             source: Box::new(io::Error::other(format!(
-                "unexpected optional text type: {:?}",
-                other
+                "unexpected optional text type: {other:?}"
             ))),
         }),
         None => Err(SearchError::SubsystemError {
@@ -352,15 +352,14 @@ fn row_optional_text(row: &Row, index: usize) -> SearchResult<Option<String>> {
     }
 }
 
-fn row_blob_32(row: &Row, index: usize, field: &str) -> SearchResult<[u8; 32]> {
-    let blob = match row.get(index) {
-        Some(SqliteValue::Blob(blob)) => blob,
+fn row_blob_32(row: &Row<'_>, index: usize, field: &str) -> SearchResult<[u8; 32]> {
+    let blob = match row_value(row, index)? {
+        Some(Value::Blob(blob)) => blob,
         Some(other) => {
             return Err(SearchError::SubsystemError {
                 subsystem: "storage",
                 source: Box::new(io::Error::other(format!(
-                    "unexpected type for {field}: {:?}",
-                    other
+                    "unexpected type for {field}: {other:?}"
                 ))),
             });
         }
@@ -383,18 +382,17 @@ fn row_blob_32(row: &Row, index: usize, field: &str) -> SearchResult<[u8; 32]> {
     }
 
     let mut out = [0_u8; 32];
-    out.copy_from_slice(blob);
+    out.copy_from_slice(&blob);
     Ok(out)
 }
 
-fn row_text<'a>(row: &'a Row, index: usize, field: &str) -> SearchResult<&'a str> {
-    match row.get(index) {
-        Some(SqliteValue::Text(value)) => Ok(value),
+fn row_text(row: &Row<'_>, index: usize, field: &str) -> SearchResult<String> {
+    match row_value(row, index)? {
+        Some(Value::Text(value)) => Ok(value),
         Some(other) => Err(SearchError::SubsystemError {
             subsystem: "storage",
             source: Box::new(io::Error::other(format!(
-                "unexpected type for {field}: {:?}",
-                other
+                "unexpected type for {field}: {other:?}"
             ))),
         }),
         None => Err(SearchError::SubsystemError {
@@ -404,14 +402,13 @@ fn row_text<'a>(row: &'a Row, index: usize, field: &str) -> SearchResult<&'a str
     }
 }
 
-fn row_i64(row: &Row, index: usize, field: &str) -> SearchResult<i64> {
-    match row.get(index) {
-        Some(SqliteValue::Integer(value)) => Ok(*value),
+fn row_i64(row: &Row<'_>, index: usize, field: &str) -> SearchResult<i64> {
+    match row_value(row, index)? {
+        Some(Value::Integer(value)) => Ok(value),
         Some(other) => Err(SearchError::SubsystemError {
             subsystem: "storage",
             source: Box::new(io::Error::other(format!(
-                "unexpected type for {field}: {:?}",
-                other
+                "unexpected type for {field}: {other:?}"
             ))),
         }),
         None => Err(SearchError::SubsystemError {
@@ -437,7 +434,7 @@ mod tests {
     use crate::Storage;
     use crate::document::DocumentRecord;
     use crate::document::EmbeddingStatus;
-    use fsqlite_types::value::SqliteValue;
+    use rusqlite::params;
 
     fn hash_with(byte: u8) -> [u8; 32] {
         [byte; 32]
@@ -460,19 +457,15 @@ mod tests {
         embedder_id: &str,
         status: EmbeddingStatus,
     ) {
-        let params = [
-            SqliteValue::Text(doc_id.to_owned().into()),
-            SqliteValue::Text(embedder_id.to_owned().into()),
-            SqliteValue::Text(status.as_str().to_owned().into()),
-        ];
         storage
             .connection()
-            .execute_with_params_sync(
+            .expect("connection")
+            .execute(
                 "INSERT INTO embedding_status \
                  (doc_id, embedder_id, embedder_revision, status, embedded_at, error_message, retry_count) \
                  VALUES (?1, ?2, NULL, ?3, NULL, NULL, 0) \
                  ON CONFLICT(doc_id, embedder_id) DO UPDATE SET status = excluded.status;",
-                &params,
+                params![doc_id, embedder_id, status.as_str()],
             )
             .expect("embedding_status upsert should succeed");
     }

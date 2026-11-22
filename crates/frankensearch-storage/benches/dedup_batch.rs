@@ -20,8 +20,8 @@ use std::hint::black_box;
 
 use frankensearch_core::{SearchError, SearchResult, bench_support::paired_median_ratio};
 use frankensearch_storage::{DeduplicationDecision, DocumentRecord, EmbeddingStatus, Storage};
-use fsqlite::{AsyncConnection, Row};
-use fsqlite_types::value::SqliteValue;
+use rusqlite::types::ValueRef;
+use rusqlite::{Connection, Row, params_from_iter};
 
 const EMBEDDER_ID: &str = "fast-tier";
 
@@ -145,7 +145,7 @@ fn legacy_check_dedup_batch(
 }
 
 fn legacy_fetch_existing_dedup_rows(
-    conn: &AsyncConnection,
+    conn: &Connection,
     items: &[(String, [u8; 32])],
     embedder_id: &str,
 ) -> SearchResult<HashMap<String, LegacyDedupRow>> {
@@ -166,23 +166,22 @@ fn legacy_fetch_existing_dedup_rows(
     sql.push_str(");");
 
     let mut params = Vec::with_capacity(items.len() + 1);
-    params.push(SqliteValue::Text(embedder_id.to_owned().into()));
+    params.push(embedder_id.to_owned());
     for (doc_id, _) in items {
-        params.push(SqliteValue::Text(doc_id.clone().into()));
+        params.push(doc_id.clone());
     }
 
-    let rows = conn
-        .query_with_params_sync(&sql, &params)
-        .map_err(fsqlite_error)?;
-    let mut existing = HashMap::with_capacity(rows.len());
+    let mut stmt = conn.prepare(&sql).map_err(db_error)?;
+    let mut rows = stmt.query(params_from_iter(params)).map_err(db_error)?;
+    let mut existing = HashMap::with_capacity(items.len());
 
-    for row in &rows {
-        let doc_id = row_text(row, 0, "documents.doc_id")?.to_owned();
+    while let Some(row) = rows.next().map_err(db_error)? {
+        let doc_id = row_text(row, 0, "documents.doc_id")?;
         let content_hash = row_blob_32(row, 1, "documents.content_hash")?;
         let raw_status = row_optional_text(row, 2)?;
         let status = raw_status.as_deref().and_then(parse_status);
         existing.insert(
-            doc_id,
+            doc_id.to_owned(),
             LegacyDedupRow {
                 content_hash,
                 status,
@@ -222,7 +221,7 @@ fn slot_join_check_dedup_batch(
 }
 
 fn slot_join_fetch_existing_dedup_slots(
-    conn: &AsyncConnection,
+    conn: &Connection,
     items: &[(String, [u8; 32])],
     embedder_id: &str,
 ) -> SearchResult<Vec<Option<LegacyDedupRow>>> {
@@ -245,17 +244,16 @@ fn slot_join_fetch_existing_dedup_slots(
     );
 
     let mut params = Vec::with_capacity(items.len() + 1);
-    params.push(SqliteValue::Text(embedder_id.to_owned().into()));
+    params.push(embedder_id.to_owned());
     for (doc_id, _) in items {
-        params.push(SqliteValue::Text(doc_id.clone().into()));
+        params.push(doc_id.clone());
     }
 
-    let rows = conn
-        .query_with_params_sync(&sql, &params)
-        .map_err(fsqlite_error)?;
+    let mut stmt = conn.prepare(&sql).map_err(db_error)?;
+    let mut rows = stmt.query(params_from_iter(params)).map_err(db_error)?;
     let mut existing = vec![None; items.len()];
 
-    for row in &rows {
+    while let Some(row) = rows.next().map_err(db_error)? {
         let ord = row_i64(row, 0, "requested.ord")?;
         let index = usize::try_from(ord).map_err(|_| storage_error("negative requested ord"))?;
         if index >= items.len() {
@@ -327,28 +325,28 @@ fn parse_status(value: &str) -> Option<EmbeddingStatus> {
     }
 }
 
-fn row_optional_text(row: &Row, index: usize) -> SearchResult<Option<String>> {
-    match row.get(index) {
-        Some(SqliteValue::Text(value)) => Ok(Some(value.to_string())),
-        Some(SqliteValue::Null) => Ok(None),
-        Some(other) => Err(storage_error(format!(
+fn row_optional_text(row: &Row<'_>, index: usize) -> SearchResult<Option<String>> {
+    match row.get_ref(index).map_err(db_error)? {
+        ValueRef::Text(value) => Ok(Some(
+            std::str::from_utf8(value)
+                .map_err(|_| storage_error("non-utf8 optional text column"))?
+                .to_owned(),
+        )),
+        ValueRef::Null => Ok(None),
+        other => Err(storage_error(format!(
             "unexpected optional text: {other:?}"
-        ))),
-        None => Err(storage_error(format!(
-            "missing optional text column {index}"
         ))),
     }
 }
 
-fn row_blob_32(row: &Row, index: usize, field: &str) -> SearchResult<[u8; 32]> {
-    let blob = match row.get(index) {
-        Some(SqliteValue::Blob(blob)) => blob,
-        Some(other) => {
+fn row_blob_32(row: &Row<'_>, index: usize, field: &str) -> SearchResult<[u8; 32]> {
+    let blob = match row.get_ref(index).map_err(db_error)? {
+        ValueRef::Blob(blob) => blob,
+        other => {
             return Err(storage_error(format!(
                 "unexpected type for {field}: {other:?}"
             )));
         }
-        None => return Err(storage_error(format!("missing column for {field}"))),
     };
 
     if blob.len() != 32 {
@@ -363,38 +361,40 @@ fn row_blob_32(row: &Row, index: usize, field: &str) -> SearchResult<[u8; 32]> {
     Ok(out)
 }
 
-fn row_optional_blob_32(row: &Row, index: usize, field: &str) -> SearchResult<Option<[u8; 32]>> {
-    match row.get(index) {
-        Some(SqliteValue::Null) => Ok(None),
-        Some(SqliteValue::Blob(_)) => row_blob_32(row, index, field).map(Some),
-        Some(other) => Err(storage_error(format!(
+fn row_optional_blob_32(
+    row: &Row<'_>,
+    index: usize,
+    field: &str,
+) -> SearchResult<Option<[u8; 32]>> {
+    match row.get_ref(index).map_err(db_error)? {
+        ValueRef::Null => Ok(None),
+        ValueRef::Blob(_) => row_blob_32(row, index, field).map(Some),
+        other => Err(storage_error(format!(
             "unexpected optional blob for {field}: {other:?}"
         ))),
-        None => Err(storage_error(format!("missing column for {field}"))),
     }
 }
 
-fn row_text<'a>(row: &'a Row, index: usize, field: &str) -> SearchResult<&'a str> {
-    match row.get(index) {
-        Some(SqliteValue::Text(value)) => Ok(value),
-        Some(other) => Err(storage_error(format!(
+fn row_text<'a>(row: &'a Row<'_>, index: usize, field: &str) -> SearchResult<&'a str> {
+    match row.get_ref(index).map_err(db_error)? {
+        ValueRef::Text(value) => std::str::from_utf8(value)
+            .map_err(|_| storage_error(format!("non-utf8 text for {field}"))),
+        other => Err(storage_error(format!(
             "unexpected type for {field}: {other:?}"
         ))),
-        None => Err(storage_error(format!("missing column for {field}"))),
     }
 }
 
-fn row_i64(row: &Row, index: usize, field: &str) -> SearchResult<i64> {
-    match row.get(index) {
-        Some(SqliteValue::Integer(value)) => Ok(*value),
-        Some(other) => Err(storage_error(format!(
+fn row_i64(row: &Row<'_>, index: usize, field: &str) -> SearchResult<i64> {
+    match row.get_ref(index).map_err(db_error)? {
+        ValueRef::Integer(value) => Ok(value),
+        other => Err(storage_error(format!(
             "unexpected type for {field}: {other:?}"
         ))),
-        None => Err(storage_error(format!("missing column for {field}"))),
     }
 }
 
-fn fsqlite_error<E>(source: E) -> SearchError
+fn db_error<E>(source: E) -> SearchError
 where
     E: std::error::Error + Send + Sync + 'static,
 {

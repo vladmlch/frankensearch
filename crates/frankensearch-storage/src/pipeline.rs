@@ -6,8 +6,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use asupersync::Cx;
 use frankensearch_core::generation::QuantizationFormat;
 use frankensearch_core::{Canonicalizer, Embedder, SearchError, SearchResult};
-use fsqlite::AsyncConnection;
-use fsqlite_types::value::SqliteValue;
+use rusqlite::types::Value as SqlValue;
+use rusqlite::{Connection, Row, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -406,15 +406,18 @@ impl StorageBackedJobRunner {
                 });
             }
 
-            let ready_params = [SqliteValue::Integer(now_ms)];
-            let ready_rows = conn.query_with_params_sync("SELECT COUNT(*) FROM embedding_jobs WHERE status = 'pending' AND submitted_at <= ?1;",
-            &ready_params,)
+            let mut ready_stmt = conn
+                .prepare(
+                    "SELECT COUNT(*) FROM embedding_jobs WHERE status = 'pending' AND submitted_at <= ?1;",
+                )
                 .map_err(map_storage_error)?;
-            let ready_pending = if let Some(row) = ready_rows.first() {
-                usize::try_from(row_i64(row, 0, "embedding_jobs.ready_pending")?)
-                    .unwrap_or(usize::MAX)
-            } else {
-                0
+            let mut ready_rows = ready_stmt
+                .query(params![now_ms])
+                .map_err(map_storage_error)?;
+            let ready_pending = match ready_rows.next().map_err(map_storage_error)? {
+                Some(row) => usize::try_from(row_i64(row, 0, "embedding_jobs.ready_pending")?)
+                    .unwrap_or(usize::MAX),
+                None => 0,
             };
 
             if ready_pending > self.queue.config().backpressure_threshold {
@@ -1016,17 +1019,13 @@ struct IngestTxResult {
 }
 
 fn dedup_state_for_doc(
-    conn: &AsyncConnection,
+    conn: &Connection,
     doc_id: &str,
     new_hash: &[u8; 32],
     embedder_id: &str,
 ) -> SearchResult<DedupCheckResult> {
-    let params = [
-        SqliteValue::Text(doc_id.to_owned().into()),
-        SqliteValue::Text(embedder_id.to_owned().into()),
-    ];
-    let rows = conn
-        .query_with_params_sync(
+    let mut stmt = conn
+        .prepare(
             "SELECT d.content_hash, e.status, j.job_id \
      FROM documents d \
      LEFT JOIN embedding_status e \
@@ -1037,10 +1036,12 @@ fn dedup_state_for_doc(
       AND j.status IN ('pending', 'processing') \
      WHERE d.doc_id = ?1 \
      LIMIT 1;",
-            &params,
         )
         .map_err(map_storage_error)?;
-    let Some(row) = rows.first() else {
+    let mut rows = stmt
+        .query(params![doc_id, embedder_id])
+        .map_err(map_storage_error)?;
+    let Some(row) = rows.next().map_err(map_storage_error)? else {
         return Ok(DedupCheckResult {
             state: DedupState::New,
             had_existing_row: false,
@@ -1057,9 +1058,9 @@ fn dedup_state_for_doc(
 
     let raw_status = row_optional_text(row, 1)?;
     let status = raw_status.as_deref().and_then(EmbeddingStatus::from_str);
-    let has_active_job = match row.get(2) {
-        Some(SqliteValue::Integer(_)) => true,
-        Some(SqliteValue::Null) | None => false,
+    let has_active_job = match row_value(row, 2)? {
+        Some(SqlValue::Integer(_)) => true,
+        Some(SqlValue::Null) | None => false,
         Some(other) => {
             return Err(pipeline_error(format!(
                 "unexpected type for dedup active-job flag: {other:?}"
@@ -1081,10 +1082,12 @@ fn dedup_state_for_doc(
     })
 }
 
-fn reset_embedding_status(conn: &AsyncConnection, doc_id: &str) -> SearchResult<()> {
-    let params = [SqliteValue::Text(doc_id.to_owned().into())];
-    conn.execute_with_params_sync("DELETE FROM embedding_status WHERE doc_id = ?1;", &params)
-        .map_err(map_storage_error)?;
+fn reset_embedding_status(conn: &Connection, doc_id: &str) -> SearchResult<()> {
+    conn.execute(
+        "DELETE FROM embedding_status WHERE doc_id = ?1;",
+        params![doc_id],
+    )
+    .map_err(map_storage_error)?;
     Ok(())
 }
 
@@ -1235,19 +1238,24 @@ fn unix_timestamp_ms() -> SearchResult<i64> {
         .map_err(|_| pipeline_error("system timestamp overflowed i64 milliseconds"))
 }
 
-fn row_optional_text(row: &fsqlite::Row, index: usize) -> SearchResult<Option<String>> {
-    match row.get(index) {
-        Some(SqliteValue::Text(value)) => Ok(Some(value.to_string())),
-        Some(SqliteValue::Null) | None => Ok(None),
+fn row_value(row: &Row<'_>, index: usize) -> SearchResult<Option<SqlValue>> {
+    row.get::<_, Option<SqlValue>>(index)
+        .map_err(map_storage_error)
+}
+
+fn row_optional_text(row: &Row<'_>, index: usize) -> SearchResult<Option<String>> {
+    match row_value(row, index)? {
+        Some(SqlValue::Text(value)) => Ok(Some(value)),
+        Some(SqlValue::Null) | None => Ok(None),
         Some(other) => Err(pipeline_error(format!(
             "unexpected optional text column type at index {index}: {other:?}"
         ))),
     }
 }
 
-fn row_blob_32(row: &fsqlite::Row, index: usize, field: &str) -> SearchResult<[u8; 32]> {
-    let bytes = match row.get(index) {
-        Some(SqliteValue::Blob(value)) => value,
+fn row_blob_32(row: &Row<'_>, index: usize, field: &str) -> SearchResult<[u8; 32]> {
+    let bytes = match row_value(row, index)? {
+        Some(SqlValue::Blob(value)) => value,
         Some(other) => {
             return Err(pipeline_error(format!(
                 "unexpected type for {field}: {other:?}"
@@ -1264,7 +1272,7 @@ fn row_blob_32(row: &fsqlite::Row, index: usize, field: &str) -> SearchResult<[u
     }
 
     let mut out = [0_u8; 32];
-    out.copy_from_slice(bytes);
+    out.copy_from_slice(&bytes);
     Ok(out)
 }
 
@@ -1776,10 +1784,11 @@ mod tests {
             runner
                 .storage
                 .connection()
-                .execute_with_params_sync(
+                .expect("connection should open")
+                .execute(
                     "UPDATE embedding_jobs SET started_at = 0 \
                      WHERE doc_id = ?1 AND status = 'processing';",
-                    &[SqliteValue::Text(doc_id.to_owned().into())],
+                    params![doc_id],
                 )
                 .unwrap(),
             1,
@@ -2368,7 +2377,8 @@ mod tests {
                 runner
                     .storage
                     .connection()
-                    .execute_sync(
+                    .expect("connection should open")
+                    .execute_batch(
                         "UPDATE embedding_jobs SET priority = 100 WHERE doc_id = 'first';",
                     )
                     .unwrap();
@@ -2713,16 +2723,13 @@ mod tests {
             let stale_started = unix_timestamp_ms()
                 .expect("timestamp should resolve")
                 .saturating_sub(10_000);
-            let params = [
-                SqliteValue::Integer(stale_started),
-                SqliteValue::Integer(claimed[0].job_id),
-            ];
             runner
                 .storage
                 .connection()
-                .execute_with_params_sync(
+                .expect("connection should open")
+                .execute(
                     "UPDATE embedding_jobs SET started_at = ?1 WHERE job_id = ?2;",
-                    &params,
+                    params![stale_started, claimed[0].job_id],
                 )
                 .expect("stale timestamp update should succeed");
 
@@ -2811,7 +2818,8 @@ mod tests {
             runner
                 .storage
                 .connection()
-                .execute_sync("DELETE FROM embedding_jobs;")
+                .expect("connection should open")
+                .execute_batch("DELETE FROM embedding_jobs;")
                 .expect("manual delete should succeed");
 
             let zombie_depth = runner.queue.queue_depth().expect("depth");
@@ -3093,16 +3101,13 @@ mod tests {
                 let stale_started = unix_timestamp_ms()
                     .expect("timestamp should resolve")
                     .saturating_sub(10_000);
-                let params = [
-                    SqliteValue::Integer(stale_started),
-                    SqliteValue::Integer(claimed[0].job_id),
-                ];
                 runner
                     .storage
                     .connection()
-                    .execute_with_params_sync(
+                    .expect("connection should open")
+                    .execute(
                         "UPDATE embedding_jobs SET started_at = ?1 WHERE job_id = ?2;",
-                        &params,
+                        params![stale_started, claimed[0].job_id],
                     )
                     .expect("stale timestamp update should succeed");
 
@@ -3257,19 +3262,22 @@ mod tests {
             assert!(!result.fast_job_enqueued, "hash tier should not enqueue");
 
             // Manually insert a hash-tier queue row to exercise skip path in process_batch.
-            let params = [
-                SqliteValue::Text("doc-hash".to_owned().into()),
-                SqliteValue::Text("fnv1a-384".to_owned().into()),
-                SqliteValue::Integer(1),
-                SqliteValue::Integer(unix_timestamp_ms().expect("timestamp should resolve")),
-                SqliteValue::Blob(ContentHasher::hash("hash tier").to_vec().into()),
-            ];
             runner
                 .storage
-                .connection().execute_with_params_sync("INSERT INTO embedding_jobs (\
+                .connection()
+                .expect("connection should open")
+                .execute(
+                    "INSERT INTO embedding_jobs (\
                 doc_id, embedder_id, priority, submitted_at, status, retry_count, max_retries, content_hash\
              ) VALUES (?1, ?2, ?3, ?4, 'pending', 0, 1, ?5);",
-            &params,)
+                    params![
+                        "doc-hash",
+                        "fnv1a-384",
+                        1_i64,
+                        unix_timestamp_ms().expect("timestamp should resolve"),
+                        ContentHasher::hash("hash tier").to_vec(),
+                    ],
+                )
                 .expect("manual queue insert should succeed");
 
             let processed = runner
@@ -4031,7 +4039,7 @@ mod integration_tests {
     use frankensearch_core::canonicalize::DefaultCanonicalizer;
     use frankensearch_core::traits::{ModelCategory, SearchFuture};
     use frankensearch_core::{Canonicalizer, Embedder, EmbeddingIdentityBundleV1, SearchError};
-    use fsqlite_types::value::SqliteValue;
+    use rusqlite::params;
 
     use crate::connection::Storage;
     use crate::index_metadata::{BuildTrigger, RecordBuildParams};
@@ -4328,6 +4336,11 @@ mod integration_tests {
                 .record_index_build(&sample_build_params("idx-fast", "fast-tier", 50))
                 .expect("record build");
 
+            // Staleness counts documents with `created_at > built_at` at
+            // millisecond resolution; ensure the phase-2 documents land in a
+            // later millisecond than the recorded build timestamp.
+            asupersync::time::sleep(cx.now(), Duration::from_millis(2)).await;
+
             // Staleness should be None right after build (no new docs).
             let detector = StorageBackedStaleness::with_defaults(Arc::clone(&storage));
             let report = detector.check("idx-fast", Some("v1.0")).expect("check");
@@ -4518,15 +4531,12 @@ mod integration_tests {
                 .expect("timestamp")
                 .saturating_sub(100_000);
             for job in &claimed {
-                let params = [
-                    SqliteValue::Integer(stale_ts),
-                    SqliteValue::Integer(job.job_id),
-                ];
                 storage
                     .connection()
-                    .execute_with_params_sync(
+                    .expect("connection should open")
+                    .execute(
                         "UPDATE embedding_jobs SET started_at = ?1 WHERE job_id = ?2;",
-                        &params,
+                        params![stale_ts, job.job_id],
                     )
                     .expect("backdate");
             }

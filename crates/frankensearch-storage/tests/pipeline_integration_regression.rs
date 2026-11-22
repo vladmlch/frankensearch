@@ -13,7 +13,7 @@ use frankensearch_storage::{
     EmbeddingVectorSink, InMemoryVectorSink, IngestAction, IngestRequest, JobQueueConfig,
     PersistentJobQueue, PipelineConfig, Storage, StorageBackedJobRunner,
 };
-use fsqlite_types::value::SqliteValue;
+use rusqlite::params;
 
 #[derive(Debug)]
 struct StubEmbedder {
@@ -644,20 +644,15 @@ fn worker_reclaims_stale_jobs_on_startup_and_logs_exit() {
                 .expect("claim should succeed");
             assert_eq!(claimed.len(), 1);
 
-            let params = [
-                SqliteValue::Integer(1),
-                SqliteValue::Integer(claimed[0].job_id),
-            ];
-            // Plant a stale `started_at` through FrankenSQLite 0.3's
-            // synchronous facade. The 0.3 async statement API takes
-            // `fsqlite_types::Cx`, not `asupersync::Cx`; the worker below
-            // still uses the asupersync `Cx`. This remains a real SQL write
+            // Plant a stale `started_at` through the storage connection's
+            // synchronous rusqlite facade. This remains a real SQL write
             // against the same connection the reclaim assertion depends on.
             storage
                 .connection()
-                .execute_with_params_sync(
+                .expect("connection should open")
+                .execute(
                     "UPDATE embedding_jobs SET started_at = ?1 WHERE job_id = ?2;",
-                    &params,
+                    params![1_i64, claimed[0].job_id],
                 )
                 .expect("stale timestamp update should succeed");
 

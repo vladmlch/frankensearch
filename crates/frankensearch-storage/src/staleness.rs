@@ -1,6 +1,6 @@
 //! Storage-backed staleness detector for frankensearch indices.
 //!
-//! Bridges the `FrankenSQLite` storage layer (bd-3w1.11 index metadata, bd-3w1.2
+//! Bridges the `rusqlite` storage layer (bd-3w1.11 index metadata, bd-3w1.2
 //! document metadata) with the `IndexCache` staleness detection system (bd-3un.41).
 //! Instead of relying solely on file timestamps, this queries the document store
 //! for precise change detection.
@@ -179,7 +179,7 @@ impl StorageBackedStaleness {
         )?;
 
         // Gather document stats.
-        let total_docs = count_documents(self.storage.connection())?;
+        let total_docs = count_documents(&*self.storage.connection()?)?;
         let total_documents = usize::try_from(total_docs).unwrap_or(0);
 
         // Get index metadata for build info.

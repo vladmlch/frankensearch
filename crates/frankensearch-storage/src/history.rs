@@ -1,42 +1,52 @@
 //! Search history and bookmark persistence.
 //!
 //! Stores recent search queries with metadata (result count, latency, query
-//! class) and user bookmarks of individual search results. Both are backed
-//! by `FrankenSQLite` tables added in schema version 6.
+//! class) and user bookmarks of individual search results.
 
 use std::io;
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 
 use frankensearch_core::{SearchError, SearchResult};
-use fsqlite::AsyncConnection;
-use fsqlite_types::value::SqliteValue;
+use rusqlite::types::Value;
+use rusqlite::{Connection, Row, params};
 
-use crate::connection::{map_storage_error, retry_transient_storage, unretryable_rollback_error};
+use crate::connection::{
+    map_storage_error, map_storage_error_at, retry_transient_storage, unretryable_rollback_error,
+};
 
 fn with_history_transaction<T>(
-    conn: &AsyncConnection,
-    mut op: impl FnMut(&AsyncConnection) -> SearchResult<T>,
+    conn: &mut Connection,
+    mut op: impl FnMut(&Connection) -> SearchResult<T>,
 ) -> SearchResult<T> {
     retry_transient_storage(
         || {
-            conn.execute_sync("BEGIN CONCURRENT;")
-                .map_err(map_storage_error)?;
-            match op(conn) {
-                Ok(value) => {
-                    conn.commit_transaction_sync().map_err(|commit_err| {
-                        match conn.rollback_transaction_sync() {
-                            Ok(()) => map_storage_error(commit_err),
-                            Err(rollback_err) => unretryable_rollback_error(
-                                &map_storage_error(commit_err),
-                                &rollback_err,
-                            ),
-                        }
-                    })?;
-                    Ok(value)
-                }
-                Err(error) => match conn.rollback_transaction_sync() {
+            // `&mut Connection` makes a nested `BEGIN` a compile-time
+            // impossibility; `Transaction`'s `DropBehavior::Rollback` plus the
+            // explicit `catch_unwind` arm below restore autocommit on error
+            // and panic alike.
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(|error| map_storage_error_at("history transaction begin", error))?;
+            let result = catch_unwind(AssertUnwindSafe(|| op(&tx)));
+            match result {
+                Ok(Ok(value)) => tx
+                    .commit()
+                    .map(|()| value)
+                    .map_err(|error| map_storage_error_at("history transaction commit", error)),
+                Ok(Err(error)) => match tx.rollback() {
                     Ok(()) => Err(error),
                     Err(rollback_err) => Err(unretryable_rollback_error(&error, &rollback_err)),
                 },
+                Err(payload) => {
+                    if let Err(rollback_err) = tx.rollback() {
+                        tracing::error!(
+                            target: "frankensearch.storage",
+                            error = %rollback_err,
+                            "critical: rollback failed during history transaction panic recovery"
+                        );
+                    }
+                    resume_unwind(payload);
+                }
             }
         },
         "search history",
@@ -72,7 +82,7 @@ pub struct SearchHistoryEntry {
 /// seconds, the existing entry is updated instead of creating a duplicate.
 #[allow(clippy::too_many_arguments)]
 pub fn record_search(
-    conn: &AsyncConnection,
+    conn: &mut Connection,
     query: &str,
     query_class: Option<&str>,
     result_count: Option<i64>,
@@ -99,7 +109,7 @@ pub fn record_search(
 
 #[allow(clippy::too_many_arguments)]
 fn record_search_once(
-    conn: &AsyncConnection,
+    conn: &Connection,
     query: &str,
     query_class: Option<&str>,
     result_count: Option<i64>,
@@ -111,64 +121,48 @@ fn record_search_once(
 ) -> SearchResult<()> {
     // Check for a recent duplicate within the dedup window.
     let window_start = searched_at.saturating_sub(dedup_window_secs);
-    let dedup_params = [
-        SqliteValue::Text(query.to_owned().into()),
-        SqliteValue::Integer(window_start),
-    ];
-    let existing = conn
-        .query_with_params_sync(
-            "SELECT id FROM search_history \
+    let existing_id = optional_first_i64(
+        conn,
+        "SELECT id FROM search_history \
      WHERE query = ?1 \
      AND searched_at >= ?2 \
      ORDER BY searched_at DESC LIMIT 1;",
-            &dedup_params,
-        )
-        .map_err(map_storage_error)?;
+        params![query, window_start],
+    )?;
 
-    if let Some(row) = existing.first() {
+    if let Some(existing_id) = existing_id {
         // Update the existing entry with new metadata.
-        let existing_id = match row.get(0) {
-            Some(SqliteValue::Integer(id)) => *id,
-            _ => {
-                return Err(SearchError::SubsystemError {
-                    subsystem: "storage",
-                    source: Box::new(io::Error::other("unexpected type for search_history.id")),
-                });
-            }
-        };
-        let update_params = [
-            opt_i64(result_count),
-            opt_i64(phase1_latency_ms),
-            opt_i64(phase2_latency_ms),
-            opt_text(top_results_json),
-            SqliteValue::Integer(searched_at),
-            SqliteValue::Integer(existing_id),
-        ];
-        conn.execute_with_params_sync(
+        conn.execute(
             "UPDATE search_history SET \
          result_count = ?1, phase1_latency_ms = ?2, phase2_latency_ms = ?3, \
          top_results_json = ?4, searched_at = ?5 \
          WHERE id = ?6;",
-            &update_params,
+            params![
+                result_count,
+                phase1_latency_ms,
+                phase2_latency_ms,
+                top_results_json,
+                searched_at,
+                existing_id,
+            ],
         )
         .map_err(map_storage_error)?;
     } else {
         // Insert a new entry.
-        let insert_params = [
-            SqliteValue::Text(query.to_owned().into()),
-            opt_text(query_class),
-            opt_i64(result_count),
-            opt_i64(phase1_latency_ms),
-            opt_i64(phase2_latency_ms),
-            opt_text(top_results_json),
-            SqliteValue::Integer(searched_at),
-        ];
-        conn.execute_with_params_sync(
+        conn.execute(
             "INSERT INTO search_history \
          (query, query_class, result_count, phase1_latency_ms, \
           phase2_latency_ms, top_results_json, searched_at) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7);",
-            &insert_params,
+            params![
+                query,
+                query_class,
+                result_count,
+                phase1_latency_ms,
+                phase2_latency_ms,
+                top_results_json,
+                searched_at,
+            ],
         )
         .map_err(map_storage_error)?;
     }
@@ -200,7 +194,7 @@ fn limit_to_i64(limit: usize, field: &'static str) -> SearchResult<i64> {
 
 /// Retrieve search history in most-recent-first order.
 pub fn list_search_history(
-    conn: &AsyncConnection,
+    conn: &Connection,
     limit: usize,
 ) -> SearchResult<Vec<SearchHistoryEntry>> {
     if limit == 0 {
@@ -208,30 +202,31 @@ pub fn list_search_history(
     }
 
     let limit_i64 = limit_to_i64(limit, "history.limit")?;
-    let params = [SqliteValue::Integer(limit_i64)];
-    let rows = retry_transient_storage(
+    let entries = retry_transient_storage(
         || {
-            conn.query_with_params_sync(
-                "SELECT id, query, query_class, result_count, phase1_latency_ms, \
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, query, query_class, result_count, phase1_latency_ms, \
      phase2_latency_ms, top_results_json, searched_at \
      FROM search_history ORDER BY searched_at DESC LIMIT ?1;",
-                &params,
-            )
-            .map_err(map_storage_error)
+                )
+                .map_err(map_storage_error)?;
+            let mut rows = stmt.query(params![limit_i64]).map_err(map_storage_error)?;
+            let mut entries = Vec::new();
+            while let Some(row) = rows.next().map_err(map_storage_error)? {
+                entries.push(parse_history_row(row)?);
+            }
+            Ok(entries)
         },
         "search history list",
     )?;
 
-    let mut entries = Vec::with_capacity(rows.len());
-    for row in &rows {
-        entries.push(parse_history_row(row)?);
-    }
     Ok(entries)
 }
 
 /// Find history entries matching a prefix (for auto-suggest).
 pub fn search_history_prefix(
-    conn: &AsyncConnection,
+    conn: &Connection,
     prefix: &str,
     limit: usize,
 ) -> SearchResult<Vec<SearchHistoryEntry>> {
@@ -241,48 +236,45 @@ pub fn search_history_prefix(
 
     let pattern = format!("{}%", escape_like_pattern(prefix));
     let limit_i64 = limit_to_i64(limit, "history.prefix_limit")?;
-    let params = [
-        SqliteValue::Text(pattern.into()),
-        SqliteValue::Integer(limit_i64),
-    ];
-    let rows = retry_transient_storage(
+    let entries = retry_transient_storage(
         || {
-            conn.query_with_params_sync(
-                "SELECT id, query, query_class, result_count, phase1_latency_ms, \
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, query, query_class, result_count, phase1_latency_ms, \
      phase2_latency_ms, top_results_json, searched_at \
      FROM search_history WHERE query LIKE ?1 ESCAPE '\\' \
      ORDER BY searched_at DESC LIMIT ?2;",
-                &params,
-            )
-            .map_err(map_storage_error)
+                )
+                .map_err(map_storage_error)?;
+            let mut rows = stmt
+                .query(params![pattern, limit_i64])
+                .map_err(map_storage_error)?;
+            let mut entries = Vec::new();
+            while let Some(row) = rows.next().map_err(map_storage_error)? {
+                entries.push(parse_history_row(row)?);
+            }
+            Ok(entries)
         },
         "search history prefix",
     )?;
 
-    let mut entries = Vec::with_capacity(rows.len());
-    for row in &rows {
-        entries.push(parse_history_row(row)?);
-    }
     Ok(entries)
 }
 
 /// Count total search history entries.
-pub fn count_search_history(conn: &AsyncConnection) -> SearchResult<i64> {
+pub fn count_search_history(conn: &Connection) -> SearchResult<i64> {
     retry_transient_storage(|| count_search_history_once(conn), "search history count")
 }
 
-fn count_search_history_once(conn: &AsyncConnection) -> SearchResult<i64> {
-    let rows = conn
-        .query_sync("SELECT COUNT(*) FROM search_history;")
-        .map_err(map_storage_error)?;
-    match rows.first().and_then(|r| r.get(0)) {
-        Some(SqliteValue::Integer(count)) => Ok(*count),
-        _ => Ok(0),
-    }
+fn count_search_history_once(conn: &Connection) -> SearchResult<i64> {
+    conn.query_row("SELECT COUNT(*) FROM search_history;", [], |row| {
+        row.get::<_, i64>(0)
+    })
+    .map_err(map_storage_error)
 }
 
 /// Truncate search history to keep only the most recent `max_entries`.
-pub fn truncate_search_history(conn: &AsyncConnection, max_entries: usize) -> SearchResult<i64> {
+pub fn truncate_search_history(conn: &mut Connection, max_entries: usize) -> SearchResult<i64> {
     let max_entries_i64 = limit_to_i64(max_entries, "history.max_entries")?;
     with_history_transaction(conn, |conn| {
         let count = count_search_history_once(conn)?;
@@ -291,11 +283,10 @@ pub fn truncate_search_history(conn: &AsyncConnection, max_entries: usize) -> Se
         }
 
         let to_delete = count - max_entries_i64;
-        let params = [SqliteValue::Integer(to_delete)];
-        conn.execute_with_params_sync(
+        conn.execute(
             "DELETE FROM search_history WHERE id IN (\
      SELECT id FROM search_history ORDER BY searched_at ASC LIMIT ?1);",
-            &params,
+            params![to_delete],
         )
         .map_err(map_storage_error)?;
 
@@ -303,33 +294,24 @@ pub fn truncate_search_history(conn: &AsyncConnection, max_entries: usize) -> Se
     })
 }
 
-fn parse_history_row(row: &fsqlite::Row) -> SearchResult<SearchHistoryEntry> {
-    let id = match row.get(0) {
-        Some(SqliteValue::Integer(v)) => *v,
-        _ => {
-            return Err(SearchError::SubsystemError {
-                subsystem: "storage",
-                source: Box::new(io::Error::other("missing search_history.id")),
-            });
-        }
+fn parse_history_row(row: &Row<'_>) -> SearchResult<SearchHistoryEntry> {
+    let Some(Value::Integer(id)) = row_value(row, 0)? else {
+        return Err(SearchError::SubsystemError {
+            subsystem: "storage",
+            source: Box::new(io::Error::other("missing search_history.id")),
+        });
     };
-    let query = match row.get(1) {
-        Some(SqliteValue::Text(v)) => v.to_string(),
-        _ => {
-            return Err(SearchError::SubsystemError {
-                subsystem: "storage",
-                source: Box::new(io::Error::other("missing search_history.query")),
-            });
-        }
+    let Some(Value::Text(query)) = row_value(row, 1)? else {
+        return Err(SearchError::SubsystemError {
+            subsystem: "storage",
+            source: Box::new(io::Error::other("missing search_history.query")),
+        });
     };
-    let searched_at = match row.get(7) {
-        Some(SqliteValue::Integer(v)) => *v,
-        _ => {
-            return Err(SearchError::SubsystemError {
-                subsystem: "storage",
-                source: Box::new(io::Error::other("missing search_history.searched_at")),
-            });
-        }
+    let Some(Value::Integer(searched_at)) = row_value(row, 7)? else {
+        return Err(SearchError::SubsystemError {
+            subsystem: "storage",
+            source: Box::new(io::Error::other("missing search_history.searched_at")),
+        });
     };
 
     Ok(SearchHistoryEntry {
@@ -363,7 +345,7 @@ pub struct Bookmark {
 
 /// Add a bookmark. If the same (`doc_id`, query) pair exists, updates the note.
 pub fn add_bookmark(
-    conn: &AsyncConnection,
+    conn: &mut Connection,
     doc_id: &str,
     query: Option<&str>,
     note: Option<&str>,
@@ -375,7 +357,7 @@ pub fn add_bookmark(
 }
 
 fn add_bookmark_once(
-    conn: &AsyncConnection,
+    conn: &Connection,
     doc_id: &str,
     query: Option<&str>,
     note: Option<&str>,
@@ -383,58 +365,33 @@ fn add_bookmark_once(
 ) -> SearchResult<()> {
     // Check for existing bookmark with same (doc_id, query) pair.
     // Handle NULL query explicitly since SQL NULL != NULL.
-    let existing = if let Some(q) = query {
-        let check_params = [
-            SqliteValue::Text(doc_id.to_owned().into()),
-            SqliteValue::Text(q.to_owned().into()),
-        ];
-        conn.query_with_params_sync(
+    let existing_id = if let Some(q) = query {
+        optional_first_i64(
+            conn,
             "SELECT id FROM bookmarks \
          WHERE doc_id = ?1 AND query = ?2 LIMIT 1;",
-            &check_params,
-        )
-        .map_err(map_storage_error)?
+            params![doc_id, q],
+        )?
     } else {
-        let check_params = [SqliteValue::Text(doc_id.to_owned().into())];
-        conn.query_with_params_sync(
+        optional_first_i64(
+            conn,
             "SELECT id FROM bookmarks \
          WHERE doc_id = ?1 AND query IS NULL LIMIT 1;",
-            &check_params,
-        )
-        .map_err(map_storage_error)?
+            params![doc_id],
+        )?
     };
 
-    if let Some(row) = existing.first() {
-        let existing_id = match row.get(0) {
-            Some(SqliteValue::Integer(id)) => *id,
-            _ => {
-                return Err(SearchError::SubsystemError {
-                    subsystem: "storage",
-                    source: Box::new(io::Error::other("unexpected type for bookmarks.id")),
-                });
-            }
-        };
-        let update_params = [
-            opt_text(note),
-            SqliteValue::Integer(created_at),
-            SqliteValue::Integer(existing_id),
-        ];
-        conn.execute_with_params_sync(
+    if let Some(existing_id) = existing_id {
+        conn.execute(
             "UPDATE bookmarks SET note = ?1, created_at = ?2 WHERE id = ?3;",
-            &update_params,
+            params![note, created_at, existing_id],
         )
         .map_err(map_storage_error)?;
     } else {
-        let insert_params = [
-            SqliteValue::Text(doc_id.to_owned().into()),
-            opt_text(query),
-            opt_text(note),
-            SqliteValue::Integer(created_at),
-        ];
-        conn.execute_with_params_sync(
+        conn.execute(
             "INSERT INTO bookmarks (doc_id, query, note, created_at) \
          VALUES (?1, ?2, ?3, ?4);",
-            &insert_params,
+            params![doc_id, query, note, created_at],
         )
         .map_err(map_storage_error)?;
     }
@@ -442,126 +399,117 @@ fn add_bookmark_once(
 }
 
 /// Remove a bookmark by its row ID.
-pub fn remove_bookmark(conn: &AsyncConnection, bookmark_id: i64) -> SearchResult<bool> {
+pub fn remove_bookmark(conn: &mut Connection, bookmark_id: i64) -> SearchResult<bool> {
     with_history_transaction(conn, |conn| remove_bookmark_once(conn, bookmark_id))
 }
 
-fn remove_bookmark_once(conn: &AsyncConnection, bookmark_id: i64) -> SearchResult<bool> {
-    let params = [SqliteValue::Integer(bookmark_id)];
-    let existed = !conn
-        .query_with_params_sync("SELECT 1 FROM bookmarks WHERE id = ?1 LIMIT 1;", &params)
-        .map_err(map_storage_error)?
-        .is_empty();
+fn remove_bookmark_once(conn: &Connection, bookmark_id: i64) -> SearchResult<bool> {
+    let existed = optional_first_i64(
+        conn,
+        "SELECT 1 FROM bookmarks WHERE id = ?1 LIMIT 1;",
+        params![bookmark_id],
+    )?
+    .is_some();
 
     if !existed {
         return Ok(false);
     }
 
-    conn.execute_with_params_sync("DELETE FROM bookmarks WHERE id = ?1;", &params)
+    conn.execute("DELETE FROM bookmarks WHERE id = ?1;", params![bookmark_id])
         .map_err(map_storage_error)?;
 
     // Verify deletion completed.
-    let check = conn
-        .query_with_params_sync("SELECT id FROM bookmarks WHERE id = ?1;", &params)
-        .map_err(map_storage_error)?;
-    Ok(check.is_empty())
+    let remaining = optional_first_i64(
+        conn,
+        "SELECT id FROM bookmarks WHERE id = ?1;",
+        params![bookmark_id],
+    )?;
+    Ok(remaining.is_none())
 }
 
 /// Remove a bookmark by document ID (removes all bookmarks for that doc).
-pub fn remove_bookmark_by_doc(conn: &AsyncConnection, doc_id: &str) -> SearchResult<()> {
+pub fn remove_bookmark_by_doc(conn: &mut Connection, doc_id: &str) -> SearchResult<()> {
     with_history_transaction(conn, |conn| {
-        let params = [SqliteValue::Text(doc_id.to_owned().into())];
-        conn.execute_with_params_sync("DELETE FROM bookmarks WHERE doc_id = ?1;", &params)
+        conn.execute("DELETE FROM bookmarks WHERE doc_id = ?1;", params![doc_id])
             .map_err(map_storage_error)?;
         Ok(())
     })
 }
 
 /// List all bookmarks in most-recent-first order.
-pub fn list_bookmarks(conn: &AsyncConnection, limit: usize) -> SearchResult<Vec<Bookmark>> {
+pub fn list_bookmarks(conn: &Connection, limit: usize) -> SearchResult<Vec<Bookmark>> {
     if limit == 0 {
         return Ok(Vec::new());
     }
 
     let limit_i64 = limit_to_i64(limit, "bookmarks.limit")?;
-    let params = [SqliteValue::Integer(limit_i64)];
-    let rows = retry_transient_storage(
+    let bookmarks = retry_transient_storage(
         || {
-            conn.query_with_params_sync(
-                "SELECT id, doc_id, query, note, created_at \
+            let mut stmt = conn
+                .prepare(
+                    "SELECT id, doc_id, query, note, created_at \
      FROM bookmarks ORDER BY created_at DESC LIMIT ?1;",
-                &params,
-            )
-            .map_err(map_storage_error)
+                )
+                .map_err(map_storage_error)?;
+            let mut rows = stmt.query(params![limit_i64]).map_err(map_storage_error)?;
+            let mut bookmarks = Vec::new();
+            while let Some(row) = rows.next().map_err(map_storage_error)? {
+                bookmarks.push(parse_bookmark_row(row)?);
+            }
+            Ok(bookmarks)
         },
         "bookmark list",
     )?;
 
-    let mut bookmarks = Vec::with_capacity(rows.len());
-    for row in &rows {
-        bookmarks.push(parse_bookmark_row(row)?);
-    }
     Ok(bookmarks)
 }
 
 /// Count total bookmarks.
-pub fn count_bookmarks(conn: &AsyncConnection) -> SearchResult<i64> {
-    let rows = retry_transient_storage(
+pub fn count_bookmarks(conn: &Connection) -> SearchResult<i64> {
+    retry_transient_storage(
         || {
-            conn.query_sync("SELECT COUNT(*) FROM bookmarks;")
-                .map_err(map_storage_error)
+            conn.query_row("SELECT COUNT(*) FROM bookmarks;", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map_err(map_storage_error)
         },
         "bookmark count",
-    )?;
-    match rows.first().and_then(|r| r.get(0)) {
-        Some(SqliteValue::Integer(count)) => Ok(*count),
-        _ => Ok(0),
-    }
+    )
 }
 
 /// Check if a document is bookmarked.
-pub fn is_bookmarked(conn: &AsyncConnection, doc_id: &str) -> SearchResult<bool> {
-    let params = [SqliteValue::Text(doc_id.to_owned().into())];
-    let rows = retry_transient_storage(
+pub fn is_bookmarked(conn: &Connection, doc_id: &str) -> SearchResult<bool> {
+    retry_transient_storage(
         || {
-            conn.query_with_params_sync(
+            optional_first_i64(
+                conn,
                 "SELECT 1 FROM bookmarks WHERE doc_id = ?1 LIMIT 1;",
-                &params,
+                params![doc_id],
             )
-            .map_err(map_storage_error)
+            .map(|bookmark| bookmark.is_some())
         },
         "bookmark exists",
-    )?;
-    Ok(!rows.is_empty())
+    )
 }
 
-fn parse_bookmark_row(row: &fsqlite::Row) -> SearchResult<Bookmark> {
-    let id = match row.get(0) {
-        Some(SqliteValue::Integer(v)) => *v,
-        _ => {
-            return Err(SearchError::SubsystemError {
-                subsystem: "storage",
-                source: Box::new(io::Error::other("missing bookmarks.id")),
-            });
-        }
+fn parse_bookmark_row(row: &Row<'_>) -> SearchResult<Bookmark> {
+    let Some(Value::Integer(id)) = row_value(row, 0)? else {
+        return Err(SearchError::SubsystemError {
+            subsystem: "storage",
+            source: Box::new(io::Error::other("missing bookmarks.id")),
+        });
     };
-    let doc_id = match row.get(1) {
-        Some(SqliteValue::Text(v)) => v.to_string(),
-        _ => {
-            return Err(SearchError::SubsystemError {
-                subsystem: "storage",
-                source: Box::new(io::Error::other("missing bookmarks.doc_id")),
-            });
-        }
+    let Some(Value::Text(doc_id)) = row_value(row, 1)? else {
+        return Err(SearchError::SubsystemError {
+            subsystem: "storage",
+            source: Box::new(io::Error::other("missing bookmarks.doc_id")),
+        });
     };
-    let created_at = match row.get(4) {
-        Some(SqliteValue::Integer(v)) => *v,
-        _ => {
-            return Err(SearchError::SubsystemError {
-                subsystem: "storage",
-                source: Box::new(io::Error::other("missing bookmarks.created_at")),
-            });
-        }
+    let Some(Value::Integer(created_at)) = row_value(row, 4)? else {
+        return Err(SearchError::SubsystemError {
+            subsystem: "storage",
+            source: Box::new(io::Error::other("missing bookmarks.created_at")),
+        });
     };
 
     Ok(Bookmark {
@@ -575,26 +523,37 @@ fn parse_bookmark_row(row: &fsqlite::Row) -> SearchResult<Bookmark> {
 
 // ─── Helpers ───────────────────────────────────────────────────────────────
 
-fn opt_text(value: Option<&str>) -> SqliteValue {
-    value.map_or(SqliteValue::Null, |s| {
-        SqliteValue::Text(s.to_owned().into())
-    })
+fn row_value(row: &Row<'_>, index: usize) -> SearchResult<Option<Value>> {
+    match row.get::<_, Value>(index) {
+        Ok(value) => Ok(Some(value)),
+        Err(rusqlite::Error::InvalidColumnIndex(_)) => Ok(None),
+        Err(error) => Err(map_storage_error(error)),
+    }
 }
 
-fn opt_i64(value: Option<i64>) -> SqliteValue {
-    value.map_or(SqliteValue::Null, SqliteValue::Integer)
+fn optional_first_i64(
+    conn: &Connection,
+    sql: &str,
+    params: impl rusqlite::Params,
+) -> SearchResult<Option<i64>> {
+    let mut stmt = conn.prepare(sql).map_err(map_storage_error)?;
+    let mut rows = stmt.query(params).map_err(map_storage_error)?;
+    rows.next().map_err(map_storage_error)?.map_or_else(
+        || Ok(None),
+        |row| row.get::<_, i64>(0).map(Some).map_err(map_storage_error),
+    )
 }
 
-fn extract_opt_text(row: &fsqlite::Row, index: usize) -> Option<String> {
-    match row.get(index) {
-        Some(SqliteValue::Text(v)) => Some(v.to_string()),
+fn extract_opt_text(row: &Row<'_>, index: usize) -> Option<String> {
+    match row.get::<_, Value>(index) {
+        Ok(Value::Text(v)) => Some(v),
         _ => None,
     }
 }
 
-fn extract_opt_i64(row: &fsqlite::Row, index: usize) -> Option<i64> {
-    match row.get(index) {
-        Some(SqliteValue::Integer(v)) => Some(*v),
+fn extract_opt_i64(row: &Row<'_>, index: usize) -> Option<i64> {
+    match row.get::<_, Value>(index) {
+        Ok(Value::Integer(v)) => Some(v),
         _ => None,
     }
 }
@@ -604,12 +563,12 @@ mod tests {
     use super::*;
     use crate::schema;
 
-    fn test_conn() -> AsyncConnection {
-        let conn = AsyncConnection::open_sync(":memory:".to_owned()).expect("in-memory connection");
+    fn test_conn() -> Connection {
+        let mut conn = Connection::open_in_memory().expect("in-memory connection");
         // Apply pragmas for foreign keys.
-        conn.execute_sync("PRAGMA foreign_keys=ON;")
+        conn.execute_batch("PRAGMA foreign_keys=ON;")
             .expect("pragma should succeed");
-        schema::bootstrap(&conn).expect("schema bootstrap should succeed");
+        schema::bootstrap(&mut conn).expect("schema bootstrap should succeed");
         conn
     }
 
@@ -617,9 +576,9 @@ mod tests {
 
     #[test]
     fn record_and_list_search_history() {
-        let conn = test_conn();
+        let mut conn = test_conn();
         record_search(
-            &conn,
+            &mut conn,
             "rust async",
             Some("natural_language"),
             Some(42),
@@ -642,9 +601,9 @@ mod tests {
 
     #[test]
     fn history_dedup_within_window() {
-        let conn = test_conn();
+        let mut conn = test_conn();
         record_search(
-            &conn,
+            &mut conn,
             "tokio spawn",
             None,
             Some(10),
@@ -658,7 +617,7 @@ mod tests {
 
         // Same query within 60 seconds — should update, not insert.
         record_search(
-            &conn,
+            &mut conn,
             "tokio spawn",
             None,
             Some(15),
@@ -683,9 +642,9 @@ mod tests {
 
     #[test]
     fn history_no_dedup_outside_window() {
-        let conn = test_conn();
+        let mut conn = test_conn();
         record_search(
-            &conn,
+            &mut conn,
             "async fn",
             None,
             Some(5),
@@ -699,7 +658,7 @@ mod tests {
 
         // Same query but 2 minutes later — should insert new entry.
         record_search(
-            &conn,
+            &mut conn,
             "async fn",
             None,
             Some(8),
@@ -717,13 +676,13 @@ mod tests {
 
     #[test]
     fn history_mru_order() {
-        let conn = test_conn();
+        let mut conn = test_conn();
         for (i, ts) in [1_700_000_000i64, 1_700_000_060, 1_700_000_120]
             .iter()
             .enumerate()
         {
             record_search(
-                &conn,
+                &mut conn,
                 &format!("query-{i}"),
                 None,
                 None,
@@ -744,10 +703,10 @@ mod tests {
 
     #[test]
     fn history_truncation() {
-        let conn = test_conn();
+        let mut conn = test_conn();
         for i in 0..10 {
             record_search(
-                &conn,
+                &mut conn,
                 &format!("query-{i}"),
                 None,
                 None,
@@ -762,7 +721,7 @@ mod tests {
 
         assert_eq!(count_search_history(&conn).expect("count"), 10);
 
-        let deleted = truncate_search_history(&conn, 5).expect("truncate");
+        let deleted = truncate_search_history(&mut conn, 5).expect("truncate");
         assert_eq!(deleted, 5);
         assert_eq!(
             count_search_history(&conn).expect("count after truncate"),
@@ -777,9 +736,9 @@ mod tests {
 
     #[test]
     fn history_truncation_noop_when_under_limit() {
-        let conn = test_conn();
+        let mut conn = test_conn();
         record_search(
-            &conn,
+            &mut conn,
             "only-one",
             None,
             None,
@@ -791,16 +750,16 @@ mod tests {
         )
         .expect("record");
 
-        let deleted = truncate_search_history(&conn, 100).expect("truncate");
+        let deleted = truncate_search_history(&mut conn, 100).expect("truncate");
         assert_eq!(deleted, 0);
         assert_eq!(count_search_history(&conn).expect("count"), 1);
     }
 
     #[test]
     fn history_prefix_search() {
-        let conn = test_conn();
+        let mut conn = test_conn();
         for q in ["rust async", "rust ownership", "python async"] {
-            record_search(&conn, q, None, None, None, None, None, 1_700_000_000, 0)
+            record_search(&mut conn, q, None, None, None, None, None, 1_700_000_000, 0)
                 .expect("record");
         }
 
@@ -816,9 +775,9 @@ mod tests {
 
     #[test]
     fn history_prefix_search_escapes_wildcards() {
-        let conn = test_conn();
+        let mut conn = test_conn();
         for q in ["100% coverage", "100 percent", "abc_def", "abcXdef"] {
-            record_search(&conn, q, None, None, None, None, None, 1_700_000_000, 0)
+            record_search(&mut conn, q, None, None, None, None, None, 1_700_000_000, 0)
                 .expect("record");
         }
 
@@ -835,9 +794,9 @@ mod tests {
 
     #[test]
     fn add_and_list_bookmarks() {
-        let conn = test_conn();
+        let mut conn = test_conn();
         add_bookmark(
-            &conn,
+            &mut conn,
             "doc-123",
             Some("rust async"),
             Some("great explanation"),
@@ -854,9 +813,9 @@ mod tests {
 
     #[test]
     fn bookmark_same_doc_different_queries() {
-        let conn = test_conn();
+        let mut conn = test_conn();
         add_bookmark(
-            &conn,
+            &mut conn,
             "doc-1",
             Some("rust async"),
             Some("note-a"),
@@ -865,7 +824,7 @@ mod tests {
         .expect("first bookmark");
 
         add_bookmark(
-            &conn,
+            &mut conn,
             "doc-1",
             Some("tokio spawn"),
             Some("note-b"),
@@ -882,9 +841,9 @@ mod tests {
 
     #[test]
     fn bookmark_upsert_same_doc_and_query() {
-        let conn = test_conn();
+        let mut conn = test_conn();
         add_bookmark(
-            &conn,
+            &mut conn,
             "doc-1",
             Some("rust async"),
             Some("old note"),
@@ -893,7 +852,7 @@ mod tests {
         .expect("first");
 
         add_bookmark(
-            &conn,
+            &mut conn,
             "doc-1",
             Some("rust async"),
             Some("updated note"),
@@ -914,22 +873,22 @@ mod tests {
 
     #[test]
     fn remove_bookmark_by_id() {
-        let conn = test_conn();
-        add_bookmark(&conn, "doc-rm", None, None, 1_700_000_000).expect("add");
+        let mut conn = test_conn();
+        add_bookmark(&mut conn, "doc-rm", None, None, 1_700_000_000).expect("add");
 
         let bookmarks = list_bookmarks(&conn, 10).expect("list");
         assert_eq!(bookmarks.len(), 1);
 
-        let removed = remove_bookmark(&conn, bookmarks[0].id).expect("remove");
+        let removed = remove_bookmark(&mut conn, bookmarks[0].id).expect("remove");
         assert!(removed);
         assert_eq!(count_bookmarks(&conn).expect("count"), 0);
     }
 
     #[test]
     fn remove_bookmark_by_id_returns_false_when_missing() {
-        let conn = test_conn();
-        add_bookmark(&conn, "doc-rm-missing", None, None, 1_700_000_000).expect("add");
-        let removed = remove_bookmark(&conn, 999_999).expect("remove missing");
+        let mut conn = test_conn();
+        add_bookmark(&mut conn, "doc-rm-missing", None, None, 1_700_000_000).expect("add");
+        let removed = remove_bookmark(&mut conn, 999_999).expect("remove missing");
         assert!(!removed, "missing bookmark id should report false");
         assert_eq!(
             count_bookmarks(&conn).expect("count"),
@@ -940,36 +899,86 @@ mod tests {
 
     #[test]
     fn remove_bookmark_by_doc_id() {
-        let conn = test_conn();
-        add_bookmark(&conn, "doc-rm2", Some("q1"), None, 1_700_000_000).expect("add 1");
-        add_bookmark(&conn, "doc-rm2", Some("q2"), None, 1_700_000_060).expect("add 2");
+        let mut conn = test_conn();
+        add_bookmark(&mut conn, "doc-rm2", Some("q1"), None, 1_700_000_000).expect("add 1");
+        add_bookmark(&mut conn, "doc-rm2", Some("q2"), None, 1_700_000_060).expect("add 2");
 
         assert_eq!(count_bookmarks(&conn).expect("count"), 2);
-        remove_bookmark_by_doc(&conn, "doc-rm2").expect("remove by doc");
+        remove_bookmark_by_doc(&mut conn, "doc-rm2").expect("remove by doc");
         assert_eq!(count_bookmarks(&conn).expect("count"), 0);
     }
 
     #[test]
     fn is_bookmarked_check() {
-        let conn = test_conn();
+        let mut conn = test_conn();
         assert!(!is_bookmarked(&conn, "doc-x").expect("check"));
 
-        add_bookmark(&conn, "doc-x", None, None, 1_700_000_000).expect("add");
+        add_bookmark(&mut conn, "doc-x", None, None, 1_700_000_000).expect("add");
         assert!(is_bookmarked(&conn, "doc-x").expect("check after add"));
     }
 
     #[test]
     fn bookmark_mru_order() {
-        let conn = test_conn();
+        let mut conn = test_conn();
         for (i, ts) in [1_700_000_000i64, 1_700_000_060, 1_700_000_120]
             .iter()
             .enumerate()
         {
-            add_bookmark(&conn, &format!("doc-{i}"), None, None, *ts).expect("add");
+            add_bookmark(&mut conn, &format!("doc-{i}"), None, None, *ts).expect("add");
         }
 
         let bookmarks = list_bookmarks(&conn, 10).expect("list");
         assert_eq!(bookmarks[0].doc_id, "doc-2", "most recent first");
         assert_eq!(bookmarks[2].doc_id, "doc-0", "oldest last");
+    }
+
+    // ─── Transaction rollback tests ────────────────────────────────────
+
+    #[test]
+    fn history_transaction_rolls_back_and_restores_autocommit_on_error() {
+        let mut conn = test_conn();
+        assert!(conn.is_autocommit());
+
+        let result: SearchResult<()> = with_history_transaction(&mut conn, |conn| {
+            conn.execute(
+                "INSERT INTO bookmarks (doc_id, query, note, created_at) \
+                 VALUES ('doc-tx', NULL, NULL, 1);",
+                [],
+            )
+            .map_err(map_storage_error)?;
+            Err(SearchError::SubsystemError {
+                subsystem: "storage",
+                source: Box::new(io::Error::other("forced history failure")),
+            })
+        });
+
+        assert!(result.is_err(), "closure error must propagate");
+        assert!(
+            conn.is_autocommit(),
+            "failed history transaction must restore autocommit"
+        );
+        assert_eq!(
+            count_bookmarks(&conn).expect("count"),
+            0,
+            "rolled-back bookmark insert must not persist"
+        );
+    }
+
+    #[test]
+    fn history_transaction_rolls_back_and_restores_autocommit_on_panic() {
+        let mut conn = test_conn();
+        assert!(conn.is_autocommit());
+
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            with_history_transaction(&mut conn, |_conn| -> SearchResult<()> {
+                panic!("forced history panic")
+            })
+        }));
+
+        assert!(result.is_err(), "panic must propagate to the caller");
+        assert!(
+            conn.is_autocommit(),
+            "panicked history transaction must restore autocommit"
+        );
     }
 }

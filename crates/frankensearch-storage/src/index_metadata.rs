@@ -10,8 +10,8 @@ use std::io;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use frankensearch_core::{SearchError, SearchResult};
-use fsqlite::{AsyncConnection, Row};
-use fsqlite_types::value::SqliteValue;
+use rusqlite::types::Value;
+use rusqlite::{Connection, Row, params};
 use serde::{Deserialize, Serialize};
 
 use crate::connection::{Storage, map_storage_error, retry_transient_storage};
@@ -194,54 +194,57 @@ impl Storage {
     pub fn get_index_metadata(&self, index_name: &str) -> SearchResult<Option<IndexMetadata>> {
         ensure_non_empty(index_name, "index_name")?;
 
-        let params = [SqliteValue::Text(index_name.to_owned().into())];
-        let rows = retry_transient_storage(
+        let metadata = retry_transient_storage(
             || {
-                self.connection()
-                    .query_with_params_sync(
-                        "SELECT index_name, index_type, embedder_id, embedder_revision, \
+                self.with_connection(|conn| {
+                    let mut stmt = conn
+                        .prepare(
+                            "SELECT index_name, index_type, embedder_id, embedder_revision, \
             dimension, record_count, file_path, file_size_bytes, file_hash, \
             schema_version, built_at, build_duration_ms, source_doc_count, \
             config_json, fec_path, fec_size_bytes, last_verified_at, \
             last_repair_at, repair_count, mean_norm, variance \
          FROM index_metadata WHERE index_name = ?1 LIMIT 1;",
-                        &params,
-                    )
-                    .map_err(map_storage_error)
+                        )
+                        .map_err(map_storage_error)?;
+                    let mut rows = stmt.query(params![index_name]).map_err(map_storage_error)?;
+                    let Some(row) = rows.next().map_err(map_storage_error)? else {
+                        return Ok(None);
+                    };
+                    Ok(Some(parse_index_metadata(row)?))
+                })
             },
             "index metadata fetch",
         )?;
 
-        let Some(row) = rows.first() else {
-            return Ok(None);
-        };
-
-        Ok(Some(parse_index_metadata(row)?))
+        Ok(metadata)
     }
 
     /// List all known index metadata entries.
     pub fn list_index_metadata(&self) -> SearchResult<Vec<IndexMetadata>> {
-        let rows = retry_transient_storage(
+        retry_transient_storage(
             || {
-                self.connection()
-                    .query_sync(
-                        "SELECT index_name, index_type, embedder_id, embedder_revision, \
+                self.with_connection(|conn| {
+                    let mut stmt = conn
+                        .prepare(
+                            "SELECT index_name, index_type, embedder_id, embedder_revision, \
             dimension, record_count, file_path, file_size_bytes, file_hash, \
             schema_version, built_at, build_duration_ms, source_doc_count, \
             config_json, fec_path, fec_size_bytes, last_verified_at, \
             last_repair_at, repair_count, mean_norm, variance \
          FROM index_metadata ORDER BY index_name;",
-                    )
-                    .map_err(map_storage_error)
+                        )
+                        .map_err(map_storage_error)?;
+                    let mut rows = stmt.query([]).map_err(map_storage_error)?;
+                    let mut result = Vec::new();
+                    while let Some(row) = rows.next().map_err(map_storage_error)? {
+                        result.push(parse_index_metadata(row)?);
+                    }
+                    Ok(result)
+                })
             },
             "index metadata list",
-        )?;
-
-        let mut result = Vec::with_capacity(rows.len());
-        for row in &rows {
-            result.push(parse_index_metadata(row)?);
-        }
-        Ok(result)
+        )
     }
 
     /// Check whether an index is stale by comparing document timestamps
@@ -270,20 +273,20 @@ impl Storage {
         let built_at = meta.built_at.unwrap_or(0);
 
         // Check for modified documents since last build.
-        let current_docs = count_total_documents(self.connection())?;
+        let current_docs = count_total_documents(&*self.connection()?)?;
         let docs_removed = if current_docs < meta.source_doc_count {
             meta.source_doc_count - current_docs
         } else {
             0
         };
         let docs_modified =
-            count_modified_since(self.connection(), built_at)?.saturating_add(docs_removed);
+            count_modified_since(&*self.connection()?, built_at)?.saturating_add(docs_removed);
         if docs_modified > 0 {
             reasons.push(StalenessReason::ContentChanged);
         }
 
         // Check for new documents since last build.
-        let docs_added = count_added_since(self.connection(), built_at)?;
+        let docs_added = count_added_since(&*self.connection()?, built_at)?;
         if docs_added > 0 {
             reasons.push(StalenessReason::NewDocuments);
         }
@@ -317,19 +320,15 @@ impl Storage {
         ensure_non_empty(index_name, "index_name")?;
 
         let now = unix_timestamp_ms()?;
-        let params = [
-            SqliteValue::Integer(now),
-            SqliteValue::Text(index_name.to_owned().into()),
-        ];
 
         let affected = retry_transient_storage(
             || {
-                self.connection()
-                    .execute_with_params_sync(
-                        "UPDATE index_metadata SET last_verified_at = ?1 WHERE index_name = ?2;",
-                        &params,
-                    )
-                    .map_err(map_storage_error)
+                let conn = self.connection()?;
+                conn.execute(
+                    "UPDATE index_metadata SET last_verified_at = ?1 WHERE index_name = ?2;",
+                    params![now, index_name],
+                )
+                .map_err(map_storage_error)
             },
             "index verification stamp",
         )?;
@@ -350,21 +349,17 @@ impl Storage {
         ensure_non_empty(index_name, "index_name")?;
 
         let now = unix_timestamp_ms()?;
-        let params = [
-            SqliteValue::Integer(now),
-            SqliteValue::Text(index_name.to_owned().into()),
-        ];
 
         let affected = retry_transient_storage(
             || {
-                self.connection()
-                    .execute_with_params_sync(
-                        "UPDATE index_metadata SET last_repair_at = ?1, \
+                let conn = self.connection()?;
+                conn.execute(
+                    "UPDATE index_metadata SET last_repair_at = ?1, \
             repair_count = repair_count + 1 \
          WHERE index_name = ?2;",
-                        &params,
-                    )
-                    .map_err(map_storage_error)
+                    params![now, index_name],
+                )
+                .map_err(map_storage_error)
             },
             "index repair stamp",
         )?;
@@ -391,31 +386,29 @@ impl Storage {
             return Ok(Vec::new());
         }
 
-        // NOTE: Uses format!() with sql_escape_single_quoted instead of
-        // query_with_params because FrankenSQLite's query_with_params
-        // currently returns at most one row for multi-row result sets.
-        let escaped_index = sql_escape_single_quoted(index_name);
-        let sql = format!(
-            "SELECT build_id, index_name, built_at, build_duration_ms, \
+        let mut history = retry_transient_storage(
+            || {
+                self.with_connection(|conn| {
+                    let mut stmt = conn
+                        .prepare(
+                            "SELECT build_id, index_name, built_at, build_duration_ms, \
                 record_count, source_doc_count, \"trigger\", config_json, notes, \
                 mean_norm, variance \
              FROM index_build_history \
-             WHERE index_name = '{escaped_index}' \
-             ORDER BY built_at DESC, build_id DESC;"
-        );
-        let rows = retry_transient_storage(
-            || {
-                self.connection()
-                    .query_sync(&sql)
-                    .map_err(map_storage_error)
+             WHERE index_name = ?1 \
+             ORDER BY built_at DESC, build_id DESC;",
+                        )
+                        .map_err(map_storage_error)?;
+                    let mut rows = stmt.query(params![index_name]).map_err(map_storage_error)?;
+                    let mut history = Vec::new();
+                    while let Some(row) = rows.next().map_err(map_storage_error)? {
+                        history.push(parse_build_record(row)?);
+                    }
+                    Ok(history)
+                })
             },
             "index build history",
         )?;
-
-        let mut history = Vec::with_capacity(rows.len());
-        for row in &rows {
-            history.push(parse_build_record(row)?);
-        }
         if history.len() > limit {
             history.truncate(limit);
         }
@@ -437,17 +430,16 @@ impl Storage {
         ensure_non_empty(index_name, "index_name")?;
 
         let (history_deleted, metadata_deleted) = self.transaction(|conn| {
-            let params = [SqliteValue::Text(index_name.to_owned().into())];
             let history_deleted = conn
-                .execute_with_params_sync(
+                .execute(
                     "DELETE FROM index_build_history WHERE index_name = ?1;",
-                    &params,
+                    params![index_name],
                 )
                 .map_err(map_storage_error)?;
             let metadata_deleted = conn
-                .execute_with_params_sync(
+                .execute(
                     "DELETE FROM index_metadata WHERE index_name = ?1;",
-                    &params,
+                    params![index_name],
                 )
                 .map_err(map_storage_error)?;
             Ok((history_deleted, metadata_deleted))
@@ -471,33 +463,12 @@ impl Storage {
 // ─── Internal helpers ───────────────────────────────────────────────────────
 
 fn upsert_index_metadata(
-    conn: &AsyncConnection,
+    conn: &Connection,
     params: &RecordBuildParams,
     built_at: i64,
 ) -> SearchResult<()> {
-    let update_params = [
-        SqliteValue::Text(params.index_type.clone().into()),
-        SqliteValue::Text(params.embedder_id.clone().into()),
-        sqlite_text_opt(params.embedder_revision.as_deref()),
-        SqliteValue::Integer(params.dimension),
-        SqliteValue::Integer(params.record_count),
-        sqlite_text_opt(params.file_path.as_deref()),
-        sqlite_i64_opt(params.file_size_bytes),
-        sqlite_text_opt(params.file_hash.as_deref()),
-        sqlite_i64_opt(params.schema_version),
-        SqliteValue::Integer(built_at),
-        SqliteValue::Integer(params.build_duration_ms),
-        SqliteValue::Integer(params.source_doc_count),
-        sqlite_text_opt(params.config_json.as_deref()),
-        sqlite_text_opt(params.fec_path.as_deref()),
-        sqlite_i64_opt(params.fec_size_bytes),
-        sqlite_f64_opt(params.mean_norm),
-        sqlite_f64_opt(params.variance),
-        SqliteValue::Text(params.index_name.clone().into()),
-    ];
-
     let updated = conn
-        .execute_with_params_sync(
+        .execute(
             "UPDATE index_metadata SET \
         index_type = ?1, \
         embedder_id = ?2, \
@@ -517,38 +488,33 @@ fn upsert_index_metadata(
         mean_norm = ?16, \
         variance = ?17 \
      WHERE index_name = ?18;",
-            &update_params,
+            rusqlite::params![
+                params.index_type.clone(),
+                params.embedder_id.clone(),
+                params.embedder_revision.as_deref(),
+                params.dimension,
+                params.record_count,
+                params.file_path.as_deref(),
+                params.file_size_bytes,
+                params.file_hash.as_deref(),
+                params.schema_version,
+                built_at,
+                params.build_duration_ms,
+                params.source_doc_count,
+                params.config_json.as_deref(),
+                params.fec_path.as_deref(),
+                params.fec_size_bytes,
+                params.mean_norm,
+                params.variance,
+                params.index_name.clone(),
+            ],
         )
         .map_err(map_storage_error)?;
     if updated > 0 {
         return Ok(());
     }
 
-    let insert_params = [
-        SqliteValue::Text(params.index_name.clone().into()),
-        SqliteValue::Text(params.index_type.clone().into()),
-        SqliteValue::Text(params.embedder_id.clone().into()),
-        sqlite_text_opt(params.embedder_revision.as_deref()),
-        SqliteValue::Integer(params.dimension),
-        SqliteValue::Integer(params.record_count),
-        sqlite_text_opt(params.file_path.as_deref()),
-        sqlite_i64_opt(params.file_size_bytes),
-        sqlite_text_opt(params.file_hash.as_deref()),
-        sqlite_i64_opt(params.schema_version),
-        SqliteValue::Integer(built_at),
-        SqliteValue::Integer(params.build_duration_ms),
-        SqliteValue::Integer(params.source_doc_count),
-        sqlite_text_opt(params.config_json.as_deref()),
-        sqlite_text_opt(params.fec_path.as_deref()),
-        sqlite_i64_opt(params.fec_size_bytes),
-        SqliteValue::Null,
-        SqliteValue::Null,
-        SqliteValue::Integer(0),
-        sqlite_f64_opt(params.mean_norm),
-        sqlite_f64_opt(params.variance),
-    ];
-
-    conn.execute_with_params_sync(
+    conn.execute(
         "INSERT INTO index_metadata (\
         index_name, index_type, embedder_id, embedder_revision, \
         dimension, record_count, file_path, file_size_bytes, file_hash, \
@@ -559,7 +525,29 @@ fn upsert_index_metadata(
         ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, \
         ?15, ?16, ?17, ?18, ?19, ?20, ?21\
      );",
-        &insert_params,
+        rusqlite::params![
+            params.index_name.clone(),
+            params.index_type.clone(),
+            params.embedder_id.clone(),
+            params.embedder_revision.as_deref(),
+            params.dimension,
+            params.record_count,
+            params.file_path.as_deref(),
+            params.file_size_bytes,
+            params.file_hash.as_deref(),
+            params.schema_version,
+            built_at,
+            params.build_duration_ms,
+            params.source_doc_count,
+            params.config_json.as_deref(),
+            params.fec_path.as_deref(),
+            params.fec_size_bytes,
+            Value::Null,
+            Value::Null,
+            0_i64,
+            params.mean_norm,
+            params.variance,
+        ],
     )
     .map_err(map_storage_error)?;
 
@@ -567,42 +555,39 @@ fn upsert_index_metadata(
 }
 
 fn insert_build_history(
-    conn: &AsyncConnection,
+    conn: &Connection,
     params: &RecordBuildParams,
     built_at: i64,
 ) -> SearchResult<()> {
-    let sql_params = [
-        SqliteValue::Text(params.index_name.clone().into()),
-        SqliteValue::Integer(built_at),
-        SqliteValue::Integer(params.build_duration_ms),
-        SqliteValue::Integer(params.record_count),
-        SqliteValue::Integer(params.source_doc_count),
-        SqliteValue::Text(params.trigger.as_str().to_owned().into()),
-        sqlite_text_opt(params.config_json.as_deref()),
-        sqlite_text_opt(params.notes.as_deref()),
-        sqlite_f64_opt(params.mean_norm),
-        sqlite_f64_opt(params.variance),
-    ];
-
-    conn.execute_with_params_sync(
+    conn.execute(
         "INSERT INTO index_build_history (\
         index_name, built_at, build_duration_ms, record_count, \
         source_doc_count, \"trigger\", config_json, notes, mean_norm, variance\
      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10);",
-        &sql_params,
+        rusqlite::params![
+            params.index_name.clone(),
+            built_at,
+            params.build_duration_ms,
+            params.record_count,
+            params.source_doc_count,
+            params.trigger.as_str(),
+            params.config_json.as_deref(),
+            params.notes.as_deref(),
+            params.mean_norm,
+            params.variance,
+        ],
     )
     .map_err(map_storage_error)?;
 
     Ok(())
 }
 
-fn prune_build_history(conn: &AsyncConnection, index_name: &str, keep: i64) -> SearchResult<()> {
-    let escaped_index = sql_escape_single_quoted(index_name);
-
+fn prune_build_history(conn: &Connection, index_name: &str, keep: i64) -> SearchResult<()> {
     if keep <= 0 {
-        conn.execute_sync(&format!(
-            "DELETE FROM index_build_history WHERE index_name = '{escaped_index}';"
-        ))
+        conn.execute(
+            "DELETE FROM index_build_history WHERE index_name = ?1;",
+            params![index_name],
+        )
         .map_err(map_storage_error)?;
         return Ok(());
     }
@@ -613,89 +598,80 @@ fn prune_build_history(conn: &AsyncConnection, index_name: &str, keep: i64) -> S
         ))),
     })?;
 
-    // NOTE: Uses format!() because query_with_params returns at most one
-    // row for multi-row result sets (FrankenSQLite limitation).
-    let rows = conn
-        .query_sync(&format!(
+    let mut stmt = conn
+        .prepare(
             "SELECT build_id FROM index_build_history \
-         WHERE index_name = '{escaped_index}' \
-         ORDER BY build_id DESC;"
-        ))
+         WHERE index_name = ?1 \
+         ORDER BY build_id DESC;",
+        )
         .map_err(map_storage_error)?;
-    if rows.len() <= keep {
+    let mut rows = stmt.query(params![index_name]).map_err(map_storage_error)?;
+    let mut build_ids = Vec::new();
+    while let Some(row) = rows.next().map_err(map_storage_error)? {
+        build_ids.push(row_i64(row, 0, "index_build_history.build_id")?);
+    }
+    drop(rows);
+    drop(stmt);
+    if build_ids.len() <= keep {
         return Ok(());
     }
 
-    let cutoff_row = &rows[keep - 1];
-    let cutoff = row_i64(cutoff_row, 0, "index_build_history.build_id")?;
-
-    conn.execute_sync(&format!(
+    let cutoff = build_ids[keep - 1];
+    conn.execute(
         "DELETE FROM index_build_history \
-         WHERE index_name = '{escaped_index}' \
-           AND build_id < {cutoff};"
-    ))
+         WHERE index_name = ?1 \
+           AND build_id < ?2;",
+        params![index_name, cutoff],
+    )
     .map_err(map_storage_error)?;
     Ok(())
 }
 
-fn count_modified_since(conn: &AsyncConnection, since: i64) -> SearchResult<i64> {
-    let params = [SqliteValue::Integer(since), SqliteValue::Integer(since)];
-    let rows = retry_transient_storage(
+fn count_modified_since(conn: &Connection, since: i64) -> SearchResult<i64> {
+    retry_transient_storage(
         || {
-            conn.query_with_params_sync(
+            conn.query_row(
                 "SELECT COUNT(*) FROM documents WHERE updated_at > ?1 AND created_at <= ?2;",
-                &params,
+                params![since, since],
+                |row| row.get::<_, i64>(0),
             )
             .map_err(map_storage_error)
         },
         "index staleness modified count",
-    )?;
-    let Some(row) = rows.first() else {
-        return Ok(0);
-    };
-    row_i64(row, 0, "count_modified")
+    )
 }
 
-fn count_added_since(conn: &AsyncConnection, since: i64) -> SearchResult<i64> {
-    let params = [SqliteValue::Integer(since)];
-    let rows = retry_transient_storage(
+fn count_added_since(conn: &Connection, since: i64) -> SearchResult<i64> {
+    retry_transient_storage(
         || {
-            conn.query_with_params_sync(
+            conn.query_row(
                 "SELECT COUNT(*) FROM documents WHERE created_at > ?1;",
-                &params,
+                params![since],
+                |row| row.get::<_, i64>(0),
             )
             .map_err(map_storage_error)
         },
         "index staleness added count",
-    )?;
-    let Some(row) = rows.first() else {
-        return Ok(0);
-    };
-    row_i64(row, 0, "count_added")
+    )
 }
 
-fn count_total_documents(conn: &AsyncConnection) -> SearchResult<i64> {
-    let rows = retry_transient_storage(
+fn count_total_documents(conn: &Connection) -> SearchResult<i64> {
+    retry_transient_storage(
         || {
-            conn.query_sync("SELECT COUNT(*) FROM documents;")
-                .map_err(map_storage_error)
+            conn.query_row("SELECT COUNT(*) FROM documents;", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map_err(map_storage_error)
         },
         "index staleness document count",
-    )?;
-    let row = rows.first().ok_or_else(|| SearchError::SubsystemError {
-        subsystem: "storage",
-        source: Box::new(std::io::Error::other(
-            "documents count query returned no row",
-        )),
-    })?;
-    row_i64(row, 0, "documents.count")
+    )
 }
 
-fn parse_index_metadata(row: &Row) -> SearchResult<IndexMetadata> {
+fn parse_index_metadata(row: &Row<'_>) -> SearchResult<IndexMetadata> {
     Ok(IndexMetadata {
-        index_name: row_text(row, 0, "index_metadata.index_name")?.to_owned(),
-        index_type: row_text(row, 1, "index_metadata.index_type")?.to_owned(),
-        embedder_id: row_text(row, 2, "index_metadata.embedder_id")?.to_owned(),
+        index_name: row_text(row, 0, "index_metadata.index_name")?,
+        index_type: row_text(row, 1, "index_metadata.index_type")?,
+        embedder_id: row_text(row, 2, "index_metadata.embedder_id")?,
         embedder_revision: row_optional_text(row, 3)?,
         dimension: row_i64(row, 4, "index_metadata.dimension")?,
         record_count: row_i64(row, 5, "index_metadata.record_count")?,
@@ -717,10 +693,10 @@ fn parse_index_metadata(row: &Row) -> SearchResult<IndexMetadata> {
     })
 }
 
-fn parse_build_record(row: &Row) -> SearchResult<IndexBuildRecord> {
+fn parse_build_record(row: &Row<'_>) -> SearchResult<IndexBuildRecord> {
     let trigger_str = row_text(row, 6, "index_build_history.trigger")?;
     let trigger =
-        BuildTrigger::from_str(trigger_str).ok_or_else(|| SearchError::SubsystemError {
+        BuildTrigger::from_str(&trigger_str).ok_or_else(|| SearchError::SubsystemError {
             subsystem: "storage",
             source: Box::new(io::Error::other(format!(
                 "unknown build trigger: {trigger_str}"
@@ -729,7 +705,7 @@ fn parse_build_record(row: &Row) -> SearchResult<IndexBuildRecord> {
 
     Ok(IndexBuildRecord {
         build_id: row_i64(row, 0, "index_build_history.build_id")?,
-        index_name: row_text(row, 1, "index_build_history.index_name")?.to_owned(),
+        index_name: row_text(row, 1, "index_build_history.index_name")?,
         built_at: row_i64(row, 2, "index_build_history.built_at")?,
         build_duration_ms: row_i64(row, 3, "index_build_history.build_duration_ms")?,
         record_count: row_i64(row, 4, "index_build_history.record_count")?,
@@ -744,9 +720,17 @@ fn parse_build_record(row: &Row) -> SearchResult<IndexBuildRecord> {
 
 // ─── Row extraction helpers ─────────────────────────────────────────────────
 
-fn row_text<'a>(row: &'a Row, index: usize, field: &str) -> SearchResult<&'a str> {
-    match row.get(index) {
-        Some(SqliteValue::Text(value)) => Ok(value),
+fn row_value(row: &Row<'_>, index: usize) -> SearchResult<Option<Value>> {
+    match row.get::<_, Value>(index) {
+        Ok(value) => Ok(Some(value)),
+        Err(rusqlite::Error::InvalidColumnIndex(_)) => Ok(None),
+        Err(error) => Err(map_storage_error(error)),
+    }
+}
+
+fn row_text(row: &Row<'_>, index: usize, field: &str) -> SearchResult<String> {
+    match row_value(row, index)? {
+        Some(Value::Text(value)) => Ok(value),
         Some(other) => Err(SearchError::SubsystemError {
             subsystem: "storage",
             source: Box::new(io::Error::other(format!(
@@ -760,9 +744,9 @@ fn row_text<'a>(row: &'a Row, index: usize, field: &str) -> SearchResult<&'a str
     }
 }
 
-fn row_i64(row: &Row, index: usize, field: &str) -> SearchResult<i64> {
-    match row.get(index) {
-        Some(SqliteValue::Integer(value)) => Ok(*value),
+fn row_i64(row: &Row<'_>, index: usize, field: &str) -> SearchResult<i64> {
+    match row_value(row, index)? {
+        Some(Value::Integer(value)) => Ok(value),
         Some(other) => Err(SearchError::SubsystemError {
             subsystem: "storage",
             source: Box::new(io::Error::other(format!(
@@ -776,10 +760,10 @@ fn row_i64(row: &Row, index: usize, field: &str) -> SearchResult<i64> {
     }
 }
 
-fn row_optional_text(row: &Row, index: usize) -> SearchResult<Option<String>> {
-    match row.get(index) {
-        Some(SqliteValue::Text(value)) => Ok(Some(value.to_string())),
-        Some(SqliteValue::Null) | None => Ok(None),
+fn row_optional_text(row: &Row<'_>, index: usize) -> SearchResult<Option<String>> {
+    match row_value(row, index)? {
+        Some(Value::Text(value)) => Ok(Some(value)),
+        Some(Value::Null) | None => Ok(None),
         Some(other) => Err(SearchError::SubsystemError {
             subsystem: "storage",
             source: Box::new(io::Error::other(format!(
@@ -789,10 +773,10 @@ fn row_optional_text(row: &Row, index: usize) -> SearchResult<Option<String>> {
     }
 }
 
-fn row_optional_i64(row: &Row, index: usize) -> SearchResult<Option<i64>> {
-    match row.get(index) {
-        Some(SqliteValue::Integer(value)) => Ok(Some(*value)),
-        Some(SqliteValue::Null) | None => Ok(None),
+fn row_optional_i64(row: &Row<'_>, index: usize) -> SearchResult<Option<i64>> {
+    match row_value(row, index)? {
+        Some(Value::Integer(value)) => Ok(Some(value)),
+        Some(Value::Null) | None => Ok(None),
         Some(other) => Err(SearchError::SubsystemError {
             subsystem: "storage",
             source: Box::new(io::Error::other(format!(
@@ -802,13 +786,13 @@ fn row_optional_i64(row: &Row, index: usize) -> SearchResult<Option<i64>> {
     }
 }
 
-fn row_optional_f64(row: &Row, index: usize) -> SearchResult<Option<f64>> {
-    match row.get(index) {
-        Some(SqliteValue::Float(value)) => Ok(Some(*value)),
-        Some(SqliteValue::Null) | None => Ok(None),
+fn row_optional_f64(row: &Row<'_>, index: usize) -> SearchResult<Option<f64>> {
+    match row_value(row, index)? {
+        Some(Value::Real(value)) => Ok(Some(value)),
+        Some(Value::Null) | None => Ok(None),
         // Integer 0 is sometimes stored for "no value" — coerce.
         #[allow(clippy::cast_precision_loss)]
-        Some(SqliteValue::Integer(value)) => Ok(Some(*value as f64)),
+        Some(Value::Integer(value)) => Ok(Some(value as f64)),
         Some(other) => Err(SearchError::SubsystemError {
             subsystem: "storage",
             source: Box::new(io::Error::other(format!(
@@ -816,30 +800,6 @@ fn row_optional_f64(row: &Row, index: usize) -> SearchResult<Option<f64>> {
             ))),
         }),
     }
-}
-
-fn sqlite_text_opt(value: Option<&str>) -> SqliteValue {
-    value.map_or(SqliteValue::Null, |v| {
-        SqliteValue::Text(v.to_owned().into())
-    })
-}
-
-fn sqlite_i64_opt(value: Option<i64>) -> SqliteValue {
-    value.map_or(SqliteValue::Null, SqliteValue::Integer)
-}
-
-fn sqlite_f64_opt(value: Option<f64>) -> SqliteValue {
-    value.map_or(SqliteValue::Null, SqliteValue::Float)
-}
-
-/// Escape single quotes for SQL string literals.
-///
-/// Used as a workaround for multi-row SELECT queries where
-/// `query_with_params` currently returns at most one row (`FrankenSQLite`
-/// limitation).  Single-row queries and DML (INSERT/UPDATE/DELETE) use
-/// parameterized queries instead.
-fn sql_escape_single_quoted(value: &str) -> String {
-    value.replace('\'', "''")
 }
 
 fn ensure_non_empty(value: &str, field: &'static str) -> SearchResult<()> {

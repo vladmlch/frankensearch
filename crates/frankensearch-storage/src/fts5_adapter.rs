@@ -1,25 +1,25 @@
 //! FTS5 alternative lexical search adapter.
 //!
-//! Uses `FrankenSQLite`'s built-in FTS5 implementation as an alternative to
-//! Tantivy for BM25 full-text search. Both implement the split
+//! Uses SQLite's built-in FTS5 implementation through `rusqlite` as an
+//! alternative to Tantivy for BM25 full-text search. Both implement the split
 //! [`frankensearch_core::LexicalRead`] / [`frankensearch_core::LexicalWrite`]
 //! trait from `frankensearch-core`.
 //!
 //! # Advantages over Tantivy
 //!
-//! - Zero additional binary size (FTS5 is part of `FrankenSQLite`)
+//! - Zero additional binary size (FTS5 is part of SQLite)
 //! - MVCC concurrent reads and writes
 //! - Single deployment artifact (one `.db` file)
 //!
 //! # Content mode
 //!
 //! The in-memory adapter below supports `Stored` and `Contentless` modes.
-//! Persisted tables are inspected from their SQLite metadata so that `Stored`,
-//! external-content, and contentless layouts are never inferred from caller
-//! configuration.
+//! `External` shares the `Stored` layout because an in-memory index has no
+//! separately governed content table. Persisted tables are inspected from
+//! their SQLite metadata so that `Stored`, external-content, and contentless
+//! layouts are never inferred from caller configuration.
 
 use std::collections::HashMap;
-use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::Arc;
 use std::sync::Mutex;
 
@@ -27,17 +27,12 @@ use asupersync::Cx;
 use frankensearch_core::error::{SearchError, SearchResult};
 use frankensearch_core::traits::SearchFuture;
 use frankensearch_core::types::{IndexableDocument, ScoreSource, ScoredResult};
-use fsqlite::{AsyncConnection, Row};
-use fsqlite_ext_fts5::{Fts5Table, snippet as fts5_snippet};
-use fsqlite_types::cx::Cx as FsqliteCx;
-use fsqlite_types::value::SqliteValue;
+use rusqlite::types::ValueRef;
+use rusqlite::{Connection, Row, params};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, instrument, warn};
 
-use crate::connection::{
-    Storage, fsqlite_cx, map_storage_error_at, retry_transient_storage,
-    retry_transient_storage_async, unretryable_rollback_error,
-};
+use crate::connection::{Storage, map_storage_error_at, retry_transient_storage_async};
 use crate::schema::PORTER_FTS5_REBUILD_TABLE;
 
 // ─── Constants ──────────────────────────────────────────────────────────────
@@ -51,17 +46,18 @@ const MAX_QUERY_LENGTH: usize = 10_000;
 /// Default snippet window size in tokens.
 const DEFAULT_SNIPPET_TOKENS: usize = 20;
 
-/// The on-disk marker written after applying the 0.2.1 Porter rebuild.
+/// The on-disk marker written after applying the Porter rebuild.
 ///
-/// `FrankenSQLite` 0.2.1 changes Porter token handling. A prior Porter index
-/// must be rebuilt from its complete content source; accepting an unmarked
-/// table would make terms silently unfindable.
+/// A Porter index built before the tokenizer contract was governed must be
+/// rebuilt from its complete content source; accepting an unmarked table
+/// would make terms silently unfindable.
 pub const PORTER_FTS5_REBUILD_VERSION: i64 = 1;
 
 /// Column index: content (primary search field).
 const COL_CONTENT: usize = 2;
-/// Column index: `metadata_json` (stored, not searched).
-const COL_METADATA: usize = 3;
+
+/// Name of the FTS5 virtual table inside the in-memory adapter connection.
+const MEM_FTS5_TABLE: &str = "fts5_lexical";
 
 // ─── Configuration ──────────────────────────────────────────────────────────
 
@@ -87,6 +83,17 @@ pub enum Fts5TokenizerChoice {
     Porter,
     /// Trigram tokenizer for substring matching (slower but more flexible).
     Trigram,
+}
+
+impl Fts5TokenizerChoice {
+    /// The `tokenize=` option text accepted by `CREATE VIRTUAL TABLE ... fts5`.
+    const fn fts5_tokenize(self) -> &'static str {
+        match self {
+            Self::Unicode61 => "unicode61",
+            Self::Porter => "porter unicode61",
+            Self::Trigram => "trigram",
+        }
+    }
 }
 
 /// Configuration for the FTS5 lexical search adapter.
@@ -119,8 +126,15 @@ impl Default for Fts5AdapterConfig {
 
 // ─── Row ID mapping ─────────────────────────────────────────────────────────
 
-/// Maps between string `doc_ids` and i64 rowids required by `Fts5Table`.
-#[derive(Debug, Default)]
+/// Maps between string `doc_ids` and the i64 rowids used by the FTS5 table.
+///
+/// The map is required for `Contentless` tables (whose columns cannot be
+/// read back) and keeps `doc_count` and deletions uniform across modes.
+///
+/// `Clone` lets writers stage map mutations inside a `rusqlite` transaction
+/// and publish them only after `COMMIT` succeeds, so a rolled-back batch can
+/// never desynchronize the map from the FTS5 table.
+#[derive(Debug, Default, Clone)]
 struct RowIdMap {
     doc_to_row: HashMap<String, i64>,
     row_to_doc: HashMap<i64, String>,
@@ -169,10 +183,11 @@ impl RowIdMap {
 
 /// FTS5-backed implementation of the split lexical capabilities.
 ///
-/// Uses `FrankenSQLite`'s `Fts5Table` directly for full-text indexing
-/// and BM25-ranked search. Thread-safe via internal `Mutex`.
+/// Indexes documents into a real SQLite FTS5 virtual table on an in-memory
+/// `rusqlite::Connection` and runs BM25-ranked `MATCH` queries against it.
+/// Thread-safe via internal `Mutex`.
 pub struct Fts5LexicalSearch {
-    table: Mutex<Fts5Table>,
+    conn: Mutex<Connection>,
     rowid_map: Mutex<RowIdMap>,
     config: Fts5AdapterConfig,
 }
@@ -188,19 +203,32 @@ impl std::fmt::Debug for Fts5LexicalSearch {
 
 impl Fts5LexicalSearch {
     /// Create a new FTS5 lexical search instance.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the embedded SQLite cannot create an FTS5 virtual table,
+    /// meaning the `rusqlite` build lacks the FTS5 module.
     #[must_use]
     pub fn new(config: Fts5AdapterConfig) -> Self {
-        let columns = vec![
-            "doc_id".to_owned(),
-            "title".to_owned(),
-            "content".to_owned(),
-            "metadata_json".to_owned(),
-        ];
+        let conn = Connection::open_in_memory().expect("in-memory rusqlite connection should open");
 
-        let table = Fts5Table::with_columns(columns);
+        // `External` degrades to the contentful layout: an in-memory index
+        // has no separately governed content table. `Contentless` enables
+        // `contentless_delete` so rowid-scoped deletes stay available.
+        let content_option = match config.content_mode {
+            Fts5ContentMode::Stored | Fts5ContentMode::External => "",
+            Fts5ContentMode::Contentless => ", content='', contentless_delete=1",
+        };
+        conn.execute_batch(&format!(
+            "CREATE VIRTUAL TABLE {MEM_FTS5_TABLE} USING fts5(\
+             doc_id UNINDEXED, title, content, metadata_json UNINDEXED, \
+             tokenize='{}'{content_option});",
+            config.tokenizer.fts5_tokenize()
+        ))
+        .expect("in-memory FTS5 table creation should succeed");
 
         Self {
-            table: Mutex::new(table),
+            conn: Mutex::new(conn),
             rowid_map: Mutex::new(RowIdMap::new()),
             config,
         }
@@ -251,6 +279,44 @@ impl Fts5LexicalSearch {
         ]
     }
 
+    /// The `metadata_json` select expression for the configured content mode.
+    ///
+    /// Column values cannot be read back from a contentless table, so a NULL
+    /// literal keeps the result shape identical without touching the table.
+    fn metadata_select(&self) -> &'static str {
+        match self.config.content_mode {
+            Fts5ContentMode::Contentless => "NULL",
+            Fts5ContentMode::Stored | Fts5ContentMode::External => "metadata_json",
+        }
+    }
+
+    /// Upsert one document into the FTS5 table under its mapped rowid.
+    fn index_document_on(
+        conn: &Connection,
+        rowid_map: &mut RowIdMap,
+        doc: &IndexableDocument,
+    ) -> SearchResult<()> {
+        if let Some(old_rowid) = rowid_map.get_rowid(&doc.id) {
+            conn.execute(
+                &format!("DELETE FROM {MEM_FTS5_TABLE} WHERE rowid = ?1;"),
+                params![old_rowid],
+            )
+            .map_err(|error| map_storage_error_at("fts5 remove document for upsert", error))?;
+        }
+
+        let rowid = rowid_map.get_or_assign(&doc.id);
+        let columns = Self::doc_to_columns(doc);
+        conn.execute(
+            &format!(
+                "INSERT INTO {MEM_FTS5_TABLE}(rowid, doc_id, title, content, metadata_json) \
+                 VALUES (?1, ?2, ?3, ?4, ?5);"
+            ),
+            params![rowid, columns[0], columns[1], columns[2], columns[3]],
+        )
+        .map_err(|error| map_storage_error_at("fts5 index document", error))?;
+        Ok(())
+    }
+
     /// Search with snippet generation (richer result type).
     #[allow(clippy::significant_drop_tightening)]
     pub fn search_with_snippets(&self, query: &str, limit: usize) -> SearchResult<Vec<Fts5Hit>> {
@@ -258,50 +324,64 @@ impl Fts5LexicalSearch {
         if query.trim().is_empty() {
             return Ok(Vec::new());
         }
+        let limit = i64::try_from(limit).map_err(|_| SearchError::InvalidConfig {
+            field: "fts5.limit".to_owned(),
+            value: limit.to_string(),
+            reason: "does not fit SQLite's signed integer limit".to_owned(),
+        })?;
 
-        let table = self.table.lock().map_err(lock_error)?;
+        let conn = self.conn.lock().map_err(lock_error)?;
         let rowid_map = self.rowid_map.lock().map_err(lock_error)?;
 
-        let search_results = table
-            .search(query)
-            .map_err(|e| SearchError::QueryParseError {
+        // `snippet()` cannot be served by a contentless table; keep a NULL
+        // placeholder there so the result shape stays the same.
+        let snippet_select = match self.config.content_mode {
+            Fts5ContentMode::Contentless => "NULL".to_owned(),
+            Fts5ContentMode::Stored | Fts5ContentMode::External => format!(
+                "snippet({MEM_FTS5_TABLE}, {COL_CONTENT}, '<b>', '</b>', '...', {DEFAULT_SNIPPET_TOKENS})"
+            ),
+        };
+        let sql = format!(
+            "SELECT rowid, bm25({0}, 0.0, ?2, 1.0, 0.0), {1}, {snippet_select} \
+             FROM {0} WHERE {0} MATCH ?1 \
+             ORDER BY bm25({0}, 0.0, ?2, 1.0, 0.0), rowid LIMIT ?3;",
+            MEM_FTS5_TABLE,
+            self.metadata_select(),
+        );
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|error| SearchError::QueryParseError {
                 query: query.to_owned(),
-                detail: e.to_string(),
+                detail: error.to_string(),
+            })?;
+        let rows = stmt
+            .query_map(
+                params![query, self.config.title_boost, limit],
+                |row| -> rusqlite::Result<(i64, f64, Option<String>, Option<String>)> {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                },
+            )
+            .map_err(|error| SearchError::QueryParseError {
+                query: query.to_owned(),
+                detail: error.to_string(),
             })?;
 
-        let query_terms: Vec<String> = query
-            .split_whitespace()
-            .map(|t| t.trim_matches('"').to_lowercase())
-            .collect();
-
-        let mut hits = Vec::with_capacity(search_results.len().min(limit));
-        for (rank, (rowid, score)) in search_results.into_iter().take(limit).enumerate() {
+        let mut hits = Vec::new();
+        for (rank, row) in rows.enumerate() {
+            let (rowid, raw_score, metadata_json, snippet) =
+                row.map_err(|error| SearchError::QueryParseError {
+                    query: query.to_owned(),
+                    detail: error.to_string(),
+                })?;
             let doc_id = rowid_map.get_doc_id(rowid).unwrap_or("").to_owned();
 
             // FTS5 scores are negative (lower = better). Negate for positive.
             #[allow(clippy::cast_possible_truncation)]
-            let bm25_score = (-score) as f32;
+            let bm25_score = (-raw_score) as f32;
 
-            // Generate snippet from content column if available.
-            let snippet = table
-                .get_document(rowid)
-                .and_then(|cols| cols.get(COL_CONTENT))
-                .map(|content| {
-                    fts5_snippet(
-                        content,
-                        &query_terms,
-                        "<b>",
-                        "</b>",
-                        "...",
-                        DEFAULT_SNIPPET_TOKENS,
-                    )
-                });
-
-            let metadata = table
-                .get_document(rowid)
-                .and_then(|cols| cols.get(COL_METADATA))
+            let metadata = metadata_json
                 .filter(|s| !s.is_empty())
-                .and_then(|s| serde_json::from_str(s).ok());
+                .and_then(|s| serde_json::from_str(&s).ok());
 
             hits.push(Fts5Hit {
                 doc_id,
@@ -320,33 +400,47 @@ impl Fts5LexicalSearch {
     ///
     /// Returns `true` if the document existed and was removed.
     pub fn delete_document(&self, doc_id: &str) -> SearchResult<bool> {
-        let mut table = self.table.lock().map_err(lock_error)?;
+        let conn = self.conn.lock().map_err(lock_error)?;
         let mut rowid_map = self.rowid_map.lock().map_err(lock_error)?;
 
-        let Some(rowid) = rowid_map.remove(doc_id) else {
+        let Some(rowid) = rowid_map.get_rowid(doc_id) else {
             return Ok(false);
         };
-        table.delete_document(rowid);
-        // Keep the table and ID map locked until both mutations are complete.
+        conn.execute(
+            &format!("DELETE FROM {MEM_FTS5_TABLE} WHERE rowid = ?1;"),
+            params![rowid],
+        )
+        .map_err(|error| map_storage_error_at("fts5 delete document", error))?;
+        // The map entry is dropped only after the row is gone, so a failed
+        // DELETE cannot orphan the document id in `rowid_map`.
+        rowid_map.remove(doc_id);
+        // Keep the connection and ID map locked until both mutations complete.
         drop(rowid_map);
-        drop(table);
+        drop(conn);
         Ok(true)
     }
 
     /// Delete all indexed documents.
     pub fn clear(&self) -> SearchResult<()> {
-        let mut table = self.table.lock().map_err(lock_error)?;
+        let conn = self.conn.lock().map_err(lock_error)?;
         let mut rowid_map = self.rowid_map.lock().map_err(lock_error)?;
 
-        // Collect all rowids to delete.
-        let rowids: Vec<i64> = rowid_map.row_to_doc.keys().copied().collect();
-        for rowid in rowids {
-            table.delete_document(rowid);
-        }
+        // A contentless table only accepts the `delete-all` command; a
+        // contentful table takes a plain unqualified DELETE.
+        let clear_sql = match self.config.content_mode {
+            Fts5ContentMode::Contentless => {
+                format!("INSERT INTO {MEM_FTS5_TABLE}({MEM_FTS5_TABLE}) VALUES('delete-all');")
+            }
+            Fts5ContentMode::Stored | Fts5ContentMode::External => {
+                format!("DELETE FROM {MEM_FTS5_TABLE};")
+            }
+        };
+        conn.execute(&clear_sql, [])
+            .map_err(|error| map_storage_error_at("fts5 clear", error))?;
         rowid_map.doc_to_row.clear();
         rowid_map.row_to_doc.clear();
         drop(rowid_map);
-        drop(table);
+        drop(conn);
 
         debug!("fts5: cleared all documents");
         Ok(())
@@ -389,11 +483,14 @@ impl PersistedFts5LexicalSearch {
     /// This checks the table's actual `sqlite_master` DDL rather than trusting
     /// an application-supplied content mode or tokenizer. It also requires the
     /// committed rebuild marker before returning a searchable reader.
+    // The signature stays `async` so callers pin a stable `Future` even though
+    // the rusqlite work inside is synchronous.
+    #[allow(clippy::unused_async_trait_impl)]
     pub async fn open(cx: &Cx, storage: Arc<Storage>, table_name: &str) -> SearchResult<Self> {
         let table_name = validated_fts5_identifier(table_name)?;
-        let fsqlite_cx = fsqlite_cx(cx);
+        fts5_checkpoint(cx, "fts5.persisted.open")?;
         let metadata =
-            ensure_porter_fts5_ready(&fsqlite_cx, storage.connection(), &table_name).await?;
+            storage.with_connection(|conn| ensure_porter_fts5_ready(conn, &table_name))?;
         Ok(Self {
             storage,
             table_name,
@@ -416,22 +513,19 @@ impl PersistedFts5LexicalSearch {
     ///
     /// This is the authoritative alternative to the synchronous
     /// [`frankensearch_core::LexicalRead::doc_count`] capability, which cannot
-    /// pin or await this adapter's live `FrankenSQLite` generation.
+    /// pin or await this adapter's live storage connection.
     ///
     /// # Errors
     ///
     /// Returns a storage or result-shape error when the current table count
     /// cannot be established.
     pub async fn current_doc_count(&self, cx: &Cx) -> SearchResult<usize> {
-        let fsqlite_cx = fsqlite_cx(cx);
         retry_transient_storage_async(
             cx,
-            || {
-                persisted_fts5_verified_doc_count(
-                    &fsqlite_cx,
-                    self.storage.connection(),
-                    &self.table_name,
-                )
+            || async {
+                self.storage.with_connection(|conn| {
+                    persisted_fts5_verified_doc_count(conn, &self.table_name)
+                })
             },
             "persisted fts5 count",
         )
@@ -448,21 +542,17 @@ impl frankensearch_core::LexicalRead for PersistedFts5LexicalSearch {
         limit: usize,
     ) -> SearchFuture<'a, Vec<ScoredResult>> {
         Box::pin(async move {
+            fts5_checkpoint(cx, "fts5.persisted.search")?;
             let query = Fts5LexicalSearch::truncate_query(query);
             if query.trim().is_empty() {
                 return Ok(Vec::new());
             }
 
-            let fsqlite_cx = fsqlite_cx(cx);
             let limit = i64::try_from(limit).map_err(|_| SearchError::InvalidConfig {
                 field: "fts5.limit".to_owned(),
                 value: limit.to_string(),
                 reason: "does not fit SQLite's signed integer limit".to_owned(),
             })?;
-            let params = [
-                SqliteValue::Text(query.to_owned().into()),
-                SqliteValue::Integer(limit),
-            ];
             let sql = format!(
                 "SELECT doc_id, metadata_json, bm25({0}) FROM {0} \
                          WHERE {0} MATCH ?1 ORDER BY bm25({0}), rowid LIMIT ?2;",
@@ -475,23 +565,22 @@ impl frankensearch_core::LexicalRead for PersistedFts5LexicalSearch {
                     // the rebuild helper: external DDL or marker changes fail
                     // the search closed before MATCH can return a stale Porter
                     // result.
-                    ensure_porter_fts5_ready(
-                        &fsqlite_cx,
-                        self.storage.connection(),
-                        &self.table_name,
-                    )
-                    .await?;
-                    let rows = self
-                        .storage
-                        .connection()
-                        .query_with_params(&fsqlite_cx, &sql, &params)
-                        .await
-                        .map_err(|error| {
+                    self.storage.with_connection(|conn| {
+                        ensure_porter_fts5_ready(conn, &self.table_name)?;
+                        let mut stmt = conn.prepare(&sql).map_err(|error| {
                             map_storage_error_at("persisted Porter FTS5 search", error)
                         })?;
-                    rows.iter()
-                        .map(decode_persisted_fts5_row)
-                        .collect::<SearchResult<Vec<_>>>()
+                        let mut rows = stmt.query(params![query, limit]).map_err(|error| {
+                            map_storage_error_at("persisted Porter FTS5 search", error)
+                        })?;
+                        let mut results = Vec::new();
+                        while let Some(row) = rows.next().map_err(|error| {
+                            map_storage_error_at("persisted Porter FTS5 search", error)
+                        })? {
+                            results.push(decode_persisted_fts5_row(row)?);
+                        }
+                        Ok(results)
+                    })
                 },
                 "persisted fts5 search",
             )
@@ -509,27 +598,27 @@ impl frankensearch_core::LexicalRead for PersistedFts5LexicalSearch {
     }
 }
 
-/// Rebuild a persisted Porter FTS5 table for `FrankenSQLite` 0.3.
+/// Rebuild a persisted Porter FTS5 table.
 ///
 /// The table's own DDL decides its content mode. Ordinary stored and external
 /// tables use FTS5's `rebuild` command; contentless tables are rejected because
 /// authoritative text and original rowids must be re-ingested instead.
 ///
-/// Rebuild and marker promotion share one synchronous worker transaction.
-/// Transient `FrankenSQLite` errors retry the whole transaction after a
-/// successful rollback. A failed rollback is not retried. Panic still
-/// rolls back once and resumes unwinding.
+/// Rebuild and marker promotion share one `BEGIN IMMEDIATE` worker transaction
+/// through [`Storage::immediate_transaction`]. Transient SQLite contention
+/// retries the whole transaction; a panic rolls back once before unwinding
+/// continues.
 pub async fn rebuild_porter_fts5_table(
     cx: &Cx,
-    conn: &AsyncConnection,
+    storage: &Storage,
     table_name: &str,
 ) -> SearchResult<()> {
     let table_name = validated_fts5_identifier(table_name)?;
-    let fsqlite_cx = fsqlite_cx(cx);
-    let metadata = read_persisted_fts5_metadata(&fsqlite_cx, conn, &table_name).await?;
+    let metadata =
+        storage.with_connection(|conn| read_persisted_fts5_metadata(conn, &table_name))?;
     ensure_rebuildable_porter_fts5(&table_name, &metadata)?;
 
-    match read_porter_fts5_rebuild_marker(&fsqlite_cx, conn, &table_name).await? {
+    match storage.with_connection(|conn| read_porter_fts5_rebuild_marker(conn, &table_name))? {
         Some(PORTER_FTS5_REBUILD_VERSION) => return Ok(()),
         Some(version) if version > PORTER_FTS5_REBUILD_VERSION => {
             return Err(SearchError::InvalidConfig {
@@ -543,79 +632,25 @@ pub async fn rebuild_porter_fts5_table(
         Some(_) | None => {}
     }
 
-    cx.checkpoint().map_err(|error| SearchError::Cancelled {
-        phase: "porter fts5 rebuild".to_owned(),
-        reason: cx
-            .cancel_reason()
-            .map_or_else(|| error.to_string(), |reason| reason.to_string()),
-    })?;
-    retry_transient_storage(
-        || rebuild_porter_fts5_table_once(conn, &table_name),
-        "porter fts5 rebuild",
-    )
-}
+    fts5_checkpoint(cx, "porter fts5 rebuild")?;
+    storage.immediate_transaction(|tx| {
+        tx.execute(
+            &format!("INSERT INTO {table_name}({table_name}) VALUES ('rebuild');"),
+            [],
+        )
+        .map_err(|error| map_storage_error_at("rebuild Porter FTS5 table", error))?;
 
-fn rebuild_porter_fts5_table_once(conn: &AsyncConnection, table_name: &str) -> SearchResult<()> {
-    conn.execute_sync("BEGIN IMMEDIATE;")
-        .map_err(|error| map_storage_error_at("begin Porter FTS5 rebuild", error))?;
-
-    let result = catch_unwind(AssertUnwindSafe(|| -> SearchResult<()> {
-        let rebuild_sql = format!("INSERT INTO {table_name}({table_name}) VALUES ('rebuild');");
-        conn.execute_sync(&rebuild_sql)
-            .map_err(|error| map_storage_error_at("rebuild Porter FTS5 table", error))?;
-
-        let params = [
-            SqliteValue::Text(table_name.to_owned().into()),
-            SqliteValue::Integer(PORTER_FTS5_REBUILD_VERSION),
-        ];
-        conn.execute_with_params_sync(
+        tx.execute(
             &format!(
                 "INSERT INTO {PORTER_FTS5_REBUILD_TABLE} (table_name, rebuild_version) \
                  VALUES (?1, ?2) \
                  ON CONFLICT(table_name) DO UPDATE SET rebuild_version = excluded.rebuild_version;"
             ),
-            &params,
+            params![table_name, PORTER_FTS5_REBUILD_VERSION],
         )
         .map_err(|error| map_storage_error_at("write Porter FTS5 rebuild marker", error))?;
         Ok(())
-    }));
-
-    match result {
-        Ok(Ok(())) => conn.commit_transaction_sync().map_err(|commit_error| {
-            match conn.rollback_transaction_sync() {
-                Ok(()) => map_storage_error_at("commit Porter FTS5 rebuild", commit_error),
-                Err(rollback_error) => {
-                    warn!(
-                        error = %rollback_error,
-                        "rollback failed after Porter FTS5 rebuild commit error"
-                    );
-                    unretryable_rollback_error(
-                        &map_storage_error_at("commit Porter FTS5 rebuild", commit_error),
-                        &rollback_error,
-                    )
-                }
-            }
-        }),
-        Ok(Err(error)) => match conn.rollback_transaction_sync() {
-            Ok(()) => Err(error),
-            Err(rollback_error) => {
-                warn!(
-                    error = %rollback_error,
-                    "rollback failed after Porter FTS5 rebuild error"
-                );
-                Err(unretryable_rollback_error(&error, &rollback_error))
-            }
-        },
-        Err(payload) => {
-            if let Err(rollback_error) = conn.rollback_transaction_sync() {
-                warn!(
-                    error = %rollback_error,
-                    "rollback failed during Porter FTS5 rebuild panic recovery"
-                );
-            }
-            resume_unwind(payload);
-        }
-    }
+    })
 }
 
 fn validated_fts5_identifier(table_name: &str) -> SearchResult<String> {
@@ -635,16 +670,15 @@ fn validated_fts5_identifier(table_name: &str) -> SearchResult<String> {
     }
 }
 
-async fn ensure_porter_fts5_ready(
-    fsqlite_cx: &FsqliteCx,
-    conn: &AsyncConnection,
+fn ensure_porter_fts5_ready(
+    conn: &Connection,
     table_name: &str,
 ) -> SearchResult<PersistedFts5Metadata> {
-    let metadata = read_persisted_fts5_metadata(fsqlite_cx, conn, table_name).await?;
+    let metadata = read_persisted_fts5_metadata(conn, table_name)?;
     ensure_rebuildable_porter_fts5(table_name, &metadata)?;
     ensure_porter_fts5_rebuild_version(
         table_name,
-        read_porter_fts5_rebuild_marker(fsqlite_cx, conn, table_name).await?,
+        read_porter_fts5_rebuild_marker(conn, table_name)?,
     )?;
     Ok(metadata)
 }
@@ -673,62 +707,70 @@ fn ensure_porter_fts5_rebuild_version(
     }
 }
 
-async fn read_persisted_fts5_metadata(
-    fsqlite_cx: &FsqliteCx,
-    conn: &AsyncConnection,
+fn read_persisted_fts5_metadata(
+    conn: &Connection,
     table_name: &str,
 ) -> SearchResult<PersistedFts5Metadata> {
-    let params = [SqliteValue::Text(table_name.to_owned().into())];
-    let rows = conn
-        .query_with_params(
-            fsqlite_cx,
-            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1;",
-            &params,
-        )
-        .await
+    let mut stmt = conn
+        .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1;")
+        .map_err(|error| map_storage_error_at("read persisted FTS5 table metadata", error))?;
+    let mut rows = stmt
+        .query(params![table_name])
         .map_err(|error| map_storage_error_at("read persisted FTS5 table metadata", error))?;
 
-    let [row] = rows.as_slice() else {
+    let mut create_sql = None;
+    while let Some(row) = rows
+        .next()
+        .map_err(|error| map_storage_error_at("read persisted FTS5 table metadata", error))?
+    {
+        if create_sql.is_some() {
+            return Err(persisted_fts5_metadata_error(
+                table_name,
+                "sqlite_master returned more than one table definition",
+            ));
+        }
+        create_sql = Some(match row.get_ref(0) {
+            Ok(ValueRef::Text(sql)) => std::str::from_utf8(sql)
+                .map_err(|_| {
+                    persisted_fts5_metadata_error(table_name, "sqlite_master.sql is not text")
+                })?
+                .to_owned(),
+            _ => {
+                return Err(persisted_fts5_metadata_error(
+                    table_name,
+                    "sqlite_master.sql is not text",
+                ));
+            }
+        });
+    }
+    let Some(create_sql) = create_sql else {
         return Err(persisted_fts5_metadata_error(
             table_name,
-            if rows.is_empty() {
-                "table is absent from sqlite_master"
-            } else {
-                "sqlite_master returned more than one table definition"
-            },
+            "table is absent from sqlite_master",
         ));
     };
-    let Some(SqliteValue::Text(sql)) = row.get(0) else {
-        return Err(persisted_fts5_metadata_error(
-            table_name,
-            "sqlite_master.sql is not text",
-        ));
-    };
-
-    parse_persisted_fts5_metadata(table_name, sql.as_ref())
+    parse_persisted_fts5_metadata(table_name, &create_sql)
 }
 
-async fn read_porter_fts5_rebuild_marker(
-    fsqlite_cx: &FsqliteCx,
-    conn: &AsyncConnection,
+fn read_porter_fts5_rebuild_marker(
+    conn: &Connection,
     table_name: &str,
 ) -> SearchResult<Option<i64>> {
-    let params = [SqliteValue::Text(table_name.to_owned().into())];
-    let rows = conn
-        .query_with_params(
-            fsqlite_cx,
-            &format!(
-                "SELECT rebuild_version FROM {PORTER_FTS5_REBUILD_TABLE} WHERE table_name = ?1;"
-            ),
-            &params,
-        )
-        .await
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT rebuild_version FROM {PORTER_FTS5_REBUILD_TABLE} WHERE table_name = ?1;"
+        ))
+        .map_err(|error| map_storage_error_at("read Porter FTS5 rebuild marker", error))?;
+    let mut rows = stmt
+        .query(params![table_name])
         .map_err(|error| map_storage_error_at("read Porter FTS5 rebuild marker", error))?;
 
-    let row = match rows.as_slice() {
-        [] => return Ok(None),
-        [row] => row,
-        _ => {
+    let mut rebuild_version = None;
+    while let Some(row) = rows
+        .next()
+        .map_err(|error| map_storage_error_at("read Porter FTS5 rebuild marker", error))?
+    {
+        if rebuild_version.is_some() {
             return Err(SearchError::InvalidConfig {
                 field: "fts5.rebuild_version".to_owned(),
                 value: table_name.to_owned(),
@@ -736,20 +778,25 @@ async fn read_porter_fts5_rebuild_marker(
                     .to_owned(),
             });
         }
-    };
-    match row.get(0) {
-        Some(SqliteValue::Integer(version)) => Ok(Some(*version)),
-        Some(value) => Err(SearchError::InvalidConfig {
-            field: "fts5.rebuild_version".to_owned(),
-            value: format!("{table_name}: {value:?}"),
-            reason: "refusing to query a Porter FTS5 table whose governed rebuild marker is not an integer".to_owned(),
-        }),
-        None => Err(SearchError::InvalidConfig {
-            field: "fts5.rebuild_version".to_owned(),
-            value: format!("{table_name}: missing column"),
-            reason: "refusing to query a Porter FTS5 table whose governed rebuild marker row is malformed".to_owned(),
-        }),
+        rebuild_version = Some(match row.get_ref(0) {
+            Ok(ValueRef::Integer(version)) => version,
+            Ok(value) => {
+                return Err(SearchError::InvalidConfig {
+                    field: "fts5.rebuild_version".to_owned(),
+                    value: format!("{table_name}: {value:?}"),
+                    reason: "refusing to query a Porter FTS5 table whose governed rebuild marker is not an integer".to_owned(),
+                });
+            }
+            Err(_) => {
+                return Err(SearchError::InvalidConfig {
+                    field: "fts5.rebuild_version".to_owned(),
+                    value: format!("{table_name}: missing column"),
+                    reason: "refusing to query a Porter FTS5 table whose governed rebuild marker row is malformed".to_owned(),
+                });
+            }
+        });
     }
+    Ok(rebuild_version)
 }
 
 fn ensure_rebuildable_porter_fts5(
@@ -780,117 +827,136 @@ fn ensure_rebuildable_porter_fts5(
     Ok(())
 }
 
-async fn persisted_fts5_verified_doc_count(
-    fsqlite_cx: &FsqliteCx,
-    conn: &AsyncConnection,
-    table_name: &str,
-) -> SearchResult<usize> {
-    let params = [SqliteValue::Text(table_name.to_owned().into())];
-    let rows = conn
-        .query_with_params(
-            fsqlite_cx,
-            &format!(
-                "SELECT schema_entry.sql, \
-                        (SELECT COUNT(*) FROM {PORTER_FTS5_REBUILD_TABLE} \
-                         WHERE table_name = ?1), \
-                        (SELECT MIN(rebuild_version) FROM {PORTER_FTS5_REBUILD_TABLE} \
-                         WHERE table_name = ?1), \
-                        (SELECT COUNT(*) FROM {table_name}) \
-                 FROM sqlite_master AS schema_entry \
-                 WHERE schema_entry.type = 'table' AND schema_entry.name = ?1;"
-            ),
-            &params,
-        )
-        .await
+fn persisted_fts5_verified_doc_count(conn: &Connection, table_name: &str) -> SearchResult<usize> {
+    let sql = format!(
+        "SELECT schema_entry.sql, \
+                (SELECT COUNT(*) FROM {PORTER_FTS5_REBUILD_TABLE} \
+                 WHERE table_name = ?1), \
+                (SELECT MIN(rebuild_version) FROM {PORTER_FTS5_REBUILD_TABLE} \
+                 WHERE table_name = ?1), \
+                (SELECT COUNT(*) FROM {table_name}) \
+         FROM sqlite_master AS schema_entry \
+         WHERE schema_entry.type = 'table' AND schema_entry.name = ?1;"
+    );
+    let mut stmt = conn.prepare(&sql).map_err(|error| {
+        map_storage_error_at("verify and count persisted Porter FTS5 documents", error)
+    })?;
+    let mut rows = stmt.query(params![table_name]).map_err(|error| {
+        map_storage_error_at("verify and count persisted Porter FTS5 documents", error)
+    })?;
+
+    let (create_sql, marker_count, rebuild_version, count) = match rows.next().map_err(|error| {
+        map_storage_error_at("verify and count persisted Porter FTS5 documents", error)
+    })? {
+        Some(row) => {
+            let create_sql = match row.get_ref(0) {
+                Ok(ValueRef::Text(sql)) => std::str::from_utf8(sql)
+                    .map_err(|_| {
+                        persisted_fts5_metadata_error(table_name, "sqlite_master.sql is not text")
+                    })?
+                    .to_owned(),
+                _ => {
+                    return Err(persisted_fts5_metadata_error(
+                        table_name,
+                        "sqlite_master.sql is not text",
+                    ));
+                }
+            };
+            let Ok(ValueRef::Integer(marker_count)) = row.get_ref(1) else {
+                return Err(SearchError::InvalidConfig {
+                    field: "fts5.rebuild_version".to_owned(),
+                    value: table_name.to_owned(),
+                    reason: "governed Porter FTS5 marker cardinality is not an integer".to_owned(),
+                });
+            };
+            let rebuild_version = match row.get_ref(2) {
+                Ok(ValueRef::Integer(version)) => Some(version),
+                Ok(ValueRef::Null) => None,
+                Ok(value) => {
+                    return Err(SearchError::InvalidConfig {
+                        field: "fts5.rebuild_version".to_owned(),
+                        value: format!("{table_name}: {value:?}"),
+                        reason: "refusing to count a Porter FTS5 table whose governed rebuild marker is not an integer".to_owned(),
+                    });
+                }
+                Err(_) => {
+                    return Err(persisted_fts5_metadata_error(
+                        table_name,
+                        "verification result is missing the rebuild marker column",
+                    ));
+                }
+            };
+            let Ok(ValueRef::Integer(count)) = row.get_ref(3) else {
+                return Err(persisted_fts5_metadata_error(
+                    table_name,
+                    "COUNT(*) did not return an integer",
+                ));
+            };
+            (create_sql, marker_count, rebuild_version, count)
+        }
+        None => {
+            return Err(persisted_fts5_metadata_error(
+                table_name,
+                "table is absent from sqlite_master",
+            ));
+        }
+    };
+    if rows
+        .next()
         .map_err(|error| {
             map_storage_error_at("verify and count persisted Porter FTS5 documents", error)
-        })?;
-    let [row] = rows.as_slice() else {
+        })?
+        .is_some()
+    {
         return Err(persisted_fts5_metadata_error(
             table_name,
-            if rows.is_empty() {
-                "table is absent from sqlite_master"
-            } else {
-                "verification and COUNT(*) returned more than one row"
-            },
+            "verification and COUNT(*) returned more than one row",
         ));
-    };
-    let Some(SqliteValue::Text(sql)) = row.get(0) else {
-        return Err(persisted_fts5_metadata_error(
-            table_name,
-            "sqlite_master.sql is not text",
-        ));
-    };
-    let metadata = parse_persisted_fts5_metadata(table_name, sql.as_ref())?;
+    }
+
+    let metadata = parse_persisted_fts5_metadata(table_name, &create_sql)?;
     ensure_rebuildable_porter_fts5(table_name, &metadata)?;
 
-    let Some(SqliteValue::Integer(marker_count)) = row.get(1) else {
-        return Err(SearchError::InvalidConfig {
-            field: "fts5.rebuild_version".to_owned(),
-            value: table_name.to_owned(),
-            reason: "governed Porter FTS5 marker cardinality is not an integer".to_owned(),
-        });
-    };
-    match *marker_count {
+    match marker_count {
         0 => ensure_porter_fts5_rebuild_version(table_name, None)?,
         1 => {}
-        count => {
+        duplicates => {
             return Err(SearchError::InvalidConfig {
                 field: "fts5.rebuild_version".to_owned(),
-                value: format!("{table_name}: {count} rows"),
+                value: format!("{table_name}: {duplicates} rows"),
                 reason: "governed Porter FTS5 marker table contains duplicate rows for one table"
                     .to_owned(),
             });
         }
     }
-
-    let rebuild_version = match row.get(2) {
-        Some(SqliteValue::Integer(version)) => Some(*version),
-        Some(SqliteValue::Null) => None,
-        Some(value) => {
-            return Err(SearchError::InvalidConfig {
-                field: "fts5.rebuild_version".to_owned(),
-                value: format!("{table_name}: {value:?}"),
-                reason: "refusing to count a Porter FTS5 table whose governed rebuild marker is not an integer".to_owned(),
-            });
-        }
-        None => {
-            return Err(persisted_fts5_metadata_error(
-                table_name,
-                "verification result is missing the rebuild marker column",
-            ));
-        }
-    };
     ensure_porter_fts5_rebuild_version(table_name, rebuild_version)?;
 
-    let Some(SqliteValue::Integer(count)) = row.get(3) else {
-        return Err(persisted_fts5_metadata_error(
-            table_name,
-            "COUNT(*) did not return an integer",
-        ));
-    };
-    usize::try_from(*count).map_err(|_| {
+    usize::try_from(count).map_err(|_| {
         persisted_fts5_metadata_error(table_name, "COUNT(*) is negative or does not fit usize")
     })
 }
 
-fn decode_persisted_fts5_row(row: &Row) -> SearchResult<ScoredResult> {
-    let Some(SqliteValue::Text(doc_id)) = row.get(0) else {
-        return Err(persisted_fts5_result_error("doc_id must be non-NULL TEXT"));
+fn decode_persisted_fts5_row(row: &Row<'_>) -> SearchResult<ScoredResult> {
+    let doc_id = match row.get_ref(0) {
+        Ok(ValueRef::Text(bytes)) => std::str::from_utf8(bytes)
+            .map_err(|_| persisted_fts5_result_error("doc_id must be non-NULL TEXT"))?,
+        _ => return Err(persisted_fts5_result_error("doc_id must be non-NULL TEXT")),
     };
     if doc_id.is_empty() {
         return Err(persisted_fts5_result_error("doc_id must not be empty"));
     }
 
-    let metadata = match row.get(1) {
-        None => {
+    let metadata = match row.get_ref(1) {
+        Err(_) => {
             return Err(persisted_fts5_result_error(
                 "metadata_json column is missing",
             ));
         }
-        Some(SqliteValue::Null) => None,
-        Some(SqliteValue::Text(text)) if text.is_empty() => None,
-        Some(SqliteValue::Text(text)) => {
+        Ok(ValueRef::Null) => None,
+        Ok(ValueRef::Text([])) => None,
+        Ok(ValueRef::Text(text)) => {
+            let text = std::str::from_utf8(text)
+                .map_err(|_| persisted_fts5_result_error("metadata_json must be TEXT or NULL"))?;
             Some(
                 serde_json::from_str(text).map_err(|error| SearchError::InvalidConfig {
                     field: "fts5.metadata_json".to_owned(),
@@ -899,22 +965,22 @@ fn decode_persisted_fts5_row(row: &Row) -> SearchResult<ScoredResult> {
                 })?,
             )
         }
-        Some(value) => {
+        Ok(value) => {
             return Err(persisted_fts5_result_error(&format!(
                 "metadata_json must be TEXT or NULL, got {value:?}"
             )));
         }
     };
 
-    let raw_score = match row.get(2) {
-        Some(SqliteValue::Float(score)) => *score,
-        Some(SqliteValue::Integer(score)) => *score as f64,
-        Some(value) => {
+    let raw_score = match row.get_ref(2) {
+        Ok(ValueRef::Real(score)) => score,
+        Ok(ValueRef::Integer(score)) => score as f64,
+        Ok(value) => {
             return Err(persisted_fts5_result_error(&format!(
                 "bm25 score must be REAL or INTEGER, got {value:?}"
             )));
         }
-        None => return Err(persisted_fts5_result_error("bm25 score column is missing")),
+        Err(_) => return Err(persisted_fts5_result_error("bm25 score column is missing")),
     };
     let score = -raw_score;
     if !score.is_finite() || score > f64::from(f32::MAX) {
@@ -926,7 +992,7 @@ fn decode_persisted_fts5_row(row: &Row) -> SearchResult<ScoredResult> {
     let score = score as f32;
 
     Ok(ScoredResult {
-        doc_id: doc_id.to_string().into(),
+        doc_id: doc_id.to_owned().into(),
         score,
         source: ScoreSource::Lexical,
         index: None,
@@ -1360,33 +1426,57 @@ impl frankensearch_core::LexicalRead for Fts5LexicalSearch {
             if query.trim().is_empty() {
                 return Ok(Vec::new());
             }
+            let limit = i64::try_from(limit).map_err(|_| SearchError::InvalidConfig {
+                field: "fts5.limit".to_owned(),
+                value: limit.to_string(),
+                reason: "does not fit SQLite's signed integer limit".to_owned(),
+            })?;
 
-            let table = self.table.lock().map_err(lock_error)?;
+            let conn = self.conn.lock().map_err(lock_error)?;
             let rowid_map = self.rowid_map.lock().map_err(lock_error)?;
 
-            let search_results = table
-                .search(query)
-                .map_err(|e| SearchError::QueryParseError {
+            let sql = format!(
+                "SELECT rowid, bm25({0}, 0.0, ?2, 1.0, 0.0), {1} \
+                 FROM {0} WHERE {0} MATCH ?1 \
+                 ORDER BY bm25({0}, 0.0, ?2, 1.0, 0.0), rowid LIMIT ?3;",
+                MEM_FTS5_TABLE,
+                self.metadata_select(),
+            );
+            let mut stmt = conn
+                .prepare(&sql)
+                .map_err(|error| SearchError::QueryParseError {
                     query: query.to_owned(),
-                    detail: e.to_string(),
+                    detail: error.to_string(),
+                })?;
+            let rows = stmt
+                .query_map(
+                    params![query, self.config.title_boost, limit],
+                    |row| -> rusqlite::Result<(i64, f64, Option<String>)> {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    },
+                )
+                .map_err(|error| SearchError::QueryParseError {
+                    query: query.to_owned(),
+                    detail: error.to_string(),
                 })?;
 
-            debug!(hits = search_results.len(), "fts5 BM25 search completed");
-
-            let mut results = Vec::with_capacity(search_results.len().min(limit));
-            for (rowid, score) in search_results.into_iter().take(limit) {
+            let mut results = Vec::new();
+            for row in rows {
+                let (rowid, raw_score, metadata_json) =
+                    row.map_err(|error| SearchError::QueryParseError {
+                        query: query.to_owned(),
+                        detail: error.to_string(),
+                    })?;
                 let doc_id = rowid_map.get_doc_id(rowid).unwrap_or("").to_owned();
 
                 // FTS5 BM25 scores are negative (lower = better).
                 // Negate to produce positive scores (higher = better).
                 #[allow(clippy::cast_possible_truncation)]
-                let bm25_score = (-score) as f32;
+                let bm25_score = (-raw_score) as f32;
 
-                let metadata = table
-                    .get_document(rowid)
-                    .and_then(|cols| cols.get(COL_METADATA))
+                let metadata = metadata_json
                     .filter(|s| !s.is_empty())
-                    .and_then(|s| serde_json::from_str(s).ok());
+                    .and_then(|s| serde_json::from_str(&s).ok());
 
                 results.push(ScoredResult {
                     doc_id: doc_id.into(),
@@ -1401,7 +1491,7 @@ impl frankensearch_core::LexicalRead for Fts5LexicalSearch {
                     metadata,
                 });
             }
-
+            debug!(hits = results.len(), "fts5 BM25 search completed");
             Ok(results)
         })
     }
@@ -1422,19 +1512,22 @@ impl frankensearch_core::LexicalWrite for Fts5LexicalSearch {
     ) -> SearchFuture<'a, ()> {
         Box::pin(async move {
             fts5_checkpoint(cx, "fts5.index_document")?;
-            let mut table = self.table.lock().map_err(lock_error)?;
+            let mut conn = self.conn.lock().map_err(lock_error)?;
             let mut rowid_map = self.rowid_map.lock().map_err(lock_error)?;
 
-            // Upsert: delete existing document with same ID first.
-            if let Some(old_rowid) = rowid_map.get_rowid(&doc.id) {
-                table.delete_document(old_rowid);
-            }
-
-            let rowid = rowid_map.get_or_assign(&doc.id);
-            let columns = Self::doc_to_columns(doc);
-            table.insert_document(rowid, &columns);
+            // The upsert's DELETE+INSERT pair runs in one transaction and the
+            // rowid map is staged on a clone, so a failed write rolls back
+            // both the FTS5 row and the map mutation together.
+            let tx = conn
+                .transaction()
+                .map_err(|error| map_storage_error_at("fts5 index begin", error))?;
+            let mut staged_map = rowid_map.clone();
+            Self::index_document_on(&tx, &mut staged_map, doc)?;
+            tx.commit()
+                .map_err(|error| map_storage_error_at("fts5 index commit", error))?;
+            *rowid_map = staged_map;
             drop(rowid_map);
-            drop(table);
+            drop(conn);
 
             Ok(())
         })
@@ -1447,21 +1540,26 @@ impl frankensearch_core::LexicalWrite for Fts5LexicalSearch {
     ) -> SearchFuture<'a, ()> {
         Box::pin(async move {
             fts5_checkpoint(cx, "fts5.index_documents")?;
-            let mut table = self.table.lock().map_err(lock_error)?;
+            let mut conn = self.conn.lock().map_err(lock_error)?;
             let mut rowid_map = self.rowid_map.lock().map_err(lock_error)?;
 
+            let tx = conn
+                .transaction()
+                .map_err(|error| map_storage_error_at("fts5 index batch begin", error))?;
+            // Stage rowid assignments on a clone: a mid-batch checkpoint or a
+            // failed commit drops `tx` (rolling back every FTS5 write) and
+            // discards `staged_map`, leaving `rowid_map` in sync with the
+            // table. The clone is published only after `tx.commit()` succeeds.
+            let mut staged_map = rowid_map.clone();
             for doc in docs {
                 fts5_checkpoint(cx, "fts5.index_documents")?;
-                if let Some(old_rowid) = rowid_map.get_rowid(&doc.id) {
-                    table.delete_document(old_rowid);
-                }
-
-                let rowid = rowid_map.get_or_assign(&doc.id);
-                let columns = Self::doc_to_columns(doc);
-                table.insert_document(rowid, &columns);
+                Self::index_document_on(&tx, &mut staged_map, doc)?;
             }
+            tx.commit()
+                .map_err(|error| map_storage_error_at("fts5 index batch commit", error))?;
+            *rowid_map = staged_map;
             drop(rowid_map);
-            drop(table);
+            drop(conn);
 
             debug!(count = docs.len(), "fts5: batch indexed documents");
             Ok(())
@@ -1469,7 +1567,7 @@ impl frankensearch_core::LexicalWrite for Fts5LexicalSearch {
     }
 
     fn commit<'a>(&'a self, _cx: &'a Cx) -> SearchFuture<'a, ()> {
-        // FTS5 in-memory table has no separate commit phase.
+        // FTS5 on a single connection has no separate commit phase.
         Box::pin(async { Ok(()) })
     }
 }
@@ -1619,48 +1717,31 @@ mod tests {
                 Storage::open_unbootstrapped_in_memory_for_test()
                     .expect("in-memory storage should open"),
             );
-            let fsqlite_cx = fsqlite_cx(&cx);
-            storage
-                .connection()
-                .execute(
-                    &fsqlite_cx,
-                    &format!(
-                        "CREATE TABLE {PORTER_FTS5_REBUILD_TABLE}(\
-                         table_name TEXT, rebuild_version INTEGER NOT NULL);"
-                    ),
-                )
-                .await
+            {
+                let conn = storage.connection().expect("connection should open");
+                conn.execute_batch(&format!(
+                    "CREATE TABLE {PORTER_FTS5_REBUILD_TABLE}(\
+                     table_name TEXT, rebuild_version INTEGER NOT NULL);"
+                ))
                 .expect("governed rebuild marker table should be created");
-            storage
-                .connection()
-                .execute(
-                    &fsqlite_cx,
+                conn.execute_batch(
                     "CREATE VIRTUAL TABLE persisted_docs USING fts5(\
                      doc_id UNINDEXED, metadata_json UNINDEXED, content, tokenize='porter');",
                 )
-                .await
                 .expect("persisted Porter table should be created");
-            storage
-                .connection()
-                .execute(
-                    &fsqlite_cx,
+                conn.execute_batch(
                     "INSERT INTO persisted_docs(doc_id, metadata_json, content) VALUES \
                      ('doc-1', '{}', 'first document'), \
                      ('doc-2', '{}', 'second document');",
                 )
-                .await
                 .expect("persisted documents should be inserted");
-            storage
-                .connection()
-                .execute(
-                    &fsqlite_cx,
-                    &format!(
-                        "INSERT INTO {PORTER_FTS5_REBUILD_TABLE}(table_name, rebuild_version) \
-                         VALUES ('persisted_docs', {PORTER_FTS5_REBUILD_VERSION});"
-                    ),
-                )
-                .await
+                conn.execute_batch(&format!(
+                    "INSERT INTO {PORTER_FTS5_REBUILD_TABLE}(table_name, rebuild_version) \
+                     VALUES ('persisted_docs', {PORTER_FTS5_REBUILD_VERSION});"
+                ))
                 .expect("governed rebuild marker should be installed");
+                drop(conn);
+            }
 
             let reader =
                 PersistedFts5LexicalSearch::open(&cx, Arc::clone(&storage), "persisted_docs")
@@ -1681,51 +1762,90 @@ mod tests {
                 2
             );
 
-            storage
-                .connection()
-                .execute(
-                    &fsqlite_cx,
-                    &format!(
-                        "UPDATE {PORTER_FTS5_REBUILD_TABLE} SET rebuild_version = 0 \
-                         WHERE table_name = 'persisted_docs';"
-                    ),
-                )
-                .await
+            {
+                let conn = storage.connection().expect("connection should open");
+                conn.execute_batch(&format!(
+                    "UPDATE {PORTER_FTS5_REBUILD_TABLE} SET rebuild_version = 0 \
+                     WHERE table_name = 'persisted_docs';"
+                ))
                 .expect("marker invalidation should succeed");
+                drop(conn);
+            }
             assert!(matches!(
                 reader.current_doc_count(&cx).await,
                 Err(SearchError::InvalidConfig { field, .. })
                     if field == "fts5.rebuild_version"
             ));
 
-            storage
-                .connection()
-                .execute(
-                    &fsqlite_cx,
-                    &format!(
-                        "UPDATE {PORTER_FTS5_REBUILD_TABLE} \
-                         SET rebuild_version = {PORTER_FTS5_REBUILD_VERSION} \
-                         WHERE table_name = 'persisted_docs';"
-                    ),
-                )
-                .await
+            {
+                let conn = storage.connection().expect("connection should open");
+                conn.execute_batch(&format!(
+                    "UPDATE {PORTER_FTS5_REBUILD_TABLE} \
+                     SET rebuild_version = {PORTER_FTS5_REBUILD_VERSION} \
+                     WHERE table_name = 'persisted_docs';"
+                ))
                 .expect("governed marker should be restored");
-            storage
-                .connection()
-                .execute(
-                    &fsqlite_cx,
-                    &format!(
-                        "INSERT INTO {PORTER_FTS5_REBUILD_TABLE}(table_name, rebuild_version) \
-                         VALUES ('persisted_docs', {PORTER_FTS5_REBUILD_VERSION});"
-                    ),
-                )
-                .await
+                conn.execute_batch(&format!(
+                    "INSERT INTO {PORTER_FTS5_REBUILD_TABLE}(table_name, rebuild_version) \
+                     VALUES ('persisted_docs', {PORTER_FTS5_REBUILD_VERSION});"
+                ))
                 .expect("duplicate hostile markers should be inserted");
+                drop(conn);
+            }
             assert!(matches!(
                 reader.current_doc_count(&cx).await,
                 Err(SearchError::InvalidConfig { field, reason, .. })
                     if field == "fts5.rebuild_version" && reason.contains("duplicate")
             ));
+        });
+    }
+
+    #[test]
+    fn rebuild_porter_table_then_persisted_search_finds_stemmed_matches() {
+        run_with_cx(|cx| async move {
+            let storage = Arc::new(Storage::open_in_memory().expect("storage should open"));
+            {
+                let conn = storage.connection().expect("connection should open");
+                conn.execute_batch(
+                    "CREATE VIRTUAL TABLE porter_docs USING fts5(\
+                     doc_id UNINDEXED, metadata_json UNINDEXED, content, tokenize='porter');",
+                )
+                .expect("Porter table should be created");
+                conn.execute_batch(
+                    "INSERT INTO porter_docs(doc_id, metadata_json, content) VALUES \
+                     ('doc-1', '{}', 'running fast'), \
+                     ('doc-2', '{}', 'walking slow');",
+                )
+                .expect("documents should be inserted");
+            }
+
+            // Without a committed rebuild marker the governed reader refuses
+            // to serve potentially stale Porter results.
+            assert!(
+                PersistedFts5LexicalSearch::open(&cx, Arc::clone(&storage), "porter_docs")
+                    .await
+                    .is_err()
+            );
+
+            rebuild_porter_fts5_table(&cx, &storage, "porter_docs")
+                .await
+                .expect("rebuild should succeed");
+            // The committed marker makes a second rebuild an idempotent no-op.
+            rebuild_porter_fts5_table(&cx, &storage, "porter_docs")
+                .await
+                .expect("rebuild should be idempotent");
+
+            let reader = PersistedFts5LexicalSearch::open(&cx, Arc::clone(&storage), "porter_docs")
+                .await
+                .expect("governed persisted reader should open");
+            let hits = reader
+                .search(&cx, "run", 10)
+                .await
+                .expect("persisted search should succeed");
+            assert_eq!(hits.len(), 1, "Porter should stem 'running' to 'run'");
+            assert_eq!(hits[0].doc_id, "doc-1");
+            assert!(hits[0].score > 0.0);
+            assert_eq!(reader.current_doc_count(&cx).await.expect("count"), 2);
         });
     }
 
@@ -1916,13 +2036,20 @@ mod tests {
         let search = Fts5LexicalSearch::with_defaults();
 
         {
-            let mut table = search.table.lock().unwrap();
+            let conn = search.conn.lock().unwrap();
             let mut rowid_map = search.rowid_map.lock().unwrap();
 
             let doc = make_doc("doc1", "The quick brown fox jumps over the lazy dog");
             let rowid = rowid_map.get_or_assign(&doc.id);
             let columns = Fts5LexicalSearch::doc_to_columns(&doc);
-            table.insert_document(rowid, &columns);
+            conn.execute(
+                &format!(
+                    "INSERT INTO {MEM_FTS5_TABLE}(rowid, doc_id, title, content, metadata_json) \
+                     VALUES (?1, ?2, ?3, ?4, ?5);"
+                ),
+                params![rowid, columns[0], columns[1], columns[2], columns[3]],
+            )
+            .expect("document should be indexed");
         }
 
         let hits = search.search_with_snippets("fox", 10).unwrap();
@@ -2044,6 +2171,185 @@ mod tests {
             ];
             search.index_documents(&cx, &batch).await.unwrap();
             assert_eq!(search.doc_count().expect("document count"), 2);
+        });
+    }
+
+    // -- Transaction safety --
+
+    #[test]
+    fn cancelled_index_documents_leaves_index_unchanged() {
+        run_with_cx(|cx| async move {
+            let search = Fts5LexicalSearch::with_defaults();
+            search
+                .index_document(&cx, &make_doc("keep", "stable seed content"))
+                .await
+                .unwrap();
+            assert_eq!(search.doc_count().expect("document count"), 1);
+
+            cx.cancel_with(
+                asupersync::CancelKind::User,
+                Some("fts5 batch cancel probe"),
+            );
+            let docs = vec![
+                make_doc("batch-a", "cancelled alpha"),
+                make_doc("batch-b", "cancelled bravo"),
+            ];
+            let error = search
+                .index_documents(&cx, &docs)
+                .await
+                .expect_err("cancelled batch must not commit");
+            assert!(matches!(error, SearchError::Cancelled { .. }));
+
+            // The cancelled cx fails every later checkpoint, so verify with a
+            // fresh context.
+            let verify_cx = Cx::for_testing();
+            assert_eq!(
+                search.doc_count().expect("document count"),
+                1,
+                "cancelled batch must not change doc_count"
+            );
+            let hits = search.search(&verify_cx, "stable", 10).await.unwrap();
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].doc_id, "keep");
+            let hits = search.search(&verify_cx, "cancelled", 10).await.unwrap();
+            assert!(
+                hits.is_empty(),
+                "cancelled batch documents must not become searchable"
+            );
+        });
+    }
+
+    #[test]
+    #[allow(clippy::significant_drop_tightening)]
+    fn failed_index_documents_rolls_back_rowid_map() {
+        run_with_cx(|cx| async move {
+            let search = Fts5LexicalSearch::with_defaults();
+            search
+                .index_document(&cx, &make_doc("seed", "stable seed content"))
+                .await
+                .unwrap();
+            assert_eq!(search.doc_count().expect("document count"), 1);
+
+            // Occupy the rowid the batch's second document will be assigned,
+            // without registering it in `rowid_map`. The batch then fails
+            // mid-transaction on a rowid constraint after the first document
+            // was already inserted.
+            {
+                let conn = search.conn.lock().expect("lock connection");
+                conn.execute(
+                    &format!(
+                        "INSERT INTO {MEM_FTS5_TABLE}(rowid, doc_id, title, content, metadata_json) \
+                         VALUES (?1, ?2, ?3, ?4, ?5);"
+                    ),
+                    params![3_i64, "ghost", "", "", ""],
+                )
+                .expect("ghost row should insert");
+            }
+
+            let docs = vec![
+                make_doc("batch-a", "alpha content"),
+                make_doc("batch-b", "bravo content"),
+            ];
+            let error = search
+                .index_documents(&cx, &docs)
+                .await
+                .expect_err("mid-batch rowid conflict must fail the batch");
+            assert!(!matches!(error, SearchError::Cancelled { .. }));
+
+            assert_eq!(
+                search.doc_count().expect("document count"),
+                1,
+                "rolled-back batch must not change doc_count"
+            );
+            let hits = search.search(&cx, "alpha", 10).await.unwrap();
+            assert!(
+                hits.is_empty(),
+                "rolled-back document must not be searchable"
+            );
+            let hits = search.search(&cx, "stable", 10).await.unwrap();
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].doc_id, "seed");
+        });
+    }
+
+    // -- Content modes and tokenizers --
+
+    #[test]
+    fn contentless_mode_indexes_upserts_searches_and_deletes() {
+        let config = Fts5AdapterConfig {
+            content_mode: Fts5ContentMode::Contentless,
+            ..Fts5AdapterConfig::default()
+        };
+        let search = Fts5LexicalSearch::new(config);
+        run_with_cx(|cx| async move {
+            search
+                .index_document(&cx, &make_doc("doc1", "contentless alpha"))
+                .await
+                .unwrap();
+            // The upsert exercises the contentless_delete rowid path.
+            search
+                .index_document(&cx, &make_doc("doc1", "contentless beta"))
+                .await
+                .unwrap();
+            search
+                .index_document(&cx, &make_doc("doc2", "contentless gamma"))
+                .await
+                .unwrap();
+            assert_eq!(search.doc_count().expect("document count"), 2);
+
+            let hits = search.search(&cx, "beta", 10).await.unwrap();
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].doc_id, "doc1");
+            assert!(hits[0].metadata.is_none());
+
+            // Snippets are NULL placeholders on a contentless table.
+            let hits = search.search_with_snippets("beta", 10).unwrap();
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].doc_id, "doc1");
+            assert!(hits[0].snippet.is_none());
+
+            assert!(search.delete_document("doc1").unwrap());
+            assert_eq!(search.doc_count().expect("document count"), 1);
+            search.clear().unwrap();
+            assert_eq!(search.doc_count().expect("document count"), 0);
+        });
+    }
+
+    #[test]
+    fn porter_tokenizer_stems_terms() {
+        let search = Fts5LexicalSearch::new(Fts5AdapterConfig {
+            tokenizer: Fts5TokenizerChoice::Porter,
+            ..Fts5AdapterConfig::default()
+        });
+        run_with_cx(|cx| async move {
+            search
+                .index_document(&cx, &make_doc("doc1", "running quickly"))
+                .await
+                .unwrap();
+
+            // Porter stems 'running' to 'run', so the stemmed query matches.
+            let hits = search.search(&cx, "run", 10).await.unwrap();
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].doc_id, "doc1");
+        });
+    }
+
+    #[test]
+    fn trigram_tokenizer_matches_substrings() {
+        let search = Fts5LexicalSearch::new(Fts5AdapterConfig {
+            tokenizer: Fts5TokenizerChoice::Trigram,
+            ..Fts5AdapterConfig::default()
+        });
+        run_with_cx(|cx| async move {
+            search
+                .index_document(&cx, &make_doc("doc1", "hello world"))
+                .await
+                .unwrap();
+
+            // Trigram indexes byte substrings, so partial words match.
+            let hits = search.search(&cx, "ello wor", 10).await.unwrap();
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].doc_id, "doc1");
         });
     }
 
