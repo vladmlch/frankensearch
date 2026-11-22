@@ -1,44 +1,38 @@
-//! FrankenSQLite-backed storage bootstrap for ops telemetry.
+//! SQLite-backed storage bootstrap for ops telemetry (rusqlite).
 //!
 //! This module provides the schema contract for the control-plane database
 //! (`frankensearch-ops.db`) and a small connection wrapper that applies
-//! pragmas, runs migrations, and validates migration checksums.
+//! pragmas and bootstraps the clean v1 baseline schema.
 
 use std::collections::BTreeSet;
 use std::io;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use frankensearch_core::{
     SearchError, SearchEventPhase as TelemetrySearchEventPhase, SearchResult,
     TELEMETRY_SCHEMA_VERSION, TelemetryEnvelope, TelemetryEvent, TelemetryQueryClass,
 };
-use fsqlite::{AsyncConnection, Row};
-use fsqlite_types::value::SqliteValue;
+use rusqlite::types::Value as SqliteValue;
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 
 /// Current schema version for the ops telemetry database.
-pub const OPS_SCHEMA_VERSION: i64 = 2;
+///
+/// Exactly one schema version exists: the collapsed final form of the retired
+/// prototype migrations. The version is recorded both in the
+/// `ops_schema_version` marker table and in `PRAGMA user_version`, stamped
+/// inside the same `BEGIN IMMEDIATE` transaction that creates the schema.
+pub const OPS_SCHEMA_VERSION: i64 = 1;
 
-#[allow(clippy::needless_raw_string_hashes)]
-const OPS_SCHEMA_MIGRATIONS_TABLE_SQL: &str = r#"
-CREATE TABLE IF NOT EXISTS ops_schema_migrations (
-    version INTEGER PRIMARY KEY,
-    name TEXT NOT NULL,
-    applied_at_ms INTEGER NOT NULL,
-    checksum TEXT NOT NULL,
-    reversible INTEGER NOT NULL CHECK (reversible IN (0, 1))
-);
-"#;
+/// Version marker table created inside the bootstrap transaction.
+const OPS_SCHEMA_VERSION_TABLE_SQL: &str =
+    "CREATE TABLE IF NOT EXISTS ops_schema_version (version INTEGER PRIMARY KEY);";
 
-const OPS_SCHEMA_V1_NAME: &str = "ops_telemetry_storage_v1";
-const OPS_SCHEMA_V1_CHECKSUM: &str = "ops-schema-v1-20260214";
-const OPS_SCHEMA_V2_NAME: &str = "ops_telemetry_storage_v2_slo_anomaly_rollups";
-const OPS_SCHEMA_V2_CHECKSUM: &str = "ops-schema-v2-20260214";
-
+/// Canonical v1 baseline schema applied to every new database.
 #[allow(clippy::needless_raw_string_hashes)]
 const OPS_SCHEMA_V1_STATEMENTS: &[&str] = &[
     r#"
@@ -173,10 +167,6 @@ CREATE TABLE IF NOT EXISTS evidence_links (
     "CREATE INDEX IF NOT EXISTS ix_at_pk ON alerts_timeline(project_key, opened_at_ms DESC);",
     "CREATE INDEX IF NOT EXISTS ix_at_open ON alerts_timeline(project_key, state, severity, updated_at_ms DESC) WHERE state != 'resolved';",
     "CREATE INDEX IF NOT EXISTS ix_el_aid ON evidence_links(alert_id, created_at_ms DESC);",
-];
-
-#[allow(clippy::needless_raw_string_hashes)]
-const OPS_SCHEMA_V2_STATEMENTS: &[&str] = &[
     r#"
 CREATE TABLE IF NOT EXISTS slo_rollups (
     rollup_id TEXT PRIMARY KEY,
@@ -226,31 +216,6 @@ CREATE TABLE IF NOT EXISTS anomaly_materializations (
     "CREATE INDEX IF NOT EXISTS ix_slo_project_window ON slo_rollups(project_key, window, window_start_ms DESC);",
     "CREATE INDEX IF NOT EXISTS ix_am_scope_state ON anomaly_materializations(scope, scope_key, state, severity, updated_at_ms DESC);",
     "CREATE INDEX IF NOT EXISTS ix_am_project_timeline ON anomaly_materializations(project_key, opened_at_ms DESC);",
-];
-
-struct OpsMigration {
-    version: i64,
-    name: &'static str,
-    checksum: &'static str,
-    reversible: bool,
-    statements: &'static [&'static str],
-}
-
-const OPS_MIGRATIONS: &[OpsMigration] = &[
-    OpsMigration {
-        version: 1,
-        name: OPS_SCHEMA_V1_NAME,
-        checksum: OPS_SCHEMA_V1_CHECKSUM,
-        reversible: true,
-        statements: OPS_SCHEMA_V1_STATEMENTS,
-    },
-    OpsMigration {
-        version: 2,
-        name: OPS_SCHEMA_V2_NAME,
-        checksum: OPS_SCHEMA_V2_CHECKSUM,
-        reversible: true,
-        statements: OPS_SCHEMA_V2_STATEMENTS,
-    },
 ];
 
 /// Configuration for the ops telemetry storage connection.
@@ -1355,7 +1320,7 @@ impl Drop for PendingEventsReservation {
 
 /// Connection wrapper for ops telemetry storage.
 pub struct OpsStorage {
-    conn: AsyncConnection,
+    conn: Mutex<Connection>,
     config: OpsStorageConfig,
     ingestion_metrics: Arc<OpsIngestionMetrics>,
 }
@@ -1426,15 +1391,25 @@ impl OpsStorage {
     }
 
     fn open_once(config: OpsStorageConfig) -> SearchResult<Self> {
-        let conn = AsyncConnection::open_sync(config.db_path.to_string_lossy().to_string())
-            .map_err(ops_error)?;
+        let conn = if config.db_path.as_os_str() == ":memory:" {
+            Connection::open_in_memory().map_err(ops_error)?
+        } else {
+            Connection::open(&config.db_path).map_err(ops_error)?
+        };
         let storage = Self {
-            conn,
+            conn: Mutex::new(conn),
             config,
             ingestion_metrics: Arc::new(OpsIngestionMetrics::default()),
         };
-        storage.apply_pragmas()?;
-        bootstrap(storage.connection())?;
+        {
+            let mut conn = storage.connection();
+            storage.apply_connection_pragmas(&conn)?;
+            // `bootstrap` stamps `PRAGMA user_version = 1` inside `BEGIN
+            // IMMEDIATE`; `journal_mode` is only enabled afterwards.
+            bootstrap(&mut conn)?;
+            storage.apply_journal_mode(&conn)?;
+            current_version(&conn)?;
+        }
         Ok(storage)
     }
 
@@ -1447,13 +1422,16 @@ impl OpsStorage {
         Self::open(OpsStorageConfig::in_memory())
     }
 
-    /// Underlying database connection.
+    /// Lock the underlying database connection.
     ///
     /// Crate-private on purpose: every write goes through `with_transaction`,
     /// and a public raw handle would let callers bypass that bracket.
-    #[must_use]
-    pub(crate) const fn connection(&self) -> &AsyncConnection {
-        &self.conn
+    /// Poisoned locks are recovered: a panic inside a transaction closure
+    /// already rolled back, so the connection stays consistent.
+    pub(crate) fn connection(&self) -> MutexGuard<'_, Connection> {
+        self.conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Runtime configuration used by this storage handle.
@@ -1468,7 +1446,7 @@ impl OpsStorage {
     ///
     /// Returns an error if schema metadata cannot be read.
     pub fn current_schema_version(&self) -> SearchResult<i64> {
-        retry_ops_op(|| current_version(self.connection()), "schema version")
+        retry_ops_op(|| current_version(&self.connection()), "schema version")
     }
 
     /// Current ingestion metrics snapshot used by dashboards and tests.
@@ -1739,27 +1717,27 @@ impl OpsStorage {
         sample.validate()?;
 
         // Delete-then-insert must be one retryable transaction. Autocommit
-        // leaves a hole if INSERT fails after DELETE, and FrankenSQLite
-        // transients (Busy/SnapshotTooOld/SchemaChanged) need a clean retry.
+        // leaves a hole if INSERT fails after DELETE, and transient SQLite
+        // busy/locked errors need a clean retry.
         self.with_transaction(|conn| {
             ensure_project_exists(conn, &sample.project_key, sample.ts_ms)?;
             ensure_instance_exists(conn, &sample.instance_id, &sample.project_key, sample.ts_ms)?;
 
             let key_params = [
-                SqliteValue::Text(sample.project_key.clone().into()),
-                SqliteValue::Text(sample.instance_id.clone().into()),
+                SqliteValue::Text(sample.project_key.clone()),
+                SqliteValue::Text(sample.instance_id.clone()),
                 SqliteValue::Integer(sample.ts_ms),
             ];
-            conn.execute_with_params_sync(
+            conn.execute(
                 "DELETE FROM resource_samples \
          WHERE project_key = ?1 AND instance_id = ?2 AND ts_ms = ?3;",
-                &key_params,
+                key_params,
             )
             .map_err(ops_error)?;
 
             let params = [
-                SqliteValue::Text(sample.project_key.clone().into()),
-                SqliteValue::Text(sample.instance_id.clone().into()),
+                SqliteValue::Text(sample.project_key.clone()),
+                SqliteValue::Text(sample.instance_id.clone()),
                 optional_f64(sample.cpu_pct),
                 optional_u64(sample.rss_bytes, "rss_bytes")?,
                 optional_u64(sample.io_read_bytes, "io_read_bytes")?,
@@ -1767,12 +1745,12 @@ impl OpsStorage {
                 optional_u64(sample.queue_depth, "queue_depth")?,
                 SqliteValue::Integer(sample.ts_ms),
             ];
-            conn.execute_with_params_sync(
+            conn.execute(
                 "INSERT INTO resource_samples(\
             project_key, instance_id, cpu_pct, rss_bytes, io_read_bytes, io_write_bytes, \
             queue_depth, ts_ms\
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8);",
-                &params,
+                params,
             )
             .map_err(ops_error)?;
             Ok(())
@@ -1788,14 +1766,14 @@ impl OpsStorage {
     pub fn insert_evidence_link(&self, link: &EvidenceLinkRecord) -> SearchResult<()> {
         link.validate()?;
         self.with_transaction(|conn| {
-            let alert_params = [SqliteValue::Text(link.alert_id.clone().into())];
-            let alert_rows = conn
-                .query_with_params_sync(
-                    "SELECT project_key FROM alerts_timeline \
+            let alert_params = [SqliteValue::Text(link.alert_id.clone())];
+            let alert_rows = query_values(
+                conn,
+                "SELECT project_key FROM alerts_timeline \
              WHERE alert_id = ?1 LIMIT 1;",
-                    &alert_params,
-                )
-                .map_err(ops_error)?;
+                &alert_params,
+            )
+            .map_err(ops_error)?;
             let Some(alert_row) = alert_rows.first() else {
                 return Err(SearchError::InvalidConfig {
                     field: "alert_id".to_owned(),
@@ -1816,16 +1794,16 @@ impl OpsStorage {
             }
 
             let duplicate_params = [
-                SqliteValue::Text(link.alert_id.clone().into()),
-                SqliteValue::Text(link.evidence_uri.clone().into()),
+                SqliteValue::Text(link.alert_id.clone()),
+                SqliteValue::Text(link.evidence_uri.clone()),
             ];
-            let duplicate_rows = conn
-                .query_with_params_sync(
-                    "SELECT link_id FROM evidence_links \
+            let duplicate_rows = query_values(
+                conn,
+                "SELECT link_id FROM evidence_links \
              WHERE alert_id = ?1 AND evidence_uri = ?2 LIMIT 1;",
-                    &duplicate_params,
-                )
-                .map_err(ops_error)?;
+                &duplicate_params,
+            )
+            .map_err(ops_error)?;
             if !duplicate_rows.is_empty() {
                 return Err(SearchError::InvalidConfig {
                     field: "evidence_uri".to_owned(),
@@ -1839,22 +1817,22 @@ impl OpsStorage {
 
             let link_id = evidence_link_id(&link.alert_id, &link.evidence_uri);
             let params = [
-                SqliteValue::Text(link_id.into()),
-                SqliteValue::Text(link.project_key.clone().into()),
-                SqliteValue::Text(link.alert_id.clone().into()),
-                SqliteValue::Text(link.evidence_type.clone().into()),
-                SqliteValue::Text(link.evidence_uri.clone().into()),
+                SqliteValue::Text(link_id),
+                SqliteValue::Text(link.project_key.clone()),
+                SqliteValue::Text(link.alert_id.clone()),
+                SqliteValue::Text(link.evidence_type.clone()),
+                SqliteValue::Text(link.evidence_uri.clone()),
                 link.evidence_hash
                     .clone()
-                    .map_or(SqliteValue::Null, |s| SqliteValue::Text(s.into())),
+                    .map_or(SqliteValue::Null, SqliteValue::Text),
                 SqliteValue::Integer(link.created_at_ms),
             ];
-            conn.execute_with_params_sync(
+            conn.execute(
                 "INSERT INTO evidence_links(\
                 link_id, project_key, alert_id, evidence_type, evidence_uri, \
                 evidence_hash, created_at_ms\
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7);",
-                &params,
+                params,
             )
             .map_err(ops_error)?;
             Ok(())
@@ -2033,26 +2011,26 @@ impl OpsStorage {
         ensure_non_empty(scope_key, "scope_key")?;
         let rows = retry_ops_op(
             || {
-                self.connection()
-                    .query_with_params_sync(
-                        "SELECT scope, scope_key, project_key, window, window_start_ms, window_end_ms, \
+                query_values(
+                    &self.connection(),
+                    "SELECT scope, scope_key, project_key, window, window_start_ms, window_end_ms, \
                 total_requests, failed_requests, p95_latency_us, target_p95_latency_us, \
                 error_budget_ratio, error_rate, error_budget_burn, remaining_budget_ratio, \
                 health, reason_code, generated_at_ms \
          FROM slo_rollups \
          WHERE scope = ?1 AND scope_key = ?2 AND window = ?3 \
          ORDER BY window_start_ms DESC LIMIT 1;",
-                        &[
-                            SqliteValue::Text(scope.as_str().to_owned().into()),
-                            SqliteValue::Text(scope_key.to_owned().into()),
-                            SqliteValue::Text(window.as_label().to_owned().into()),
-                        ],
-                    )
-                    .map_err(ops_error)
+                    &[
+                        SqliteValue::Text(scope.as_str().to_owned()),
+                        SqliteValue::Text(scope_key.to_owned()),
+                        SqliteValue::Text(window.as_label().to_owned()),
+                    ],
+                )
+                .map_err(ops_error)
             },
             "slo rollup fetch",
         )?;
-        rows.first().map(row_to_slo_rollup).transpose()
+        rows.first().map(|row| row_to_slo_rollup(row)).transpose()
     }
 
     /// Query latest SLO rollups for one scope/key tuple.
@@ -2070,26 +2048,26 @@ impl OpsStorage {
         let limit_i64 = usize_to_i64(limit, "limit")?;
         let rows = retry_ops_op(
             || {
-                self.connection()
-                    .query_with_params_sync(
-                        "SELECT scope, scope_key, project_key, window, window_start_ms, window_end_ms, \
+                query_values(
+                    &self.connection(),
+                    "SELECT scope, scope_key, project_key, window, window_start_ms, window_end_ms, \
                 total_requests, failed_requests, p95_latency_us, target_p95_latency_us, \
                 error_budget_ratio, error_rate, error_budget_burn, remaining_budget_ratio, \
                 health, reason_code, generated_at_ms \
          FROM slo_rollups \
          WHERE scope = ?1 AND scope_key = ?2 \
          ORDER BY window_start_ms DESC, window ASC LIMIT ?3;",
-                        &[
-                            SqliteValue::Text(scope.as_str().to_owned().into()),
-                            SqliteValue::Text(scope_key.to_owned().into()),
-                            SqliteValue::Integer(limit_i64),
-                        ],
-                    )
-                    .map_err(ops_error)
+                    &[
+                        SqliteValue::Text(scope.as_str().to_owned()),
+                        SqliteValue::Text(scope_key.to_owned()),
+                        SqliteValue::Integer(limit_i64),
+                    ],
+                )
+                .map_err(ops_error)
             },
             "slo rollup list",
         )?;
-        rows.iter().map(row_to_slo_rollup).collect()
+        rows.iter().map(|row| row_to_slo_rollup(row)).collect()
     }
 
     /// Query open anomalies for a specific scope/key pair.
@@ -2107,9 +2085,9 @@ impl OpsStorage {
         let limit_i64 = usize_to_i64(limit, "limit")?;
         let rows = retry_ops_op(
             || {
-                self.connection()
-                    .query_with_params_sync(
-                        "SELECT anomaly_id, scope, scope_key, project_key, window, window_start_ms, \
+                query_values(
+                    &self.connection(),
+                    "SELECT anomaly_id, scope, scope_key, project_key, window, window_start_ms, \
                 metric_name, baseline_value, observed_value, deviation_ratio, severity, \
                 reason_code, correlation_id, state, opened_at_ms, updated_at_ms, \
                 resolved_at_ms \
@@ -2123,17 +2101,17 @@ impl OpsStorage {
                     ELSE 0 \
                   END DESC, \
                   updated_at_ms DESC LIMIT ?3;",
-                        &[
-                            SqliteValue::Text(scope.as_str().to_owned().into()),
-                            SqliteValue::Text(scope_key.to_owned().into()),
-                            SqliteValue::Integer(limit_i64),
-                        ],
-                    )
-                    .map_err(ops_error)
+                    &[
+                        SqliteValue::Text(scope.as_str().to_owned()),
+                        SqliteValue::Text(scope_key.to_owned()),
+                        SqliteValue::Integer(limit_i64),
+                    ],
+                )
+                .map_err(ops_error)
             },
             "open anomaly list",
         )?;
-        rows.iter().map(row_to_anomaly).collect()
+        rows.iter().map(|row| row_to_anomaly(row)).collect()
     }
 
     /// Query anomaly timeline ordered by newest first.
@@ -2151,38 +2129,30 @@ impl OpsStorage {
             || {
                 if let Some(project_key) = project_key {
                     ensure_non_empty(project_key, "project_key")?;
-                    self.connection()
-                        .query_with_params_sync(
-                            "SELECT anomaly_id, scope, scope_key, project_key, window, window_start_ms, \
+                    query_values(&self.connection(), "SELECT anomaly_id, scope, scope_key, project_key, window, window_start_ms, \
                     metric_name, baseline_value, observed_value, deviation_ratio, severity, \
                     reason_code, correlation_id, state, opened_at_ms, updated_at_ms, \
                     resolved_at_ms \
              FROM anomaly_materializations \
              WHERE project_key = ?1 \
-             ORDER BY opened_at_ms DESC LIMIT ?2;",
-                            &[
-                                SqliteValue::Text(project_key.to_owned().into()),
+             ORDER BY opened_at_ms DESC LIMIT ?2;", &[
+                                SqliteValue::Text(project_key.to_owned()),
                                 SqliteValue::Integer(limit_i64),
-                            ],
-                        )
+                            ])
                         .map_err(ops_error)
                 } else {
-                    self.connection()
-                        .query_with_params_sync(
-                            "SELECT anomaly_id, scope, scope_key, project_key, window, window_start_ms, \
+                    query_values(&self.connection(), "SELECT anomaly_id, scope, scope_key, project_key, window, window_start_ms, \
                     metric_name, baseline_value, observed_value, deviation_ratio, severity, \
                     reason_code, correlation_id, state, opened_at_ms, updated_at_ms, \
                     resolved_at_ms \
              FROM anomaly_materializations \
-             ORDER BY opened_at_ms DESC LIMIT ?1;",
-                            &[SqliteValue::Integer(limit_i64)],
-                        )
+             ORDER BY opened_at_ms DESC LIMIT ?1;", &[SqliteValue::Integer(limit_i64)])
                         .map_err(ops_error)
                 }
             },
             "anomaly timeline",
         )?;
-        rows.iter().map(row_to_anomaly).collect()
+        rows.iter().map(|row| row_to_anomaly(row)).collect()
     }
 
     /// Fetch the most recent summary for a `(project, instance, window)` tuple.
@@ -2199,22 +2169,22 @@ impl OpsStorage {
         ensure_non_empty(project_key, "project_key")?;
         ensure_non_empty(instance_id, "instance_id")?;
         let params = [
-            SqliteValue::Text(project_key.to_owned().into()),
-            SqliteValue::Text(instance_id.to_owned().into()),
-            SqliteValue::Text(window.as_label().to_owned().into()),
+            SqliteValue::Text(project_key.to_owned()),
+            SqliteValue::Text(instance_id.to_owned()),
+            SqliteValue::Text(window.as_label().to_owned()),
         ];
         let rows = retry_ops_op(
             || {
-                self.connection()
-                    .query_with_params_sync(
-                        "SELECT window_start_ms, search_count, p50_latency_us, p95_latency_us, \
+                query_values(
+                    &self.connection(),
+                    "SELECT window_start_ms, search_count, p50_latency_us, p95_latency_us, \
                 p99_latency_us, avg_result_count \
          FROM search_summaries \
          WHERE project_key = ?1 AND instance_id = ?2 AND window = ?3 \
          ORDER BY window_start_ms DESC LIMIT 1;",
-                        &params,
-                    )
-                    .map_err(ops_error)
+                    &params,
+                )
+                .map_err(ops_error)
             },
             "search summary fetch",
         )?;
@@ -2242,7 +2212,7 @@ impl OpsStorage {
         let raw_stats = retry_ops_op(
             || {
                 compute_window_event_stats(
-                    self.connection(),
+                    &self.connection(),
                     project_key,
                     instance_id,
                     window_start_ms,
@@ -2282,23 +2252,23 @@ impl OpsStorage {
         ensure_non_empty(instance_id, "instance_id")?;
         let window_start_ms = window.rolling_start_ms(now_ms);
         let params = [
-            SqliteValue::Text(project_key.to_owned().into()),
-            SqliteValue::Text(instance_id.to_owned().into()),
+            SqliteValue::Text(project_key.to_owned()),
+            SqliteValue::Text(instance_id.to_owned()),
             SqliteValue::Integer(window_start_ms),
             SqliteValue::Integer(now_ms),
             SqliteValue::Integer(usize_to_i64(limit, "limit")?),
         ];
         let rows = retry_ops_op(
             || {
-                self.connection()
-                    .query_with_params_sync(
-                        "SELECT ts_ms, cpu_pct, rss_bytes, io_read_bytes, io_write_bytes, queue_depth \
+                query_values(
+                    &self.connection(),
+                    "SELECT ts_ms, cpu_pct, rss_bytes, io_read_bytes, io_write_bytes, queue_depth \
          FROM resource_samples \
          WHERE project_key = ?1 AND instance_id = ?2 AND ts_ms >= ?3 AND ts_ms <= ?4 \
          ORDER BY ts_ms DESC LIMIT ?5;",
-                        &params,
-                    )
-                    .map_err(ops_error)
+                    &params,
+                )
+                .map_err(ops_error)
             },
             "resource trend",
         )?;
@@ -2351,22 +2321,22 @@ impl OpsStorage {
         ensure_non_empty(instance_id, "instance_id")?;
         let window_start_ms = window.rolling_start_ms(now_ms);
         let params = [
-            SqliteValue::Text(project_key.to_owned().into()),
-            SqliteValue::Text(instance_id.to_owned().into()),
+            SqliteValue::Text(project_key.to_owned()),
+            SqliteValue::Text(instance_id.to_owned()),
             SqliteValue::Integer(window_start_ms),
             SqliteValue::Integer(now_ms),
         ];
         let rows = retry_ops_op(
             || {
-                self.connection()
-                    .query_with_params_sync(
-                        "SELECT completed_jobs, failed_jobs, retried_jobs, ts_ms \
+                query_values(
+                    &self.connection(),
+                    "SELECT completed_jobs, failed_jobs, retried_jobs, ts_ms \
          FROM embedding_job_snapshots \
          WHERE project_key = ?1 AND instance_id = ?2 AND ts_ms >= ?3 AND ts_ms <= ?4 \
          ORDER BY ts_ms ASC;",
-                        &params,
-                    )
-                    .map_err(ops_error)
+                    &params,
+                )
+                .map_err(ops_error)
             },
             "embedding throughput",
         )?;
@@ -2465,10 +2435,10 @@ impl OpsStorage {
 
         self.with_transaction(|conn| {
             let downsampled_resource_samples = if downsample_stride > 1 {
-                conn.execute_with_params_sync(
+                conn.execute(
                     "DELETE FROM resource_samples \
              WHERE ts_ms < ?1 AND (sample_id % ?2) != 0;",
-                    &[
+                    [
                         SqliteValue::Integer(downsample_cutoff),
                         SqliteValue::Integer(i64::from(downsample_stride)),
                     ],
@@ -2479,21 +2449,21 @@ impl OpsStorage {
             };
 
             let deleted_search_events = conn
-                .execute_with_params_sync(
+                .execute(
                     "DELETE FROM search_events WHERE ts_ms < ?1;",
-                    &[SqliteValue::Integer(search_cutoff)],
+                    [SqliteValue::Integer(search_cutoff)],
                 )
                 .map_err(ops_error)?;
             let deleted_search_summaries = conn
-                .execute_with_params_sync(
+                .execute(
                     "DELETE FROM search_summaries WHERE window_start_ms < ?1;",
-                    &[SqliteValue::Integer(summary_cutoff)],
+                    [SqliteValue::Integer(summary_cutoff)],
                 )
                 .map_err(ops_error)?;
             let deleted_resource_samples = conn
-                .execute_with_params_sync(
+                .execute(
                     "DELETE FROM resource_samples WHERE ts_ms < ?1;",
-                    &[SqliteValue::Integer(resource_cutoff)],
+                    [SqliteValue::Integer(resource_cutoff)],
                 )
                 .map_err(ops_error)?;
 
@@ -2506,75 +2476,78 @@ impl OpsStorage {
         })
     }
 
-    fn apply_pragmas(&self) -> SearchResult<()> {
-        self.conn
-            .execute_sync("PRAGMA foreign_keys=ON;")
-            .map_err(ops_error)?;
-        if self.config.wal_mode {
-            self.conn
-                .execute_sync("PRAGMA journal_mode=WAL;")
-                .map_err(ops_error)?;
-        } else if let Err(error) = self.conn.execute_sync("PRAGMA journal_mode=DELETE;") {
-            tracing::warn!(
-                target: "frankensearch.ops.storage",
-                ?error,
-                "journal_mode=DELETE was not accepted; falling back to WAL"
-            );
-            self.conn
-                .execute_sync("PRAGMA journal_mode=WAL;")
-                .map_err(ops_error)?;
-        }
+    /// PRAGMAs that must be in place before the bootstrap transaction runs:
+    /// `foreign_keys` so constraint checks apply inside `BEGIN IMMEDIATE`,
+    /// `busy_timeout`/`cache_size` as ordinary connection settings.
+    /// `journal_mode` is deliberately excluded; it is applied by
+    /// `apply_journal_mode` only after `user_version` has been stamped.
+    fn apply_connection_pragmas(&self, conn: &Connection) -> SearchResult<()> {
+        retry_ops_op(
+            || {
+                conn.execute_batch("PRAGMA foreign_keys=ON;")
+                    .map_err(ops_error)?;
+                conn.busy_timeout(Duration::from_millis(self.config.busy_timeout_ms))
+                    .map_err(ops_error)?;
+                conn.execute_batch(&format!(
+                    "PRAGMA cache_size={};",
+                    self.config.cache_size_pages
+                ))
+                .map_err(ops_error)
+            },
+            "ops pragmas",
+        )
+    }
 
-        self.conn
-            .execute_sync(&format!(
-                "PRAGMA busy_timeout={};",
-                self.config.busy_timeout_ms
-            ))
-            .map_err(ops_error)?;
-        self.conn
-            .execute_sync(&format!(
-                "PRAGMA cache_size={};",
-                self.config.cache_size_pages
-            ))
-            .map_err(ops_error)?;
-
-        Ok(())
+    fn apply_journal_mode(&self, conn: &Connection) -> SearchResult<()> {
+        retry_ops_op(
+            || {
+                if self.config.wal_mode {
+                    conn.execute_batch("PRAGMA journal_mode=WAL;")
+                        .map_err(ops_error)?;
+                } else if let Err(error) = conn.execute_batch("PRAGMA journal_mode=DELETE;") {
+                    tracing::warn!(
+                        target: "frankensearch.ops.storage",
+                        ?error,
+                        "journal_mode=DELETE was not accepted; falling back to WAL"
+                    );
+                    conn.execute_batch("PRAGMA journal_mode=WAL;")
+                        .map_err(ops_error)?;
+                }
+                Ok(())
+            },
+            "ops journal mode",
+        )
     }
 
     fn with_transaction<T, F>(&self, mut operation: F) -> SearchResult<T>
     where
-        F: FnMut(&AsyncConnection) -> SearchResult<T>,
+        F: FnMut(&Connection) -> SearchResult<T>,
     {
         retry_ops_transaction(|| self.with_transaction_once(&mut operation))
     }
 
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the mutex guard must outlive the Transaction handle that borrows it"
+    )]
     fn with_transaction_once<T, F>(&self, operation: &mut F) -> SearchResult<T>
     where
-        F: FnMut(&AsyncConnection) -> SearchResult<T>,
+        F: FnMut(&Connection) -> SearchResult<T>,
     {
-        self.connection()
-            .begin_transaction_sync()
+        let mut conn = self.connection();
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(ops_error)?;
-        let result = catch_unwind(AssertUnwindSafe(|| operation(self.connection())));
+        let result = catch_unwind(AssertUnwindSafe(|| operation(&tx)));
         match result {
+            // `Transaction::commit` consumes the handle; a failed commit still
+            // rolls back on drop, so there is no separate rollback path here.
             Ok(Ok(value)) => {
-                if let Err(commit_err) = self.connection().commit_transaction_sync() {
-                    return Err(match self.connection().rollback_transaction_sync() {
-                        Ok(()) => ops_error(commit_err),
-                        Err(rollback_err) => {
-                            tracing::warn!(
-                                target: "frankensearch.ops.storage",
-                                error = %rollback_err,
-                                "rollback failed after operations storage commit error"
-                            );
-                            unretryable_ops_rollback_error(&ops_error(commit_err), &rollback_err)
-                        }
-                    });
-                }
+                tx.commit().map_err(ops_error)?;
                 Ok(value)
             }
             Ok(Err(error)) => {
-                let error = match self.connection().rollback_transaction_sync() {
+                let error = match tx.rollback() {
                     Ok(()) => error,
                     Err(rollback_err) => {
                         tracing::warn!(
@@ -2588,7 +2561,7 @@ impl OpsStorage {
                 Err(error)
             }
             Err(payload) => {
-                if let Err(rollback_err) = self.connection().rollback_transaction_sync() {
+                if let Err(rollback_err) = tx.rollback() {
                     tracing::warn!(
                         target: "frankensearch.ops.storage",
                         error = %rollback_err,
@@ -2622,132 +2595,151 @@ impl OpsIngestBatchResult {
     }
 }
 
-/// Bootstrap ops schema to the latest supported version.
+/// Bootstrap ops schema to the clean v1 baseline.
 ///
 /// # Errors
 ///
-/// Returns an error if migration metadata cannot be read, any migration fails,
-/// checksums do not match, or an unsupported schema version is detected.
-pub fn bootstrap(conn: &AsyncConnection) -> SearchResult<()> {
-    conn.execute_sync(OPS_SCHEMA_MIGRATIONS_TABLE_SQL)
-        .map_err(ops_error)?;
-
-    let mut version = current_version_optional(conn)?.unwrap_or(0);
-    if version > OPS_SCHEMA_VERSION {
-        return Err(SearchError::SubsystemError {
-            subsystem: "ops-storage",
-            source: Box::new(io::Error::other(format!(
-                "ops schema version {version} is newer than supported {OPS_SCHEMA_VERSION}"
-            ))),
-        });
-    }
-
-    for migration in OPS_MIGRATIONS {
-        if migration.version <= version {
-            continue;
+/// Returns an error if the marker table cannot be read, the baseline DDL
+/// fails, a future schema version is detected, or an unrecognized schema
+/// version is found.
+pub fn bootstrap(conn: &mut Connection) -> SearchResult<()> {
+    match schema_version_state(conn)? {
+        SchemaVersionState::Present(version) => {
+            reject_future_version(version)?;
+            if version == OPS_SCHEMA_VERSION {
+                return Ok(());
+            }
         }
-        apply_migration(conn, migration)?;
-        version = migration.version;
+        SchemaVersionState::MissingTable | SchemaVersionState::Empty => {}
     }
+    bootstrap_write_transaction(conn)
+}
 
-    validate_migration_checksums(conn)?;
+/// Marker-table schema state: the table may not exist yet (fresh database),
+/// may exist but hold no row, or may hold a stamped version.
+enum SchemaVersionState {
+    MissingTable,
+    Empty,
+    Present(i64),
+}
+
+fn schema_version_state(conn: &Connection) -> SearchResult<SchemaVersionState> {
+    let table_exists: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM sqlite_master \
+             WHERE type = 'table' AND name = 'ops_schema_version';",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(ops_error)?;
+    if !table_exists {
+        return Ok(SchemaVersionState::MissingTable);
+    }
+    conn.query_row(
+        "SELECT version FROM ops_schema_version LIMIT 1;",
+        [],
+        |row| row.get::<_, i64>(0),
+    )
+    .optional()
+    .map_err(ops_error)?
+    .map_or_else(
+        || Ok(SchemaVersionState::Empty),
+        |version| Ok(SchemaVersionState::Present(version)),
+    )
+}
+
+fn reject_future_version(version: i64) -> SearchResult<()> {
+    if version > OPS_SCHEMA_VERSION {
+        return Err(schema_contract_error(format!(
+            "ops schema version {version} is newer than supported {OPS_SCHEMA_VERSION}"
+        )));
+    }
     Ok(())
 }
 
-/// Read the latest applied schema version.
-///
-/// # Errors
-///
-/// Returns an error if migration metadata cannot be queried or no versions
-/// have been recorded.
-pub fn current_version(conn: &AsyncConnection) -> SearchResult<i64> {
-    current_version_optional(conn)?.ok_or_else(|| SearchError::SubsystemError {
+fn schema_contract_error(message: String) -> SearchError {
+    SearchError::SubsystemError {
         subsystem: "ops-storage",
-        source: Box::new(io::Error::other(
-            "ops_schema_migrations table has no version rows",
-        )),
-    })
+        source: Box::new(io::Error::other(message)),
+    }
 }
 
-fn apply_migration(conn: &AsyncConnection, migration: &OpsMigration) -> SearchResult<()> {
-    tracing::debug!(
-        target: "frankensearch.ops.storage",
-        migration_version = migration.version,
-        migration_name = migration.name,
-        "applying ops storage migration"
-    );
+fn bootstrap_write_transaction(conn: &mut Connection) -> SearchResult<()> {
+    let tx = conn
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(ops_error)?;
+    let result = catch_unwind(AssertUnwindSafe(|| bootstrap_inner(&tx)));
+    match result {
+        Ok(Ok(())) => tx.commit().map_err(ops_error),
+        Ok(Err(error)) => match tx.rollback() {
+            Ok(()) => Err(error),
+            Err(rollback_err) => {
+                tracing::warn!(
+                    target: "frankensearch.ops.storage",
+                    error = %rollback_err,
+                    "rollback failed after ops schema bootstrap error"
+                );
+                Err(unretryable_ops_rollback_error(&error, &rollback_err))
+            }
+        },
+        Err(payload) => {
+            let _ = tx.rollback();
+            resume_unwind(payload);
+        }
+    }
+}
 
-    // Execute DDL statements individually in autocommit mode so that each
-    // CREATE TABLE / CREATE INDEX is committed separately.  This prevents
-    // the sqlite_master btree page from overflowing when the accumulated
-    // DDL text exceeds the 4 KiB page size.
-    for statement in migration.statements {
-        conn.execute_sync(statement).map_err(ops_error)?;
+fn bootstrap_inner(conn: &Connection) -> SearchResult<()> {
+    conn.execute_batch(OPS_SCHEMA_VERSION_TABLE_SQL)
+        .map_err(ops_error)?;
+
+    let version = match schema_version_state(conn)? {
+        SchemaVersionState::Present(version) => version,
+        SchemaVersionState::MissingTable | SchemaVersionState::Empty => 0,
+    };
+    reject_future_version(version)?;
+    if version == OPS_SCHEMA_VERSION {
+        // A concurrent bootstrap committed between the preflight check and
+        // BEGIN IMMEDIATE.
+        return Ok(());
+    }
+    if version != 0 {
+        return Err(schema_contract_error(format!(
+            "no migration path from ops schema version {version} to {OPS_SCHEMA_VERSION}"
+        )));
     }
 
-    // Record the migration metadata.
-    let params = [
-        SqliteValue::Integer(migration.version),
-        SqliteValue::Text(migration.name.to_owned().into()),
-        SqliteValue::Integer(unix_timestamp_ms()?),
-        SqliteValue::Text(migration.checksum.to_owned().into()),
-        SqliteValue::Integer(i64::from(migration.reversible)),
-    ];
-    conn.execute_with_params_sync(
-        "INSERT INTO ops_schema_migrations(version, name, applied_at_ms, checksum, reversible) \
-     VALUES (?1, ?2, ?3, ?4, ?5);",
-        &params,
+    for statement in OPS_SCHEMA_V1_STATEMENTS {
+        conn.execute_batch(statement).map_err(ops_error)?;
+    }
+    conn.execute(
+        "INSERT OR REPLACE INTO ops_schema_version(version) VALUES (?1);",
+        rusqlite::params![OPS_SCHEMA_VERSION],
     )
     .map_err(ops_error)?;
+    conn.execute_batch(&format!("PRAGMA user_version={OPS_SCHEMA_VERSION};"))
+        .map_err(ops_error)?;
     Ok(())
 }
 
-fn validate_migration_checksums(conn: &AsyncConnection) -> SearchResult<()> {
-    let rows = conn
-        .query_sync("SELECT version, checksum FROM ops_schema_migrations ORDER BY version ASC;")
-        .map_err(ops_error)?;
-    for row in &rows {
-        let version = row_i64(row, 0, "ops_schema_migrations.version")?;
-        let checksum = row_text(row, 1, "ops_schema_migrations.checksum")?;
-        let Some(expected) = expected_checksum(version) else {
-            return Err(SearchError::SubsystemError {
-                subsystem: "ops-storage",
-                source: Box::new(io::Error::other(format!(
-                    "unknown ops migration version {version} found in ops_schema_migrations"
-                ))),
-            });
-        };
-        if checksum != expected {
-            return Err(SearchError::SubsystemError {
-                subsystem: "ops-storage",
-                source: Box::new(io::Error::other(format!(
-                    "checksum mismatch for ops migration {version}: expected {expected}, found \
-                     {checksum}"
-                ))),
-            });
-        }
+/// Read the current schema version from the marker table.
+///
+/// # Errors
+///
+/// Returns an error if the marker table is missing or holds no version row.
+pub fn current_version(conn: &Connection) -> SearchResult<i64> {
+    match schema_version_state(conn)? {
+        SchemaVersionState::Present(version) => Ok(version),
+        SchemaVersionState::MissingTable => Err(schema_contract_error(
+            "ops_schema_version table is missing".to_owned(),
+        )),
+        SchemaVersionState::Empty => Err(schema_contract_error(
+            "ops_schema_version table has no version rows".to_owned(),
+        )),
     }
-    Ok(())
 }
 
-fn current_version_optional(conn: &AsyncConnection) -> SearchResult<Option<i64>> {
-    let rows = conn
-        .query_sync("SELECT version FROM ops_schema_migrations ORDER BY version DESC LIMIT 1;")
-        .map_err(ops_error)?;
-    let Some(row) = rows.first() else {
-        return Ok(None);
-    };
-    row_i64(row, 0, "ops_schema_migrations.version").map(Some)
-}
-
-fn expected_checksum(version: i64) -> Option<&'static str> {
-    OPS_MIGRATIONS
-        .iter()
-        .find(|migration| migration.version == version)
-        .map(|migration| migration.checksum)
-}
-
-fn row_i64(row: &Row, index: usize, field: &str) -> SearchResult<i64> {
+fn row_i64(row: &[SqliteValue], index: usize, field: &str) -> SearchResult<i64> {
     match row.get(index) {
         Some(SqliteValue::Integer(value)) => Ok(*value),
         Some(other) => Err(SearchError::SubsystemError {
@@ -2763,7 +2755,7 @@ fn row_i64(row: &Row, index: usize, field: &str) -> SearchResult<i64> {
     }
 }
 
-fn row_text<'a>(row: &'a Row, index: usize, field: &str) -> SearchResult<&'a str> {
+fn row_text<'a>(row: &'a [SqliteValue], index: usize, field: &str) -> SearchResult<&'a str> {
     match row.get(index) {
         Some(SqliteValue::Text(value)) => Ok(&**value),
         Some(other) => Err(SearchError::SubsystemError {
@@ -2779,11 +2771,24 @@ fn row_text<'a>(row: &'a Row, index: usize, field: &str) -> SearchResult<&'a str
     }
 }
 
-fn unix_timestamp_ms() -> SearchResult<i64> {
-    let since_epoch = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
+/// Run `sql` with `params` and return every row as a `Vec<SqliteValue>` so
+/// the existing typed row helpers (`row_i64`, `row_text`, ...) keep working
+/// unchanged on native rusqlite rows.
+pub(crate) fn query_values(
+    conn: &Connection,
+    sql: &str,
+    params: &[SqliteValue],
+) -> SearchResult<Vec<Vec<SqliteValue>>> {
+    let mut statement = conn.prepare(sql).map_err(ops_error)?;
+    let column_count = statement.column_count();
+    let rows = statement
+        .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+            (0..column_count)
+                .map(|index| row.get::<_, SqliteValue>(index))
+                .collect::<Result<Vec<_>, _>>()
+        })
         .map_err(ops_error)?;
-    i64::try_from(since_epoch.as_millis()).map_err(ops_error)
+    rows.collect::<Result<Vec<_>, _>>().map_err(ops_error)
 }
 
 fn evidence_link_id(alert_id: &str, evidence_uri: &str) -> String {
@@ -2808,25 +2813,30 @@ fn evidence_link_id(alert_id: &str, evidence_uri: &str) -> String {
     reason = "the cache must be populated only after its database ensure succeeds"
 )]
 fn insert_search_event_row<'a>(
-    conn: &AsyncConnection,
+    conn: &Connection,
     event: &'a SearchEventRecord,
     ensured_project_keys: &mut BTreeSet<&'a str>,
     ensured_instances: &mut BTreeSet<(&'a str, &'a str)>,
 ) -> SearchResult<usize> {
-    // Manual dedup: FrankenSQLite does not support INSERT OR IGNORE reliably.
-    let existing = conn
-        .query_with_params_sync(
+    // A retried batch must remain a pure no-op: when the event row already
+    // exists, none of the retry payload's side effects (including parent rows
+    // it may name differently) may reach the database. Keep this existence
+    // check before the parent ensures so that ordering holds even though the
+    // INSERT below is already OR IGNORE.
+    let exists = conn
+        .query_row(
             "SELECT 1 FROM search_events WHERE event_id = ?1;",
-            &[SqliteValue::Text(event.event_id.clone().into())],
+            rusqlite::params![event.event_id.as_str()],
+            |_| Ok(()),
         )
-        .map_err(ops_error)?;
-    if !existing.is_empty() {
+        .optional()
+        .map_err(ops_error)?
+        .is_some();
+    if exists {
         return Ok(0);
     }
 
-    // Ensure each referenced parent once per transaction. Keep this after the
-    // event-id lookup so a database retry remains a pure no-op, including when
-    // the retry payload names parents that do not exist.
+    // Ensure each referenced parent once per transaction.
     if !ensured_project_keys.contains(event.project_key.as_str()) {
         ensure_project_exists(conn, &event.project_key, event.ts_ms)?;
         ensured_project_keys.insert(event.project_key.as_str());
@@ -2841,79 +2851,69 @@ fn insert_search_event_row<'a>(
     }
 
     let params = [
-        SqliteValue::Text(event.event_id.clone().into()),
-        SqliteValue::Text(event.project_key.clone().into()),
-        SqliteValue::Text(event.instance_id.clone().into()),
-        SqliteValue::Text(event.correlation_id.clone().into()),
+        SqliteValue::Text(event.event_id.clone()),
+        SqliteValue::Text(event.project_key.clone()),
+        SqliteValue::Text(event.instance_id.clone()),
+        SqliteValue::Text(event.correlation_id.clone()),
         optional_text(event.query_hash.as_deref()),
         optional_text(event.query_class.as_deref()),
-        SqliteValue::Text(event.phase.as_str().to_owned().into()),
+        SqliteValue::Text(event.phase.as_str().to_owned()),
         SqliteValue::Integer(u64_to_i64(event.latency_us, "latency_us")?),
         optional_u64(event.result_count, "result_count")?,
         optional_u64(event.memory_bytes, "memory_bytes")?,
         SqliteValue::Integer(event.ts_ms),
     ];
 
-    conn.execute_with_params_sync(
-        "INSERT INTO search_events(\
+    conn.execute(
+        "INSERT OR IGNORE INTO search_events(\
         event_id, project_key, instance_id, correlation_id, query_hash, query_class, \
         phase, latency_us, result_count, memory_bytes, ts_ms\
      ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11);",
-        &params,
+        params,
     )
     .map_err(ops_error)
 }
 
 /// Ensure the `projects` table has a row for `project_key`.
-fn ensure_project_exists(
-    conn: &AsyncConnection,
-    project_key: &str,
-    ts_ms: i64,
-) -> SearchResult<()> {
-    let existing = conn
-        .query_with_params_sync(
-            "SELECT 1 FROM projects WHERE project_key = ?1;",
-            &[SqliteValue::Text(project_key.to_owned().into())],
-        )
-        .map_err(ops_error)?;
-    if existing.is_empty() {
-        conn.execute_with_params_sync(
-            "INSERT INTO projects(project_key, display_name, created_at_ms, updated_at_ms) \
+fn ensure_project_exists(conn: &Connection, project_key: &str, ts_ms: i64) -> SearchResult<()> {
+    // `INSERT OR IGNORE` is a no-op when the project already exists, matching
+    // the former probe-then-insert behavior exactly.
+    conn.execute(
+        "INSERT OR IGNORE INTO projects(project_key, display_name, created_at_ms, updated_at_ms) \
          VALUES (?1, ?2, ?3, ?4);",
-            &[
-                SqliteValue::Text(project_key.to_owned().into()),
-                SqliteValue::Text(project_key.to_owned().into()),
-                SqliteValue::Integer(ts_ms),
-                SqliteValue::Integer(ts_ms),
-            ],
-        )
-        .map_err(ops_error)?;
-    }
+        [
+            SqliteValue::Text(project_key.to_owned()),
+            SqliteValue::Text(project_key.to_owned()),
+            SqliteValue::Integer(ts_ms),
+            SqliteValue::Integer(ts_ms),
+        ],
+    )
+    .map_err(ops_error)?;
     Ok(())
 }
 
 /// Ensure the `instances` table has a row for `instance_id` under `project_key`.
 fn ensure_instance_exists(
-    conn: &AsyncConnection,
+    conn: &Connection,
     instance_id: &str,
     project_key: &str,
     ts_ms: i64,
 ) -> SearchResult<()> {
-    let existing = conn
-        .query_with_params_sync(
-            "SELECT project_key FROM instances WHERE instance_id = ?1;",
-            &[SqliteValue::Text(instance_id.to_owned().into())],
-        )
-        .map_err(ops_error)?;
+    let existing = query_values(
+        conn,
+        "SELECT project_key FROM instances WHERE instance_id = ?1;",
+        &[SqliteValue::Text(instance_id.to_owned())],
+    )
+    .map_err(ops_error)?;
     if let Some(row) = existing.first() {
         // `instances.instance_id` is the primary key, so an existing row
         // already binds this instance to one project. Silently accepting a
         // different project here would attach the caller's rows to a parent
         // it never named; reject instead of adopting either side.
         let owner = row
-            .get(0)
+            .first()
             .and_then(|value| match value {
-                SqliteValue::Text(text) => Some(text.as_ref()),
+                SqliteValue::Text(text) => Some(text.as_str()),
                 _ => None,
             })
             .unwrap_or_default();
@@ -2928,20 +2928,20 @@ fn ensure_instance_exists(
             });
         }
     } else {
-        conn.execute_with_params_sync(
+        conn.execute(
             "INSERT INTO instances(\
              instance_id, project_key, host_name, pid, version, \
              first_seen_ms, last_heartbeat_ms, state\
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8);",
-            &[
-                SqliteValue::Text(instance_id.to_owned().into()),
-                SqliteValue::Text(project_key.to_owned().into()),
-                SqliteValue::Text("auto".to_owned().into()),
+            [
+                SqliteValue::Text(instance_id.to_owned()),
+                SqliteValue::Text(project_key.to_owned()),
+                SqliteValue::Text("auto".to_owned()),
                 SqliteValue::Integer(0),
-                SqliteValue::Text("unknown".to_owned().into()),
+                SqliteValue::Text("unknown".to_owned()),
                 SqliteValue::Integer(ts_ms),
                 SqliteValue::Integer(ts_ms),
-                SqliteValue::Text("started".to_owned().into()),
+                SqliteValue::Text("started".to_owned()),
             ],
         )
         .map_err(ops_error)?;
@@ -2950,7 +2950,7 @@ fn ensure_instance_exists(
 }
 
 fn upsert_search_summary_row(
-    conn: &AsyncConnection,
+    conn: &Connection,
     project_key: &str,
     instance_id: &str,
     window: SummaryWindow,
@@ -2958,29 +2958,29 @@ fn upsert_search_summary_row(
     stats: &WindowEventStats,
 ) -> SearchResult<()> {
     let key_params = [
-        SqliteValue::Text(project_key.to_owned().into()),
-        SqliteValue::Text(instance_id.to_owned().into()),
-        SqliteValue::Text(window.as_label().to_owned().into()),
+        SqliteValue::Text(project_key.to_owned()),
+        SqliteValue::Text(instance_id.to_owned()),
+        SqliteValue::Text(window.as_label().to_owned()),
         SqliteValue::Integer(window_start_ms),
     ];
-    let existing = conn
-        .query_with_params_sync(
-            "SELECT 1 FROM search_summaries \
+    let existing = query_values(
+        conn,
+        "SELECT 1 FROM search_summaries \
      WHERE project_key = ?1 AND instance_id = ?2 AND window = ?3 AND window_start_ms = ?4;",
-            &key_params,
-        )
-        .map_err(ops_error)?;
+        &key_params,
+    )
+    .map_err(ops_error)?;
 
     if existing.is_empty() {
-        conn.execute_with_params_sync(
+        conn.execute(
             "INSERT INTO search_summaries(\
             project_key, instance_id, window, window_start_ms, search_count, \
             p50_latency_us, p95_latency_us, p99_latency_us, avg_result_count\
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9);",
-            &[
-                SqliteValue::Text(project_key.to_owned().into()),
-                SqliteValue::Text(instance_id.to_owned().into()),
-                SqliteValue::Text(window.as_label().to_owned().into()),
+            [
+                SqliteValue::Text(project_key.to_owned()),
+                SqliteValue::Text(instance_id.to_owned()),
+                SqliteValue::Text(window.as_label().to_owned()),
                 SqliteValue::Integer(window_start_ms),
                 SqliteValue::Integer(u64_to_i64(stats.search_count, "search_count")?),
                 optional_u64(stats.p50_latency_us, "p50_latency_us")?,
@@ -2991,20 +2991,20 @@ fn upsert_search_summary_row(
         )
         .map_err(ops_error)?;
     } else {
-        conn.execute_with_params_sync(
+        conn.execute(
             "UPDATE search_summaries SET \
             search_count = ?1, p50_latency_us = ?2, p95_latency_us = ?3, \
             p99_latency_us = ?4, avg_result_count = ?5 \
          WHERE project_key = ?6 AND instance_id = ?7 AND window = ?8 AND window_start_ms = ?9;",
-            &[
+            [
                 SqliteValue::Integer(u64_to_i64(stats.search_count, "search_count")?),
                 optional_u64(stats.p50_latency_us, "p50_latency_us")?,
                 optional_u64(stats.p95_latency_us, "p95_latency_us")?,
                 optional_u64(stats.p99_latency_us, "p99_latency_us")?,
                 optional_f64(stats.avg_result_count),
-                SqliteValue::Text(project_key.to_owned().into()),
-                SqliteValue::Text(instance_id.to_owned().into()),
-                SqliteValue::Text(window.as_label().to_owned().into()),
+                SqliteValue::Text(project_key.to_owned()),
+                SqliteValue::Text(instance_id.to_owned()),
+                SqliteValue::Text(window.as_label().to_owned()),
                 SqliteValue::Integer(window_start_ms),
             ],
         )
@@ -3015,26 +3015,26 @@ fn upsert_search_summary_row(
 
 #[allow(clippy::cast_precision_loss)]
 fn compute_window_event_stats(
-    conn: &AsyncConnection,
+    conn: &Connection,
     project_key: &str,
     instance_id: &str,
     window_start_ms: i64,
     window_end_ms: i64,
 ) -> SearchResult<WindowEventStats> {
-    let rows = conn
-        .query_with_params_sync(
-            "SELECT latency_us, result_count, memory_bytes \
+    let rows = query_values(
+        conn,
+        "SELECT latency_us, result_count, memory_bytes \
      FROM search_events \
      WHERE project_key = ?1 AND instance_id = ?2 AND ts_ms >= ?3 AND ts_ms <= ?4 \
      ORDER BY latency_us ASC;",
-            &[
-                SqliteValue::Text(project_key.to_owned().into()),
-                SqliteValue::Text(instance_id.to_owned().into()),
-                SqliteValue::Integer(window_start_ms),
-                SqliteValue::Integer(window_end_ms),
-            ],
-        )
-        .map_err(ops_error)?;
+        &[
+            SqliteValue::Text(project_key.to_owned()),
+            SqliteValue::Text(instance_id.to_owned()),
+            SqliteValue::Integer(window_start_ms),
+            SqliteValue::Integer(window_end_ms),
+        ],
+    )
+    .map_err(ops_error)?;
 
     if rows.is_empty() {
         return Ok(WindowEventStats::default());
@@ -3086,36 +3086,41 @@ fn compute_window_event_stats(
     })
 }
 
-fn list_distinct_project_keys(conn: &AsyncConnection) -> SearchResult<Vec<String>> {
-    let rows = conn
-        .query_sync("SELECT DISTINCT project_key FROM search_events ORDER BY project_key ASC;")
-        .map_err(ops_error)?;
+fn list_distinct_project_keys(conn: &Connection) -> SearchResult<Vec<String>> {
+    let rows = query_values(
+        conn,
+        "SELECT DISTINCT project_key FROM search_events ORDER BY project_key ASC;",
+        &[],
+    )
+    .map_err(ops_error)?;
     rows.iter()
         .map(|row| row_text(row, 0, "search_events.project_key").map(ToOwned::to_owned))
         .collect()
 }
 
 fn compute_slo_window_stats(
-    conn: &AsyncConnection,
+    conn: &Connection,
     project_key: Option<&str>,
     window_start_ms: i64,
     window_end_ms: i64,
 ) -> SearchResult<SloWindowStats> {
     let rows = if let Some(project_key) = project_key {
-        conn.query_with_params_sync(
+        query_values(
+            conn,
             "SELECT phase, latency_us \
          FROM search_events \
          WHERE project_key = ?1 AND ts_ms >= ?2 AND ts_ms <= ?3 \
          ORDER BY latency_us ASC;",
             &[
-                SqliteValue::Text(project_key.to_owned().into()),
+                SqliteValue::Text(project_key.to_owned()),
                 SqliteValue::Integer(window_start_ms),
                 SqliteValue::Integer(window_end_ms),
             ],
         )
         .map_err(ops_error)?
     } else {
-        conn.query_with_params_sync(
+        query_values(
+            conn,
             "SELECT phase, latency_us \
          FROM search_events \
          WHERE ts_ms >= ?1 AND ts_ms <= ?2 \
@@ -3326,7 +3331,7 @@ const fn budget_fraction_for_window(window: SummaryWindow) -> f64 {
     }
 }
 
-fn upsert_slo_rollup_row(conn: &AsyncConnection, evaluation: &SloEvaluation) -> SearchResult<()> {
+fn upsert_slo_rollup_row(conn: &Connection, evaluation: &SloEvaluation) -> SearchResult<()> {
     let rollup_id = format!(
         "slo:{}:{}:{}:{}",
         evaluation.scope.as_str(),
@@ -3335,32 +3340,31 @@ fn upsert_slo_rollup_row(conn: &AsyncConnection, evaluation: &SloEvaluation) -> 
         evaluation.window_start_ms
     );
     let key_params = [
-        SqliteValue::Text(evaluation.scope.as_str().to_owned().into()),
-        SqliteValue::Text(evaluation.scope_key.clone().into()),
-        SqliteValue::Text(evaluation.window.as_label().to_owned().into()),
+        SqliteValue::Text(evaluation.scope.as_str().to_owned()),
+        SqliteValue::Text(evaluation.scope_key.clone()),
+        SqliteValue::Text(evaluation.window.as_label().to_owned()),
         SqliteValue::Integer(evaluation.window_start_ms),
     ];
-    let existing = conn
-        .query_with_params_sync(
-            "SELECT 1 FROM slo_rollups \
+    let existing = query_values(
+        conn,
+        "SELECT 1 FROM slo_rollups \
      WHERE scope = ?1 AND scope_key = ?2 AND window = ?3 AND window_start_ms = ?4;",
-            &key_params,
-        )
-        .map_err(ops_error)?;
+        &key_params,
+    )
+    .map_err(ops_error)?;
 
     if existing.is_empty() {
-        conn.execute_with_params_sync("INSERT INTO slo_rollups(\
+        conn.execute("INSERT INTO slo_rollups(\
             rollup_id, scope, scope_key, project_key, window, window_start_ms, window_end_ms, \
             total_requests, failed_requests, p95_latency_us, target_p95_latency_us, \
             error_budget_ratio, error_rate, error_budget_burn, remaining_budget_ratio, \
             health, reason_code, generated_at_ms\
-         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18);",
-        &[
-            SqliteValue::Text(rollup_id.into()),
-            SqliteValue::Text(evaluation.scope.as_str().to_owned().into()),
-            SqliteValue::Text(evaluation.scope_key.clone().into()),
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18);", [
+            SqliteValue::Text(rollup_id),
+            SqliteValue::Text(evaluation.scope.as_str().to_owned()),
+            SqliteValue::Text(evaluation.scope_key.clone()),
             optional_text(evaluation.project_key.as_deref()),
-            SqliteValue::Text(evaluation.window.as_label().to_owned().into()),
+            SqliteValue::Text(evaluation.window.as_label().to_owned()),
             SqliteValue::Integer(evaluation.window_start_ms),
             SqliteValue::Integer(evaluation.window_end_ms),
             SqliteValue::Integer(u64_to_i64(
@@ -3376,24 +3380,24 @@ fn upsert_slo_rollup_row(conn: &AsyncConnection, evaluation: &SloEvaluation) -> 
                 evaluation.target_p95_latency_us,
                 "slo_rollups.target_p95_latency_us",
             )?),
-            SqliteValue::Float(evaluation.error_budget_ratio),
+            SqliteValue::Real(evaluation.error_budget_ratio),
             optional_f64(evaluation.error_rate),
             optional_f64(evaluation.error_budget_burn),
             optional_f64(evaluation.remaining_budget_ratio),
-            SqliteValue::Text(evaluation.health.as_str().to_owned().into()),
-            SqliteValue::Text(evaluation.reason_code.clone().into()),
+            SqliteValue::Text(evaluation.health.as_str().to_owned()),
+            SqliteValue::Text(evaluation.reason_code.clone()),
             SqliteValue::Integer(evaluation.generated_at_ms),
-        ],)
+        ])
         .map_err(ops_error)?;
     } else {
-        conn.execute_with_params_sync(
+        conn.execute(
             "UPDATE slo_rollups SET \
             project_key = ?1, window_end_ms = ?2, total_requests = ?3, failed_requests = ?4, \
             p95_latency_us = ?5, target_p95_latency_us = ?6, error_budget_ratio = ?7, \
             error_rate = ?8, error_budget_burn = ?9, remaining_budget_ratio = ?10, \
             health = ?11, reason_code = ?12, generated_at_ms = ?13 \
          WHERE scope = ?14 AND scope_key = ?15 AND window = ?16 AND window_start_ms = ?17;",
-            &[
+            [
                 optional_text(evaluation.project_key.as_deref()),
                 SqliteValue::Integer(evaluation.window_end_ms),
                 SqliteValue::Integer(u64_to_i64(
@@ -3409,16 +3413,16 @@ fn upsert_slo_rollup_row(conn: &AsyncConnection, evaluation: &SloEvaluation) -> 
                     evaluation.target_p95_latency_us,
                     "slo_rollups.target_p95_latency_us",
                 )?),
-                SqliteValue::Float(evaluation.error_budget_ratio),
+                SqliteValue::Real(evaluation.error_budget_ratio),
                 optional_f64(evaluation.error_rate),
                 optional_f64(evaluation.error_budget_burn),
                 optional_f64(evaluation.remaining_budget_ratio),
-                SqliteValue::Text(evaluation.health.as_str().to_owned().into()),
-                SqliteValue::Text(evaluation.reason_code.clone().into()),
+                SqliteValue::Text(evaluation.health.as_str().to_owned()),
+                SqliteValue::Text(evaluation.reason_code.clone()),
                 SqliteValue::Integer(evaluation.generated_at_ms),
-                SqliteValue::Text(evaluation.scope.as_str().to_owned().into()),
-                SqliteValue::Text(evaluation.scope_key.clone().into()),
-                SqliteValue::Text(evaluation.window.as_label().to_owned().into()),
+                SqliteValue::Text(evaluation.scope.as_str().to_owned()),
+                SqliteValue::Text(evaluation.scope_key.clone()),
+                SqliteValue::Text(evaluation.window.as_label().to_owned()),
                 SqliteValue::Integer(evaluation.window_start_ms),
             ],
         )
@@ -3428,23 +3432,23 @@ fn upsert_slo_rollup_row(conn: &AsyncConnection, evaluation: &SloEvaluation) -> 
 }
 
 fn resolve_stale_anomaly_rows(
-    conn: &AsyncConnection,
+    conn: &Connection,
     scope: SloScope,
     scope_key: &str,
     window: SummaryWindow,
     active_window_start_ms: i64,
     now_ms: i64,
 ) -> SearchResult<usize> {
-    conn.execute_with_params_sync(
+    conn.execute(
         "UPDATE anomaly_materializations \
      SET state = 'resolved', resolved_at_ms = COALESCE(resolved_at_ms, ?1), updated_at_ms = ?1 \
      WHERE scope = ?2 AND scope_key = ?3 AND window = ?4 AND state = 'open' \
        AND window_start_ms < ?5;",
-        &[
+        [
             SqliteValue::Integer(now_ms),
-            SqliteValue::Text(scope.as_str().to_owned().into()),
-            SqliteValue::Text(scope_key.to_owned().into()),
-            SqliteValue::Text(window.as_label().to_owned().into()),
+            SqliteValue::Text(scope.as_str().to_owned()),
+            SqliteValue::Text(scope_key.to_owned()),
+            SqliteValue::Text(window.as_label().to_owned()),
             SqliteValue::Integer(active_window_start_ms),
         ],
     )
@@ -3453,7 +3457,7 @@ fn resolve_stale_anomaly_rows(
 
 #[allow(clippy::too_many_lines)]
 fn sync_rollup_anomaly(
-    conn: &AsyncConnection,
+    conn: &Connection,
     evaluation: &SloEvaluation,
     now_ms: i64,
 ) -> SearchResult<(usize, usize)> {
@@ -3466,26 +3470,26 @@ fn sync_rollup_anomaly(
     );
     let Some(candidate) = &evaluation.anomaly else {
         let resolved = conn
-            .execute_with_params_sync(
+            .execute(
                 "UPDATE anomaly_materializations \
          SET state = 'resolved', resolved_at_ms = COALESCE(resolved_at_ms, ?1), \
              updated_at_ms = ?1 \
          WHERE anomaly_id = ?2 AND state = 'open';",
-                &[
+                [
                     SqliteValue::Integer(now_ms),
-                    SqliteValue::Text(anomaly_id.clone().into()),
+                    SqliteValue::Text(anomaly_id.clone()),
                 ],
             )
             .map_err(ops_error)?;
         return Ok((0, resolved));
     };
 
-    let rows = conn
-        .query_with_params_sync(
-            "SELECT state FROM anomaly_materializations WHERE anomaly_id = ?1;",
-            &[SqliteValue::Text(anomaly_id.clone().into())],
-        )
-        .map_err(ops_error)?;
+    let rows = query_values(
+        conn,
+        "SELECT state FROM anomaly_materializations WHERE anomaly_id = ?1;",
+        &[SqliteValue::Text(anomaly_id.clone())],
+    )
+    .map_err(ops_error)?;
     let existing_state = rows
         .first()
         .map(|row| row_text(row, 0, "anomaly_materializations.state"))
@@ -3493,71 +3497,70 @@ fn sync_rollup_anomaly(
 
     match existing_state {
         None => {
-            conn.execute_with_params_sync("INSERT INTO anomaly_materializations(\
+            conn.execute("INSERT INTO anomaly_materializations(\
                 anomaly_id, scope, scope_key, project_key, window, window_start_ms, \
                 metric_name, baseline_value, observed_value, deviation_ratio, severity, \
                 reason_code, correlation_id, state, opened_at_ms, updated_at_ms, resolved_at_ms\
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'open', ?14, ?14, NULL);",
-            &[
-                SqliteValue::Text(anomaly_id.into()),
-                SqliteValue::Text(evaluation.scope.as_str().to_owned().into()),
-                SqliteValue::Text(evaluation.scope_key.clone().into()),
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'open', ?14, ?14, NULL);", [
+                SqliteValue::Text(anomaly_id),
+                SqliteValue::Text(evaluation.scope.as_str().to_owned()),
+                SqliteValue::Text(evaluation.scope_key.clone()),
                 optional_text(evaluation.project_key.as_deref()),
-                SqliteValue::Text(evaluation.window.as_label().to_owned().into()),
+                SqliteValue::Text(evaluation.window.as_label().to_owned()),
                 SqliteValue::Integer(evaluation.window_start_ms),
-                SqliteValue::Text(candidate.metric_name.clone().into()),
-                SqliteValue::Float(candidate.baseline_value),
-                SqliteValue::Float(candidate.observed_value),
-                SqliteValue::Float(candidate.deviation_ratio),
-                SqliteValue::Text(candidate.severity.as_str().to_owned().into()),
-                SqliteValue::Text(candidate.reason_code.clone().into()),
+                SqliteValue::Text(candidate.metric_name.clone()),
+                SqliteValue::Real(candidate.baseline_value),
+                SqliteValue::Real(candidate.observed_value),
+                SqliteValue::Real(candidate.deviation_ratio),
+                SqliteValue::Text(candidate.severity.as_str().to_owned()),
+                SqliteValue::Text(candidate.reason_code.clone()),
                 SqliteValue::Null,
                 SqliteValue::Integer(now_ms),
-            ],)
+            ])
             .map_err(ops_error)?;
             Ok((1, 0))
         }
         Some("resolved") => {
-            conn.execute_with_params_sync(
+            conn.execute(
                 "UPDATE anomaly_materializations SET \
                 project_key = ?1, metric_name = ?2, baseline_value = ?3, observed_value = ?4, \
                 deviation_ratio = ?5, severity = ?6, reason_code = ?7, correlation_id = ?8, \
                 state = 'open', opened_at_ms = ?9, updated_at_ms = ?9, resolved_at_ms = NULL \
              WHERE anomaly_id = ?10;",
-                &[
+                [
                     optional_text(evaluation.project_key.as_deref()),
-                    SqliteValue::Text(candidate.metric_name.clone().into()),
-                    SqliteValue::Float(candidate.baseline_value),
-                    SqliteValue::Float(candidate.observed_value),
-                    SqliteValue::Float(candidate.deviation_ratio),
-                    SqliteValue::Text(candidate.severity.as_str().to_owned().into()),
-                    SqliteValue::Text(candidate.reason_code.clone().into()),
+                    SqliteValue::Text(candidate.metric_name.clone()),
+                    SqliteValue::Real(candidate.baseline_value),
+                    SqliteValue::Real(candidate.observed_value),
+                    SqliteValue::Real(candidate.deviation_ratio),
+                    SqliteValue::Text(candidate.severity.as_str().to_owned()),
+                    SqliteValue::Text(candidate.reason_code.clone()),
                     SqliteValue::Null,
                     SqliteValue::Integer(now_ms),
-                    SqliteValue::Text(anomaly_id.into()),
+                    SqliteValue::Text(anomaly_id),
                 ],
             )
             .map_err(ops_error)?;
             Ok((1, 0))
         }
         Some("open") => {
-            conn.execute_with_params_sync(
+            conn.execute(
                 "UPDATE anomaly_materializations SET \
                 project_key = ?1, metric_name = ?2, baseline_value = ?3, observed_value = ?4, \
                 deviation_ratio = ?5, severity = ?6, reason_code = ?7, correlation_id = ?8, \
                 updated_at_ms = ?9 \
              WHERE anomaly_id = ?10;",
-                &[
+                [
                     optional_text(evaluation.project_key.as_deref()),
-                    SqliteValue::Text(candidate.metric_name.clone().into()),
-                    SqliteValue::Float(candidate.baseline_value),
-                    SqliteValue::Float(candidate.observed_value),
-                    SqliteValue::Float(candidate.deviation_ratio),
-                    SqliteValue::Text(candidate.severity.as_str().to_owned().into()),
-                    SqliteValue::Text(candidate.reason_code.clone().into()),
+                    SqliteValue::Text(candidate.metric_name.clone()),
+                    SqliteValue::Real(candidate.baseline_value),
+                    SqliteValue::Real(candidate.observed_value),
+                    SqliteValue::Real(candidate.deviation_ratio),
+                    SqliteValue::Text(candidate.severity.as_str().to_owned()),
+                    SqliteValue::Text(candidate.reason_code.clone()),
                     SqliteValue::Null,
                     SqliteValue::Integer(now_ms),
-                    SqliteValue::Text(anomaly_id.into()),
+                    SqliteValue::Text(anomaly_id),
                 ],
             )
             .map_err(ops_error)?;
@@ -3572,7 +3575,7 @@ fn sync_rollup_anomaly(
     }
 }
 
-fn row_to_slo_rollup(row: &Row) -> SearchResult<SloRollupSnapshot> {
+fn row_to_slo_rollup(row: &[SqliteValue]) -> SearchResult<SloRollupSnapshot> {
     let scope = SloScope::from_db(row_text(row, 0, "slo_rollups.scope")?).ok_or_else(|| {
         SearchError::SubsystemError {
             subsystem: "ops-storage",
@@ -3647,7 +3650,7 @@ fn row_to_slo_rollup(row: &Row) -> SearchResult<SloRollupSnapshot> {
     })
 }
 
-fn row_to_anomaly(row: &Row) -> SearchResult<AnomalyMaterializationSnapshot> {
+fn row_to_anomaly(row: &[SqliteValue]) -> SearchResult<AnomalyMaterializationSnapshot> {
     let anomaly_id = row_text(row, 0, "anomaly_materializations.anomaly_id")?.to_owned();
     let scope = SloScope::from_db(row_text(row, 1, "anomaly_materializations.scope")?).ok_or_else(
         || SearchError::SubsystemError {
@@ -3731,9 +3734,7 @@ fn ensure_non_empty(value: &str, field: &str) -> SearchResult<()> {
 }
 
 fn optional_text(value: Option<&str>) -> SqliteValue {
-    value.map_or(SqliteValue::Null, |text| {
-        SqliteValue::Text(text.to_owned().into())
-    })
+    value.map_or(SqliteValue::Null, |text| SqliteValue::Text(text.to_owned()))
 }
 
 fn optional_u64(value: Option<u64>, field: &str) -> SearchResult<SqliteValue> {
@@ -3743,10 +3744,10 @@ fn optional_u64(value: Option<u64>, field: &str) -> SearchResult<SqliteValue> {
 }
 
 fn optional_f64(value: Option<f64>) -> SqliteValue {
-    value.map_or(SqliteValue::Null, SqliteValue::Float)
+    value.map_or(SqliteValue::Null, SqliteValue::Real)
 }
 
-fn row_opt_i64(row: &Row, index: usize, field: &str) -> SearchResult<Option<i64>> {
+fn row_opt_i64(row: &[SqliteValue], index: usize, field: &str) -> SearchResult<Option<i64>> {
     match row.get(index) {
         Some(SqliteValue::Integer(value)) => Ok(Some(*value)),
         Some(SqliteValue::Null) | None => Ok(None),
@@ -3759,7 +3760,11 @@ fn row_opt_i64(row: &Row, index: usize, field: &str) -> SearchResult<Option<i64>
     }
 }
 
-fn row_opt_text<'a>(row: &'a Row, index: usize, field: &str) -> SearchResult<Option<&'a str>> {
+fn row_opt_text<'a>(
+    row: &'a [SqliteValue],
+    index: usize,
+    field: &str,
+) -> SearchResult<Option<&'a str>> {
     match row.get(index) {
         Some(SqliteValue::Text(value)) => Ok(Some(&**value)),
         Some(SqliteValue::Null) | None => Ok(None),
@@ -3773,9 +3778,9 @@ fn row_opt_text<'a>(row: &'a Row, index: usize, field: &str) -> SearchResult<Opt
 }
 
 #[allow(clippy::cast_precision_loss)]
-fn row_opt_f64(row: &Row, index: usize, field: &str) -> SearchResult<Option<f64>> {
+fn row_opt_f64(row: &[SqliteValue], index: usize, field: &str) -> SearchResult<Option<f64>> {
     match row.get(index) {
-        Some(SqliteValue::Float(value)) => Ok(Some(*value)),
+        Some(SqliteValue::Real(value)) => Ok(Some(*value)),
         Some(SqliteValue::Integer(value)) => Ok(Some(*value as f64)),
         Some(SqliteValue::Null) | None => Ok(None),
         Some(other) => Err(SearchError::SubsystemError {
@@ -3829,19 +3834,24 @@ where
     }
 }
 
-fn is_retryable_franken_error(error: &fsqlite::FrankenError) -> bool {
-    error.is_transient()
-        || matches!(
-            error,
-            fsqlite::FrankenError::SnapshotTooOld { .. } | fsqlite::FrankenError::SchemaChanged
-        )
+fn is_retryable_sqlite_error(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(inner, _)
+            if matches!(
+                inner.code,
+                rusqlite::ffi::ErrorCode::DatabaseBusy
+                    | rusqlite::ffi::ErrorCode::DatabaseLocked
+                    | rusqlite::ffi::ErrorCode::SchemaChanged
+            )
+    )
 }
 
 fn is_retryable_storage_contention(error: &SearchError) -> bool {
     let mut current: Option<&(dyn std::error::Error + 'static)> = Some(error);
     while let Some(err) = current {
-        if let Some(franken) = err.downcast_ref::<fsqlite::FrankenError>() {
-            return is_retryable_franken_error(franken);
+        if let Some(sqlite) = err.downcast_ref::<rusqlite::Error>() {
+            return is_retryable_sqlite_error(sqlite);
         }
         current = err.source();
     }
@@ -3850,7 +3860,7 @@ fn is_retryable_storage_contention(error: &SearchError) -> bool {
 
 fn unretryable_ops_rollback_error(
     original: &SearchError,
-    rollback_err: &fsqlite::FrankenError,
+    rollback_err: &rusqlite::Error,
 ) -> SearchError {
     SearchError::SubsystemError {
         subsystem: "ops-storage",
@@ -3901,12 +3911,12 @@ mod tests {
     use std::sync::{Arc, LazyLock, Mutex};
 
     use super::{
-        EvidenceLinkRecord, OPS_SCHEMA_MIGRATIONS_TABLE_SQL, OPS_SCHEMA_VERSION,
-        OpsIngestionMetrics, OpsRetentionPolicy, OpsStorage, PendingEventsReservation,
+        EvidenceLinkRecord, OPS_SCHEMA_VERSION, OPS_SCHEMA_VERSION_TABLE_SQL, OpsIngestionMetrics,
+        OpsRetentionPolicy, OpsStorage, OpsStorageConfig, PendingEventsReservation,
         ResourceSampleRecord, SearchEventPhase, SearchEventRecord, SloHealth,
         SloMaterializationConfig, SloScope, SummaryWindow, bootstrap, current_version,
         evidence_link_id, is_retryable_storage_contention, ops_error,
-        parse_slo_search_p99_ms_override,
+        parse_slo_search_p99_ms_override, query_values,
     };
     use frankensearch_core::{
         LifecycleSeverity, LifecycleState, SearchError,
@@ -3915,8 +3925,12 @@ mod tests {
         TelemetryQueryClass, TelemetryResourceSample, TelemetrySearchMetrics, TelemetrySearchQuery,
         TelemetrySearchResults,
     };
-    use fsqlite::{AsyncConnection, FrankenError};
-    use fsqlite_types::value::SqliteValue;
+    use rusqlite::types::Value as SqliteValue;
+    use rusqlite::{Connection, ffi};
+
+    fn sqlite_failure(code: std::ffi::c_int) -> rusqlite::Error {
+        rusqlite::Error::SqliteFailure(ffi::Error::new(code), None)
+    }
 
     // ----------------------------------------------------------------------
     // pending_events reservation: every exit must decrement exactly once.
@@ -3934,15 +3948,19 @@ mod tests {
     }
 
     #[test]
-    fn open_retry_accepts_typed_busy_snapshot() {
-        let error = ops_error(FrankenError::BusySnapshot {
-            conflicting_pages: "1,2".to_owned(),
-        });
-        assert!(is_retryable_storage_contention(&error));
+    fn open_retry_accepts_typed_busy_errors() {
+        for code in [
+            ffi::SQLITE_BUSY,
+            ffi::SQLITE_BUSY_SNAPSHOT,
+            ffi::SQLITE_LOCKED,
+        ] {
+            let error = ops_error(sqlite_failure(code));
+            assert!(is_retryable_storage_contention(&error), "code {code}");
+        }
     }
 
     #[test]
-    fn open_retry_rejects_string_lookalike_that_is_not_franken_transient() {
+    fn open_retry_rejects_string_lookalike_that_is_not_sqlite_transient() {
         let error = SearchError::InvalidConfig {
             field: "test".to_owned(),
             value: "busy snapshot locked".to_owned(),
@@ -3952,28 +3970,23 @@ mod tests {
     }
 
     #[test]
-    fn open_retry_rejects_non_transient_franken_error() {
-        let error = ops_error(FrankenError::NoSuchTable {
-            name: "missing".to_owned(),
-        });
+    fn open_retry_rejects_non_transient_sqlite_error() {
+        let error = ops_error(sqlite_failure(ffi::SQLITE_CONSTRAINT));
         assert!(!is_retryable_storage_contention(&error));
     }
 
     #[test]
-    fn open_retry_accepts_snapshot_too_old_and_schema_changed() {
-        assert!(is_retryable_storage_contention(&ops_error(
-            FrankenError::SnapshotTooOld { txn_id: 3 }
-        )));
-        assert!(is_retryable_storage_contention(&ops_error(
-            FrankenError::SchemaChanged
-        )));
+    fn open_retry_accepts_schema_changed() {
+        assert!(is_retryable_storage_contention(&ops_error(sqlite_failure(
+            ffi::SQLITE_SCHEMA
+        ))));
     }
 
     #[test]
     fn failed_rollback_error_is_not_retryable() {
         let error = super::unretryable_ops_rollback_error(
-            &ops_error(FrankenError::Busy),
-            &FrankenError::Busy,
+            &ops_error(sqlite_failure(ffi::SQLITE_BUSY)),
+            &sqlite_failure(ffi::SQLITE_BUSY),
         );
         assert!(!is_retryable_storage_contention(&error));
     }
@@ -4100,7 +4113,7 @@ mod tests {
 
         let panicking = panic::catch_unwind(AssertUnwindSafe(|| {
             let _: SearchResult<()> = storage.with_transaction(|conn| {
-                conn.execute_sync(
+                conn.execute_batch(
                     "INSERT INTO projects(project_key, display_name, created_at_ms, updated_at_ms) \
                      VALUES ('panic-project', 'panic-project', 1, 1);",
                 )
@@ -4111,40 +4124,43 @@ mod tests {
 
         assert!(panicking.is_err(), "the transaction panic must propagate");
         assert_eq!(
-            table_row_count(storage.connection(), "projects"),
+            table_row_count(&storage.connection(), "projects"),
             0,
             "the write performed before the panic must be rolled back"
         );
 
         storage
             .connection()
-            .execute_sync(
+            .execute_batch(
                 "INSERT INTO projects(project_key, display_name, created_at_ms, updated_at_ms) \
                  VALUES ('recovery-project', 'recovery-project', 2, 2);",
             )
             .expect("the connection should accept a new write after panic rollback");
-        assert_eq!(table_row_count(storage.connection(), "projects"), 1);
+        assert_eq!(table_row_count(&storage.connection(), "projects"), 1);
     }
 
-    fn table_exists(conn: &AsyncConnection, table_name: &str) -> bool {
-        // Probe table existence with a zero-row SELECT instead of
-        // querying sqlite_master: FrankenSQLite's VDBE cannot open a
-        // storage cursor on sqlite_master's btree root page.
-        conn.query_sync(&format!("SELECT 1 FROM \"{table_name}\" LIMIT 0"))
-            .is_ok()
+    fn table_exists(conn: &Connection, table_name: &str) -> bool {
+        // Probe table existence with a zero-row SELECT: it proves the table
+        // is actually readable, not merely listed in sqlite_master.
+        query_values(
+            conn,
+            &format!("SELECT 1 FROM \"{table_name}\" LIMIT 0"),
+            &[],
+        )
+        .is_ok()
     }
 
-    fn index_exists(conn: &AsyncConnection, table_name: &str, index_name: &str) -> bool {
+    fn index_exists(conn: &Connection, table_name: &str, index_name: &str) -> bool {
         // Ask the schema catalog directly. The former `INDEXED BY` probe
-        // was not stock-conformant: SQLite, and FrankenSQLite since 0.3.7,
-        // reject `INDEXED BY` on a partial index when the query does not
-        // carry the index's WHERE predicate ("no query solution"), so every
-        // partial index read as missing.
+        // was not stock-conformant: SQLite rejects `INDEXED BY` on a partial
+        // index when the query does not carry the index's WHERE predicate
+        // ("no query solution"), so every partial index read as missing.
         let params = [
-            SqliteValue::Text(table_name.to_owned().into()),
-            SqliteValue::Text(index_name.to_owned().into()),
+            SqliteValue::Text(table_name.to_owned()),
+            SqliteValue::Text(index_name.to_owned()),
         ];
-        conn.query_with_params_sync(
+        query_values(
+            conn,
             "SELECT 1 FROM sqlite_master WHERE type = 'index' AND tbl_name = ?1 AND name = ?2",
             &params,
         )
@@ -4152,74 +4168,71 @@ mod tests {
         .unwrap_or(false)
     }
 
-    fn migration_row_count(conn: &AsyncConnection) -> i64 {
-        let rows = conn
-            .query_sync("SELECT COUNT(*) FROM ops_schema_migrations;")
+    fn schema_version_row_count(conn: &Connection) -> i64 {
+        let rows = query_values(conn, "SELECT COUNT(*) FROM ops_schema_version;", &[])
             .map_err(ops_error)
             .expect("count query should succeed");
         let Some(row) = rows.first() else {
             return 0;
         };
-        match row.get(0) {
+        match row.first() {
             Some(SqliteValue::Integer(value)) => *value,
             other => panic!("unexpected row type for count: {other:?}"),
         }
     }
 
-    fn search_event_count(conn: &AsyncConnection) -> i64 {
-        let rows = conn
-            .query_sync("SELECT COUNT(*) FROM search_events;")
+    fn search_event_count(conn: &Connection) -> i64 {
+        let rows = query_values(conn, "SELECT COUNT(*) FROM search_events;", &[])
             .map_err(ops_error)
             .expect("count query should succeed");
         let Some(row) = rows.first() else {
             return 0;
         };
-        match row.get(0) {
+        match row.first() {
             Some(SqliteValue::Integer(value)) => *value,
             other => panic!("unexpected row type for count: {other:?}"),
         }
     }
 
-    fn table_row_count(conn: &AsyncConnection, table: &str) -> i64 {
+    fn table_row_count(conn: &Connection, table: &str) -> i64 {
         let query = format!("SELECT COUNT(*) FROM {table};");
-        let rows = conn
-            .query_sync(&query)
+        let rows = query_values(conn, &query, &[])
             .map_err(ops_error)
             .expect("count query should succeed");
         let Some(row) = rows.first() else {
             return 0;
         };
-        match row.get(0) {
+        match row.first() {
             Some(SqliteValue::Integer(value)) => *value,
             other => panic!("unexpected row type for count: {other:?}"),
         }
     }
 
-    fn single_integer_value(conn: &AsyncConnection, query: &str) -> Option<i64> {
-        let rows = conn
-            .query_sync(query)
+    fn single_integer_value(conn: &Connection, query: &str) -> Option<i64> {
+        let rows = query_values(conn, query, &[])
             .map_err(ops_error)
             .expect("integer query should succeed");
-        match rows.first()?.get(0) {
+        match rows.first()?.first() {
             Some(SqliteValue::Integer(value)) => Some(*value),
             _ => None,
         }
     }
 
-    fn search_event_order(conn: &AsyncConnection) -> Vec<(String, i64)> {
-        let rows = conn
-            .query_sync(
-                "SELECT event_id, ts_ms \
+    fn search_event_order(conn: &Connection) -> Vec<(String, i64)> {
+        let rows = query_values(
+            conn,
+            "SELECT event_id, ts_ms \
          FROM search_events \
          ORDER BY ts_ms ASC, event_id ASC;",
-            )
-            .map_err(ops_error)
-            .expect("ordered search event query should succeed");
+            &[],
+        )
+        .map_err(ops_error)
+        .expect("ordered search event query should succeed");
 
         rows.iter()
             .map(|row| {
-                let event_id = match row.get(0) {
-                    Some(SqliteValue::Text(value)) => value.to_string(),
+                let event_id = match row.first() {
+                    Some(SqliteValue::Text(value)) => value.clone(),
                     other => panic!("unexpected row type for event_id: {other:?}"),
                 };
                 let ts_ms = match row.get(1) {
@@ -4231,49 +4244,50 @@ mod tests {
             .collect()
     }
 
-    fn latest_resource_queue_depth(conn: &AsyncConnection) -> i64 {
-        let rows = conn
-            .query_sync(
-                "SELECT queue_depth FROM resource_samples \
+    fn latest_resource_queue_depth(conn: &Connection) -> i64 {
+        let rows = query_values(
+            conn,
+            "SELECT queue_depth FROM resource_samples \
          ORDER BY ts_ms DESC LIMIT 1;",
-            )
-            .map_err(ops_error)
-            .expect("queue depth query should succeed");
+            &[],
+        )
+        .map_err(ops_error)
+        .expect("queue depth query should succeed");
         let Some(row) = rows.first() else {
             panic!("expected one resource sample row");
         };
-        match row.get(0) {
+        match row.first() {
             Some(SqliteValue::Integer(value)) => *value,
             other => panic!("unexpected row type for queue_depth: {other:?}"),
         }
     }
 
-    fn anomaly_state(conn: &AsyncConnection, anomaly_id: &str) -> Option<String> {
-        let rows = conn
-            .query_with_params_sync(
-                "SELECT state FROM anomaly_materializations WHERE anomaly_id = ?1 LIMIT 1;",
-                &[SqliteValue::Text(anomaly_id.to_owned().into())],
-            )
-            .map_err(ops_error)
-            .expect("anomaly state query should succeed");
+    fn anomaly_state(conn: &Connection, anomaly_id: &str) -> Option<String> {
+        let rows = query_values(
+            conn,
+            "SELECT state FROM anomaly_materializations WHERE anomaly_id = ?1 LIMIT 1;",
+            &[SqliteValue::Text(anomaly_id.to_owned())],
+        )
+        .map_err(ops_error)
+        .expect("anomaly state query should succeed");
         let row = rows.first()?;
-        match row.get(0) {
-            Some(SqliteValue::Text(value)) => Some(value.to_string()),
+        match row.first() {
+            Some(SqliteValue::Text(value)) => Some(value.clone()),
             other => panic!("unexpected row type for anomaly state: {other:?}"),
         }
     }
 
-    fn anomaly_resolved_at(conn: &AsyncConnection, anomaly_id: &str) -> Option<i64> {
-        let rows = conn
-            .query_with_params_sync(
-                "SELECT resolved_at_ms FROM anomaly_materializations \
+    fn anomaly_resolved_at(conn: &Connection, anomaly_id: &str) -> Option<i64> {
+        let rows = query_values(
+            conn,
+            "SELECT resolved_at_ms FROM anomaly_materializations \
          WHERE anomaly_id = ?1 LIMIT 1;",
-                &[SqliteValue::Text(anomaly_id.to_owned().into())],
-            )
-            .map_err(ops_error)
-            .expect("anomaly resolved_at query should succeed");
+            &[SqliteValue::Text(anomaly_id.to_owned())],
+        )
+        .map_err(ops_error)
+        .expect("anomaly resolved_at query should succeed");
         let row = rows.first()?;
-        match row.get(0) {
+        match row.first() {
             Some(SqliteValue::Integer(value)) => Some(*value),
             Some(SqliteValue::Null) | None => None,
             other => panic!("unexpected row type for anomaly resolved_at: {other:?}"),
@@ -4415,16 +4429,12 @@ mod tests {
         (result, logs)
     }
 
-    fn seed_project_and_instance_named(
-        conn: &AsyncConnection,
-        project_key: &str,
-        instance_id: &str,
-    ) {
+    fn seed_project_and_instance_named(conn: &Connection, project_key: &str, instance_id: &str) {
         let project_insert = format!(
             "INSERT INTO projects(project_key, display_name, created_at_ms, updated_at_ms) \
              VALUES ('{project_key}', '{project_key}', 1, 1);"
         );
-        conn.execute_sync(&project_insert)
+        conn.execute_batch(&project_insert)
             .expect("project row should insert");
 
         let instance_insert = format!(
@@ -4435,23 +4445,23 @@ mod tests {
                 '{instance_id}', '{project_key}', 'host-a', 123, '0.1.0', 1, 1, 'healthy'\
              );"
         );
-        conn.execute_sync(&instance_insert)
+        conn.execute_batch(&instance_insert)
             .expect("instance row should insert");
     }
 
-    fn seed_project_and_instance(conn: &AsyncConnection) {
+    fn seed_project_and_instance(conn: &Connection) {
         seed_project_and_instance_named(conn, "project-a", "instance-a");
     }
 
-    fn seed_second_project_and_instance(conn: &AsyncConnection) {
+    fn seed_second_project_and_instance(conn: &Connection) {
         seed_project_and_instance_named(conn, "project-b", "instance-b");
     }
 
     #[test]
     fn bootstrap_creates_schema_tables_and_indexes() {
-        let conn = AsyncConnection::open_sync(":memory:".to_owned()).expect("in-memory connection");
+        let mut conn = Connection::open_in_memory().expect("in-memory connection");
 
-        bootstrap(&conn).expect("bootstrap should succeed");
+        bootstrap(&mut conn).expect("bootstrap should succeed");
         assert_eq!(
             current_version(&conn).expect("schema version should be present"),
             OPS_SCHEMA_VERSION
@@ -4469,7 +4479,7 @@ mod tests {
             "evidence_links",
             "slo_rollups",
             "anomaly_materializations",
-            "ops_schema_migrations",
+            "ops_schema_version",
         ] {
             assert!(
                 table_exists(&conn, table),
@@ -4503,34 +4513,31 @@ mod tests {
 
     #[test]
     fn bootstrap_is_idempotent() {
-        let conn = AsyncConnection::open_sync(":memory:".to_owned()).expect("in-memory connection");
+        let mut conn = Connection::open_in_memory().expect("in-memory connection");
 
-        bootstrap(&conn).expect("first bootstrap should succeed");
-        bootstrap(&conn).expect("second bootstrap should succeed");
-        bootstrap(&conn).expect("third bootstrap should succeed");
+        bootstrap(&mut conn).expect("first bootstrap should succeed");
+        bootstrap(&mut conn).expect("second bootstrap should succeed");
+        bootstrap(&mut conn).expect("third bootstrap should succeed");
         assert_eq!(
             current_version(&conn).expect("schema version should be present"),
             OPS_SCHEMA_VERSION
         );
         assert_eq!(
-            migration_row_count(&conn),
-            OPS_SCHEMA_VERSION,
-            "schema should record one row per applied migration version"
+            schema_version_row_count(&conn),
+            1,
+            "the marker table must hold exactly one stamped version"
         );
     }
 
     #[test]
     fn bootstrap_rejects_newer_schema_versions() {
-        let conn = AsyncConnection::open_sync(":memory:".to_owned()).expect("in-memory connection");
-        conn.execute_sync(OPS_SCHEMA_MIGRATIONS_TABLE_SQL)
-            .expect("migrations table creation should succeed");
-        conn.execute_sync(
-            "INSERT INTO ops_schema_migrations(version, name, applied_at_ms, checksum, reversible) \
-         VALUES (99, 'future', 0, 'future-checksum', 0);",
-        )
-        .expect("future migration row should insert");
+        let mut conn = Connection::open_in_memory().expect("in-memory connection");
+        conn.execute_batch(OPS_SCHEMA_VERSION_TABLE_SQL)
+            .expect("version table creation should succeed");
+        conn.execute_batch("INSERT INTO ops_schema_version(version) VALUES (99);")
+            .expect("future version row should insert");
 
-        let error = bootstrap(&conn).expect_err("newer versions should be rejected");
+        let error = bootstrap(&mut conn).expect_err("newer versions should be rejected");
         let message = error.to_string();
         assert!(
             message.contains("ops schema version 99 is newer than supported"),
@@ -4539,20 +4546,17 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_detects_checksum_mismatch() {
-        let conn = AsyncConnection::open_sync(":memory:".to_owned()).expect("in-memory connection");
-        conn.execute_sync(OPS_SCHEMA_MIGRATIONS_TABLE_SQL)
-            .expect("migrations table creation should succeed");
-        conn.execute_sync(
-            "INSERT INTO ops_schema_migrations(version, name, applied_at_ms, checksum, reversible) \
-         VALUES (1, 'ops_telemetry_storage_v1', 0, 'bad-checksum', 1);",
-        )
-        .expect("mismatch migration row should insert");
+    fn bootstrap_rejects_unrecognized_schema_versions() {
+        let mut conn = Connection::open_in_memory().expect("in-memory connection");
+        conn.execute_batch(OPS_SCHEMA_VERSION_TABLE_SQL)
+            .expect("version table creation should succeed");
+        conn.execute_batch("INSERT INTO ops_schema_version(version) VALUES (-1);")
+            .expect("legacy version row should insert");
 
-        let error = bootstrap(&conn).expect_err("checksum mismatch should fail");
+        let error = bootstrap(&mut conn).expect_err("unrecognized versions should be rejected");
         let message = error.to_string();
         assert!(
-            message.contains("checksum mismatch"),
+            message.contains("no migration path from ops schema version -1 to"),
             "unexpected error message: {message}"
         );
     }
@@ -4569,9 +4573,66 @@ mod tests {
     }
 
     #[test]
+    fn open_file_backed_storage_stamps_pragma_and_cascade_contract() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("wall clock should be >= unix epoch")
+            .as_nanos();
+        let db_path =
+            std::env::temp_dir().join(format!("frankensearch-ops-pragma-contract-{nanos}.sqlite3"));
+        let storage = OpsStorage::open(OpsStorageConfig {
+            db_path,
+            ..OpsStorageConfig::default()
+        })
+        .expect("file-backed ops storage should open");
+
+        {
+            let conn = storage.connection();
+            let user_version: i64 = conn
+                .query_row("PRAGMA user_version;", [], |row| row.get(0))
+                .expect("user_version pragma should be queryable");
+            assert_eq!(user_version, OPS_SCHEMA_VERSION);
+            let foreign_keys: i64 = conn
+                .query_row("PRAGMA foreign_keys;", [], |row| row.get(0))
+                .expect("foreign_keys pragma should be queryable");
+            assert_eq!(foreign_keys, 1, "open must enable PRAGMA foreign_keys=ON");
+            let journal_mode: String = conn
+                .query_row("PRAGMA journal_mode;", [], |row| row.get(0))
+                .expect("journal_mode pragma should be queryable");
+            assert_eq!(journal_mode, "wal");
+
+            seed_project_and_instance(&conn);
+            conn.execute(
+                "INSERT INTO search_events(\
+                    event_id, project_key, instance_id, correlation_id, phase, latency_us, ts_ms\
+                 ) VALUES (\
+                    'evt-cascade', 'project-a', 'instance-a', 'corr-cascade', 'initial', 100, 1\
+                 );",
+                [],
+            )
+            .expect("search event seed should insert");
+            conn.execute("DELETE FROM projects WHERE project_key = 'project-a';", [])
+                .expect("project delete should succeed");
+            assert_eq!(table_row_count(&conn, "projects"), 0);
+            assert_eq!(
+                table_row_count(&conn, "instances"),
+                0,
+                "instances must cascade away with their project"
+            );
+            assert_eq!(
+                table_row_count(&conn, "search_events"),
+                0,
+                "search_events must cascade through projects -> instances"
+            );
+            drop(conn);
+        }
+        drop(storage);
+    }
+
+    #[test]
     fn ingest_search_events_batch_is_idempotent_and_tracks_metrics() {
         let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
-        seed_project_and_instance(storage.connection());
+        seed_project_and_instance(&storage.connection());
         let event = sample_search_event("event-1", 42);
 
         let first = storage
@@ -4587,7 +4648,7 @@ mod tests {
             .expect("second ingest should succeed");
         assert_eq!(second.inserted, 0);
         assert_eq!(second.deduplicated, 1);
-        assert_eq!(search_event_count(storage.connection()), 1);
+        assert_eq!(search_event_count(&storage.connection()), 1);
 
         let metrics = storage.ingestion_metrics();
         assert_eq!(metrics.total_batches, 2);
@@ -4600,7 +4661,7 @@ mod tests {
     #[test]
     fn ingest_search_events_batch_orders_insertions_deterministically() {
         let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
-        seed_project_and_instance(storage.connection());
+        seed_project_and_instance(&storage.connection());
 
         let first = sample_search_event("event-order-b", 10);
         let second = sample_search_event("event-order-c", 30);
@@ -4609,7 +4670,7 @@ mod tests {
             .ingest_search_events_batch(&[first, second, third], 64)
             .expect("ingest should succeed");
 
-        let ordered = search_event_order(storage.connection());
+        let ordered = search_event_order(&storage.connection());
         let ordered_ids: Vec<&str> = ordered
             .iter()
             .map(|(event_id, _)| event_id.as_str())
@@ -4633,11 +4694,11 @@ mod tests {
 
         assert_eq!(result.inserted, 3);
         assert_eq!(result.deduplicated, 0);
-        assert_eq!(table_row_count(storage.connection(), "projects"), 1);
-        assert_eq!(table_row_count(storage.connection(), "instances"), 1);
+        assert_eq!(table_row_count(&storage.connection(), "projects"), 1);
+        assert_eq!(table_row_count(&storage.connection(), "instances"), 1);
         assert_eq!(
             single_integer_value(
-                storage.connection(),
+                &storage.connection(),
                 "SELECT created_at_ms FROM projects WHERE project_key = 'project-a';",
             ),
             Some(10),
@@ -4645,14 +4706,14 @@ mod tests {
         );
         assert_eq!(
             single_integer_value(
-                storage.connection(),
+                &storage.connection(),
                 "SELECT first_seen_ms FROM instances WHERE instance_id = 'instance-a';",
             ),
             Some(10),
             "the earliest canonically ordered event must establish the instance"
         );
         assert_eq!(
-            search_event_order(storage.connection()),
+            search_event_order(&storage.connection()),
             vec![
                 ("event-shared-parent-a".to_owned(), 10),
                 ("event-shared-parent-b".to_owned(), 20),
@@ -4688,32 +4749,32 @@ mod tests {
 
         assert_eq!(result.inserted, 4);
         assert_eq!(result.deduplicated, 0);
-        assert_eq!(table_row_count(storage.connection(), "projects"), 2);
-        assert_eq!(table_row_count(storage.connection(), "instances"), 2);
+        assert_eq!(table_row_count(&storage.connection(), "projects"), 2);
+        assert_eq!(table_row_count(&storage.connection(), "instances"), 2);
         assert_eq!(
             single_integer_value(
-                storage.connection(),
+                &storage.connection(),
                 "SELECT created_at_ms FROM projects WHERE project_key = 'project-a';",
             ),
             Some(20)
         );
         assert_eq!(
             single_integer_value(
-                storage.connection(),
+                &storage.connection(),
                 "SELECT created_at_ms FROM projects WHERE project_key = 'project-b';",
             ),
             Some(10)
         );
         assert_eq!(
             single_integer_value(
-                storage.connection(),
+                &storage.connection(),
                 "SELECT first_seen_ms FROM instances WHERE instance_id = 'instance-a';",
             ),
             Some(20)
         );
         assert_eq!(
             single_integer_value(
-                storage.connection(),
+                &storage.connection(),
                 "SELECT first_seen_ms FROM instances WHERE instance_id = 'instance-b';",
             ),
             Some(10)
@@ -4745,15 +4806,17 @@ mod tests {
             "unexpected error: {error}"
         );
 
-        assert_eq!(search_event_count(storage.connection()), 1);
-        assert_eq!(table_row_count(storage.connection(), "projects"), 1);
-        assert_eq!(table_row_count(storage.connection(), "instances"), 1);
+        assert_eq!(search_event_count(&storage.connection()), 1);
+        assert_eq!(table_row_count(&storage.connection(), "projects"), 1);
+        assert_eq!(table_row_count(&storage.connection(), "instances"), 1);
         assert_eq!(
-            storage
-                .connection()
-                .query_sync("SELECT project_key FROM instances WHERE instance_id = 'instance-a';")
-                .expect("instance lookup should succeed")
-                .len(),
+            query_values(
+                &storage.connection(),
+                "SELECT project_key FROM instances WHERE instance_id = 'instance-a';",
+                &[]
+            )
+            .expect("instance lookup should succeed")
+            .len(),
             1
         );
         assert_eq!(storage.ingestion_metrics().pending_events, 0);
@@ -4777,23 +4840,27 @@ mod tests {
 
         assert_eq!(result.inserted, 0);
         assert_eq!(result.deduplicated, 1);
-        assert_eq!(search_event_count(storage.connection()), 1);
-        assert_eq!(table_row_count(storage.connection(), "projects"), 1);
-        assert_eq!(table_row_count(storage.connection(), "instances"), 1);
+        assert_eq!(search_event_count(&storage.connection()), 1);
+        assert_eq!(table_row_count(&storage.connection(), "projects"), 1);
+        assert_eq!(table_row_count(&storage.connection(), "instances"), 1);
         assert!(
-            storage
-                .connection()
-                .query_sync("SELECT 1 FROM projects WHERE project_key = 'project-retry-decoy';")
-                .expect("project lookup should succeed")
-                .is_empty(),
+            query_values(
+                &storage.connection(),
+                "SELECT 1 FROM projects WHERE project_key = 'project-retry-decoy';",
+                &[]
+            )
+            .expect("project lookup should succeed")
+            .is_empty(),
             "a database retry must not create a project from its changed payload"
         );
         assert!(
-            storage
-                .connection()
-                .query_sync("SELECT 1 FROM instances WHERE instance_id = 'instance-retry-decoy';")
-                .expect("instance lookup should succeed")
-                .is_empty(),
+            query_values(
+                &storage.connection(),
+                "SELECT 1 FROM instances WHERE instance_id = 'instance-retry-decoy';",
+                &[]
+            )
+            .expect("instance lookup should succeed")
+            .is_empty(),
             "a database retry must not create an instance from its changed payload"
         );
     }
@@ -4801,7 +4868,7 @@ mod tests {
     #[test]
     fn ingest_search_events_batch_dedup_retry_preserves_ingest_sequence() {
         let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
-        seed_project_and_instance(storage.connection());
+        seed_project_and_instance(&storage.connection());
 
         let event_a = sample_search_event("event-dedup-a", 101);
         let event_b = sample_search_event("event-dedup-b", 102);
@@ -4812,7 +4879,7 @@ mod tests {
             .ingest_search_events_batch(&[event_b, event_a], 64)
             .expect("retry ingest should deduplicate");
 
-        let ordered = search_event_order(storage.connection());
+        let ordered = search_event_order(&storage.connection());
         assert_eq!(ordered.len(), 2);
         let ordered_ids: Vec<&str> = ordered
             .iter()
@@ -4824,7 +4891,7 @@ mod tests {
     #[test]
     fn ingest_search_events_batch_deduplicates_duplicates_within_single_batch() {
         let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
-        seed_project_and_instance(storage.connection());
+        seed_project_and_instance(&storage.connection());
 
         let event_a = sample_search_event("event-single-batch-dup-a", 11);
         let event_b = sample_search_event("event-single-batch-dup-b", 12);
@@ -4837,9 +4904,9 @@ mod tests {
         assert_eq!(result.inserted, 2);
         assert_eq!(result.deduplicated, 1);
         assert_eq!(result.failed, 0);
-        assert_eq!(search_event_count(storage.connection()), 2);
+        assert_eq!(search_event_count(&storage.connection()), 2);
 
-        let ordered = search_event_order(storage.connection());
+        let ordered = search_event_order(&storage.connection());
         let ordered_ids: Vec<&str> = ordered
             .iter()
             .map(|(event_id, _)| event_id.as_str())
@@ -4853,7 +4920,7 @@ mod tests {
     #[test]
     fn refresh_search_summaries_materializes_all_windows() {
         let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
-        seed_project_and_instance(storage.connection());
+        seed_project_and_instance(&storage.connection());
 
         let now_ms = 600_000;
         let mut event_a = sample_search_event("event-summary-a", now_ms - 20_000);
@@ -4898,7 +4965,7 @@ mod tests {
     #[test]
     fn materialize_slo_rollups_and_anomalies_emits_project_and_fleet_views() {
         let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
-        seed_project_and_instance(storage.connection());
+        seed_project_and_instance(&storage.connection());
 
         let now_ms = 119_000;
         let mut events = Vec::new();
@@ -4972,7 +5039,7 @@ mod tests {
     #[test]
     fn materialize_slo_rollups_and_anomalies_resolves_when_thresholds_relax() {
         let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
-        seed_project_and_instance(storage.connection());
+        seed_project_and_instance(&storage.connection());
 
         let now_ms = 119_000;
         let mut events = Vec::new();
@@ -5034,7 +5101,7 @@ mod tests {
     #[test]
     fn materialize_slo_rollups_uses_no_data_reason_when_min_requests_not_met() {
         let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
-        seed_project_and_instance(storage.connection());
+        seed_project_and_instance(&storage.connection());
 
         let now_ms = 700_000;
         let event = sample_search_event("event-min-requests", now_ms - 100);
@@ -5069,7 +5136,7 @@ mod tests {
     #[test]
     fn query_resource_trend_returns_ordered_points_in_window() {
         let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
-        seed_project_and_instance(storage.connection());
+        seed_project_and_instance(&storage.connection());
         let now_ms = 500_000;
 
         for (offset, queue_depth) in [(40_000, 2_u64), (30_000, 4_u64), (20_000, 6_u64)] {
@@ -5099,11 +5166,11 @@ mod tests {
     #[test]
     fn query_embedding_throughput_computes_rates() {
         let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
-        seed_project_and_instance(storage.connection());
+        seed_project_and_instance(&storage.connection());
 
         storage
             .connection()
-            .execute_sync(
+            .execute_batch(
                 "INSERT INTO embedding_job_snapshots(\
             snapshot_id, project_key, instance_id, embedder_id, pending_jobs, \
             processing_jobs, completed_jobs, failed_jobs, retried_jobs, batch_latency_us, ts_ms\
@@ -5114,7 +5181,7 @@ mod tests {
             .expect("first embedding snapshot should insert");
         storage
             .connection()
-            .execute_sync(
+            .execute_batch(
                 "INSERT INTO embedding_job_snapshots(\
             snapshot_id, project_key, instance_id, embedder_id, pending_jobs, \
             processing_jobs, completed_jobs, failed_jobs, retried_jobs, batch_latency_us, ts_ms\
@@ -5136,8 +5203,8 @@ mod tests {
     #[test]
     fn materialize_slo_rollups_and_anomalies_writes_project_and_fleet_views() {
         let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
-        seed_project_and_instance(storage.connection());
-        seed_second_project_and_instance(storage.connection());
+        seed_project_and_instance(&storage.connection());
+        seed_second_project_and_instance(&storage.connection());
 
         let now_ms = 120_500;
         let mut events = Vec::new();
@@ -5227,7 +5294,7 @@ mod tests {
     #[test]
     fn materialize_slo_rollups_resolves_previous_window_anomalies() {
         let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
-        seed_project_and_instance(storage.connection());
+        seed_project_and_instance(&storage.connection());
 
         let first_now_ms = 120_500;
         let mut first_window_events = Vec::new();
@@ -5252,7 +5319,7 @@ mod tests {
         let first_window_start = SummaryWindow::OneMinute.bucket_start_ms(first_now_ms);
         let anomaly_id = format!("anomaly:project:project-a:1m:{first_window_start}");
         assert_eq!(
-            anomaly_state(storage.connection(), &anomaly_id).as_deref(),
+            anomaly_state(&storage.connection(), &anomaly_id).as_deref(),
             Some("open")
         );
 
@@ -5274,11 +5341,11 @@ mod tests {
             .expect("second materialization should succeed");
 
         assert_eq!(
-            anomaly_state(storage.connection(), &anomaly_id).as_deref(),
+            anomaly_state(&storage.connection(), &anomaly_id).as_deref(),
             Some("resolved")
         );
         assert!(
-            anomaly_resolved_at(storage.connection(), &anomaly_id).is_some(),
+            anomaly_resolved_at(&storage.connection(), &anomaly_id).is_some(),
             "resolved anomalies should carry resolved_at_ms"
         );
     }
@@ -5286,7 +5353,7 @@ mod tests {
     #[test]
     fn apply_retention_policy_prunes_and_downsamples() {
         let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
-        seed_project_and_instance(storage.connection());
+        seed_project_and_instance(&storage.connection());
 
         let old_event = sample_search_event("event-retention-old", 1_000);
         let new_event = sample_search_event("event-retention-new", 9_900);
@@ -5325,18 +5392,18 @@ mod tests {
             )
             .expect("retention apply should succeed");
 
-        assert_eq!(search_event_count(storage.connection()), 1);
+        assert_eq!(search_event_count(&storage.connection()), 1);
         assert!(result.deleted_search_events >= 1);
         assert!(result.deleted_search_summaries <= 7);
         assert!(result.deleted_resource_samples <= 5);
         assert!(result.downsampled_resource_samples >= 1);
-        assert!(table_row_count(storage.connection(), "resource_samples") <= 3);
+        assert!(table_row_count(&storage.connection(), "resource_samples") <= 3);
     }
 
     #[test]
     fn ingestion_metrics_snapshot_tracks_high_watermark_and_latency() {
         let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
-        seed_project_and_instance(storage.connection());
+        seed_project_and_instance(&storage.connection());
 
         let first_batch = vec![
             sample_search_event("event-hwm-1", 201),
@@ -5380,7 +5447,7 @@ mod tests {
     #[test]
     fn ingestion_metrics_snapshot_tracks_backpressure_peak_and_resets_pending() {
         let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
-        seed_project_and_instance(storage.connection());
+        seed_project_and_instance(&storage.connection());
 
         let event_a = sample_search_event("event-bp-hwm-a", 301);
         let event_b = sample_search_event("event-bp-hwm-b", 302);
@@ -5412,7 +5479,7 @@ mod tests {
     #[test]
     fn ingest_search_events_batch_rejects_when_backpressured() {
         let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
-        seed_project_and_instance(storage.connection());
+        seed_project_and_instance(&storage.connection());
         let event_a = sample_search_event("event-a", 1);
         let event_b = sample_search_event("event-b", 2);
 
@@ -5429,7 +5496,7 @@ mod tests {
             ),
             "unexpected backpressure error: {error}"
         );
-        assert_eq!(search_event_count(storage.connection()), 0);
+        assert_eq!(search_event_count(&storage.connection()), 0);
 
         let metrics = storage.ingestion_metrics();
         assert_eq!(metrics.total_backpressured_batches, 1);
@@ -5440,7 +5507,7 @@ mod tests {
     #[test]
     fn ingest_search_events_batch_rolls_back_on_validation_error() {
         let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
-        seed_project_and_instance(storage.connection());
+        seed_project_and_instance(&storage.connection());
 
         let valid = sample_search_event("event-valid", 7);
         let invalid = SearchEventRecord {
@@ -5455,7 +5522,7 @@ mod tests {
             matches!(error, SearchError::InvalidConfig { ref field, .. } if field == "event_id"),
             "unexpected validation error: {error}"
         );
-        assert_eq!(search_event_count(storage.connection()), 0);
+        assert_eq!(search_event_count(&storage.connection()), 0);
 
         let metrics = storage.ingestion_metrics();
         assert_eq!(metrics.total_batches, 1);
@@ -5467,7 +5534,7 @@ mod tests {
     #[test]
     fn ingest_search_events_batch_rejects_empty_correlation_id() {
         let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
-        seed_project_and_instance(storage.connection());
+        seed_project_and_instance(&storage.connection());
 
         let invalid = SearchEventRecord {
             correlation_id: String::new(),
@@ -5487,7 +5554,7 @@ mod tests {
             ),
             "unexpected validation error: {error}"
         );
-        assert_eq!(search_event_count(storage.connection()), 0);
+        assert_eq!(search_event_count(&storage.connection()), 0);
 
         let metrics = storage.ingestion_metrics();
         assert_eq!(metrics.total_batches, 1);
@@ -5499,7 +5566,7 @@ mod tests {
     #[test]
     fn ingest_search_events_batch_emits_structured_success_log() {
         let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
-        seed_project_and_instance(storage.connection());
+        seed_project_and_instance(&storage.connection());
         let event = sample_search_event("event-log-success", 90);
 
         let (_result, logs) = with_captured_logs(|| {
@@ -5527,7 +5594,7 @@ mod tests {
     #[test]
     fn ingest_search_events_batch_emits_structured_backpressure_log() {
         let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
-        seed_project_and_instance(storage.connection());
+        seed_project_and_instance(&storage.connection());
         let event_a = sample_search_event("event-log-backpressure-a", 91);
         let event_b = sample_search_event("event-log-backpressure-b", 92);
 
@@ -5551,7 +5618,7 @@ mod tests {
     #[test]
     fn ingest_search_events_batch_emits_structured_failure_log() {
         let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
-        seed_project_and_instance(storage.connection());
+        seed_project_and_instance(&storage.connection());
         let valid = sample_search_event("event-log-valid", 93);
         let invalid = SearchEventRecord {
             event_id: String::new(),
@@ -5577,7 +5644,7 @@ mod tests {
     #[test]
     fn upsert_resource_sample_replaces_existing_queue_depth() {
         let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
-        seed_project_and_instance(storage.connection());
+        seed_project_and_instance(&storage.connection());
 
         let first = ResourceSampleRecord {
             project_key: "project-a".to_owned(),
@@ -5602,33 +5669,32 @@ mod tests {
             .upsert_resource_sample(&second)
             .expect("second resource sample upsert should succeed");
 
-        assert_eq!(latest_resource_queue_depth(storage.connection()), 9);
+        assert_eq!(latest_resource_queue_depth(&storage.connection()), 9);
     }
 
     #[test]
-    #[ignore = "FrankenSQLite does not yet enforce CHECK constraints on direct SQL writes"]
     fn search_summaries_window_check_rejects_invalid_values() {
-        let conn = AsyncConnection::open_sync(":memory:".to_owned()).expect("in-memory connection");
-        bootstrap(&conn).expect("bootstrap should succeed");
+        let mut conn = Connection::open_in_memory().expect("in-memory connection");
+        bootstrap(&mut conn).expect("bootstrap should succeed");
         seed_project_and_instance(&conn);
 
         let params = [
-            SqliteValue::Text("project-a".to_owned().into()),
-            SqliteValue::Text("instance-a".to_owned().into()),
-            SqliteValue::Text("2h".to_owned().into()),
+            SqliteValue::Text("project-a".to_owned()),
+            SqliteValue::Text("instance-a".to_owned()),
+            SqliteValue::Text("2h".to_owned()),
             SqliteValue::Integer(0),
             SqliteValue::Integer(10),
             SqliteValue::Integer(100),
             SqliteValue::Integer(200),
             SqliteValue::Integer(300),
-            SqliteValue::Float(4.2),
+            SqliteValue::Real(4.2),
         ];
-        let result = conn.execute_with_params_sync(
+        let result = conn.execute(
             "INSERT INTO search_summaries(\
             project_key, instance_id, window, window_start_ms, search_count, \
             p50_latency_us, p95_latency_us, p99_latency_us, avg_result_count\
          ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9);",
-            &params,
+            params,
         );
         assert!(
             result.is_err(),
@@ -5638,8 +5704,8 @@ mod tests {
 
     #[test]
     fn search_summaries_accepts_all_supported_windows() {
-        let conn = AsyncConnection::open_sync(":memory:".to_owned()).expect("in-memory connection");
-        bootstrap(&conn).expect("bootstrap should succeed");
+        let mut conn = Connection::open_in_memory().expect("in-memory connection");
+        bootstrap(&mut conn).expect("bootstrap should succeed");
         seed_project_and_instance(&conn);
 
         for (index, window) in ["1m", "15m", "1h", "6h", "24h", "3d", "1w"]
@@ -5647,22 +5713,22 @@ mod tests {
             .enumerate()
         {
             let params = [
-                SqliteValue::Text("project-a".to_owned().into()),
-                SqliteValue::Text("instance-a".to_owned().into()),
-                SqliteValue::Text((*window).to_owned().into()),
+                SqliteValue::Text("project-a".to_owned()),
+                SqliteValue::Text("instance-a".to_owned()),
+                SqliteValue::Text((*window).to_owned()),
                 SqliteValue::Integer(i64::try_from(index).expect("index fits in i64")),
                 SqliteValue::Integer(10),
                 SqliteValue::Integer(100),
                 SqliteValue::Integer(200),
                 SqliteValue::Integer(300),
-                SqliteValue::Float(5.0),
+                SqliteValue::Real(5.0),
             ];
-            conn.execute_with_params_sync(
+            conn.execute(
                 "INSERT INTO search_summaries(\
                 project_key, instance_id, window, window_start_ms, search_count, \
                 p50_latency_us, p95_latency_us, p99_latency_us, avg_result_count\
              ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9);",
-                &params,
+                params,
             )
             .expect("supported window should insert");
         }
@@ -5671,10 +5737,10 @@ mod tests {
     #[test]
     fn evidence_links_unique_constraint_prevents_duplicate_alert_uri_pairs() {
         let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
-        seed_project_and_instance(storage.connection());
+        seed_project_and_instance(&storage.connection());
         storage
             .connection()
-            .execute_sync(
+            .execute_batch(
                 "INSERT INTO alerts_timeline(\
         alert_id, project_key, instance_id, category, severity, reason_code, summary, \
         state, opened_at_ms, updated_at_ms\
@@ -5712,14 +5778,14 @@ mod tests {
     #[test]
     fn evidence_links_allow_same_uri_across_distinct_alerts() {
         let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
-        seed_project_and_instance(storage.connection());
+        seed_project_and_instance(&storage.connection());
         storage
-            .connection().execute_sync("INSERT INTO alerts_timeline(\
+            .connection().execute_batch("INSERT INTO alerts_timeline(\
         alert_id, project_key, instance_id, category, severity, reason_code, summary, \
         state, opened_at_ms, updated_at_ms\
                      ) VALUES \
         ('alert-1', 'project-a', 'instance-a', 'latency', 'warn', 'latency.spike', 'spike', 'open', 1, 1), \
-        ('alert-2', 'project-a', 'instance-a', 'latency', 'warn', 'latency.spike', 'spike', 'open', 2, 2);",)
+        ('alert-2', 'project-a', 'instance-a', 'latency', 'warn', 'latency.spike', 'spike', 'open', 2, 2);")
             .expect("alert rows should insert");
 
         let shared_uri = "file:///tmp/shared-evidence.jsonl";
@@ -5746,19 +5812,18 @@ mod tests {
             .insert_evidence_link(&second)
             .expect("second alert with same uri should also insert");
 
-        let rows = storage
-            .connection()
-            .query_with_params_sync(
-                "SELECT link_id FROM evidence_links \
+        let rows = query_values(
+            &storage.connection(),
+            "SELECT link_id FROM evidence_links \
          WHERE project_key = ?1 AND evidence_uri = ?2 \
          ORDER BY alert_id ASC;",
-                &[
-                    SqliteValue::Text("project-a".to_owned().into()),
-                    SqliteValue::Text(shared_uri.to_owned().into()),
-                ],
-            )
-            .map_err(ops_error)
-            .expect("shared-uri query should succeed");
+            &[
+                SqliteValue::Text("project-a".to_owned()),
+                SqliteValue::Text(shared_uri.to_owned()),
+            ],
+        )
+        .map_err(ops_error)
+        .expect("shared-uri query should succeed");
         assert_eq!(
             rows.len(),
             2,
@@ -5769,7 +5834,7 @@ mod tests {
     #[test]
     fn insert_evidence_link_rejects_unknown_alert_id() {
         let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
-        seed_project_and_instance(storage.connection());
+        seed_project_and_instance(&storage.connection());
 
         let link = EvidenceLinkRecord {
             project_key: "project-a".to_owned(),
@@ -5792,7 +5857,7 @@ mod tests {
     #[test]
     fn insert_evidence_link_rejects_empty_evidence_uri() {
         let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
-        seed_project_and_instance(storage.connection());
+        seed_project_and_instance(&storage.connection());
 
         let link = EvidenceLinkRecord {
             project_key: "project-a".to_owned(),
@@ -5814,11 +5879,11 @@ mod tests {
     #[test]
     fn insert_evidence_link_rejects_alert_project_mismatch() {
         let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
-        seed_project_and_instance(storage.connection());
-        seed_second_project_and_instance(storage.connection());
+        seed_project_and_instance(&storage.connection());
+        seed_second_project_and_instance(&storage.connection());
         storage
             .connection()
-            .execute_sync(
+            .execute_batch(
                 "INSERT INTO alerts_timeline(\
             alert_id, project_key, instance_id, category, severity, reason_code, summary, \
             state, opened_at_ms, updated_at_ms\
@@ -5850,10 +5915,10 @@ mod tests {
     #[test]
     fn insert_evidence_link_uses_deterministic_link_id() {
         let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
-        seed_project_and_instance(storage.connection());
+        seed_project_and_instance(&storage.connection());
         storage
             .connection()
-            .execute_sync(
+            .execute_batch(
                 "INSERT INTO alerts_timeline(\
             alert_id, project_key, instance_id, category, severity, reason_code, summary, \
             state, opened_at_ms, updated_at_ms\
@@ -5877,20 +5942,19 @@ mod tests {
             .insert_evidence_link(&link)
             .expect("evidence link insert should succeed");
 
-        let rows = storage
-            .connection()
-            .query_with_params_sync(
-                "SELECT link_id FROM evidence_links \
+        let rows = query_values(
+            &storage.connection(),
+            "SELECT link_id FROM evidence_links \
          WHERE alert_id = ?1 AND evidence_uri = ?2 LIMIT 1;",
-                &[
-                    SqliteValue::Text(link.alert_id.into()),
-                    SqliteValue::Text(link.evidence_uri.into()),
-                ],
-            )
-            .map_err(ops_error)
-            .expect("link id query should succeed");
+            &[
+                SqliteValue::Text(link.alert_id),
+                SqliteValue::Text(link.evidence_uri),
+            ],
+        )
+        .map_err(ops_error)
+        .expect("link id query should succeed");
         let row = rows.first().expect("expected one evidence link row");
-        let actual_link_id = match row.get(0) {
+        let actual_link_id = match row.first() {
             Some(SqliteValue::Text(value)) => value,
             other => panic!("unexpected row type for evidence_links.link_id: {other:?}"),
         };
@@ -6370,7 +6434,7 @@ mod tests {
     #[test]
     fn optional_f64_some_is_float() {
         match super::optional_f64(Some(2.72_f64)) {
-            SqliteValue::Float(v) => assert!((v - 2.72_f64).abs() < f64::EPSILON),
+            SqliteValue::Real(v) => assert!((v - 2.72_f64).abs() < f64::EPSILON),
             other => panic!("expected Float, got {other:?}"),
         }
     }
@@ -6855,7 +6919,7 @@ mod tests {
     #[test]
     fn ingest_search_events_batch_rejects_zero_backpressure_threshold() {
         let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
-        seed_project_and_instance(storage.connection());
+        seed_project_and_instance(&storage.connection());
         let event = sample_search_event("event-zero-bp", 1);
         let err = storage.ingest_search_events_batch(&[event], 0).unwrap_err();
         assert!(
@@ -6896,8 +6960,8 @@ mod tests {
     // --- OPS_SCHEMA_VERSION constant ---
 
     #[test]
-    fn ops_schema_version_is_two() {
-        assert_eq!(OPS_SCHEMA_VERSION, 2);
+    fn ops_schema_version_is_one() {
+        assert_eq!(OPS_SCHEMA_VERSION, 1);
     }
 
     // ─── bd-3tjs tests end ───

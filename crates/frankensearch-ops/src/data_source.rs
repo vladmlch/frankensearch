@@ -2,8 +2,8 @@
 //!
 //! The [`DataSource`] trait decouples the TUI from the concrete data backend.
 //! Product screens read from a `DataSource`; the real implementation queries
-//! `FrankenSQLite` (wired in via bd-2yu.4.3), while [`MockDataSource`] provides
-//! test data for development and testing.
+//! the SQLite telemetry store (wired in via bd-2yu.4.3), while
+//! [`MockDataSource`] provides test data for development and testing.
 
 use std::collections::HashMap;
 use std::io;
@@ -18,10 +18,9 @@ use crate::state::{
     LifecycleSignal, LifecycleTrackerConfig, ProjectAttributionResolver, ProjectLifecycleTracker,
     ResourceMetrics, SearchMetrics,
 };
-use crate::storage::{ResourceTrendPoint, SearchSummarySnapshot, SummaryWindow};
+use crate::storage::{ResourceTrendPoint, SearchSummarySnapshot, SummaryWindow, query_values};
 use crate::{DiscoveredInstance, DiscoveryStatus, InstanceSighting, OpsStorage};
-use fsqlite::Row;
-use fsqlite_types::value::SqliteValue;
+use rusqlite::types::Value as SqliteValue;
 use tracing::warn;
 
 // ─── Time Window ─────────────────────────────────────────────────────────────
@@ -99,7 +98,7 @@ impl std::fmt::Display for TimeWindow {
 /// Synchronous interface for the render loop. Background async tasks
 /// populate the backing store; the `DataSource` provides read access.
 ///
-/// The real implementation queries `FrankenSQLite` (bd-2yu.4.3).
+/// The real implementation queries the SQLite telemetry store (bd-2yu.4.3).
 /// [`MockDataSource`] provides synthetic data for development.
 pub trait DataSource {
     /// Get the current fleet snapshot.
@@ -383,16 +382,15 @@ impl StorageDataSource {
     }
 
     fn load_instance_rows(&self) -> frankensearch_core::SearchResult<Vec<StorageInstanceRow>> {
-        let rows = self
-            .storage
-            .connection()
-            .query_sync(
-                "SELECT project_key, instance_id, host_name, pid, version, last_heartbeat_ms \
+        let rows = query_values(
+            &self.storage.connection(),
+            "SELECT project_key, instance_id, host_name, pid, version, last_heartbeat_ms \
          FROM instances \
          ORDER BY instance_id ASC;",
-            )
-            .map_err(data_source_error)?;
-        rows.iter().map(parse_instance_row).collect()
+            &[],
+        )
+        .map_err(data_source_error)?;
+        rows.iter().map(|row| parse_instance_row(row)).collect()
     }
 
     fn latest_resource_point(
@@ -401,20 +399,18 @@ impl StorageDataSource {
         instance_id: &str,
         now_ms: u64,
     ) -> frankensearch_core::SearchResult<Option<ResourceTrendPoint>> {
-        let rows = self
-            .storage
-            .connection()
-            .query_with_params_sync(
-                "SELECT cpu_pct, rss_bytes, io_read_bytes, io_write_bytes, queue_depth, ts_ms \
+        let rows = query_values(
+            &self.storage.connection(),
+            "SELECT cpu_pct, rss_bytes, io_read_bytes, io_write_bytes, queue_depth, ts_ms \
          FROM resource_samples \
          WHERE project_key = ?1 AND instance_id = ?2 \
          ORDER BY rowid DESC LIMIT 1;",
-                &[
-                    SqliteValue::Text(project_key.to_owned().into()),
-                    SqliteValue::Text(instance_id.to_owned().into()),
-                ],
-            )
-            .map_err(data_source_error)?;
+            &[
+                SqliteValue::Text(project_key.to_owned()),
+                SqliteValue::Text(instance_id.to_owned()),
+            ],
+        )
+        .map_err(data_source_error)?;
         let Some(row) = rows.first() else {
             return Ok(None);
         };
@@ -452,19 +448,17 @@ impl StorageDataSource {
         project_key: &str,
         instance_id: &str,
     ) -> frankensearch_core::SearchResult<Option<u64>> {
-        let rows = self
-            .storage
-            .connection()
-            .query_with_params_sync(
-                "SELECT record_count FROM index_inventory_snapshots \
+        let rows = query_values(
+            &self.storage.connection(),
+            "SELECT record_count FROM index_inventory_snapshots \
          WHERE project_key = ?1 AND instance_id = ?2 \
          ORDER BY ts_ms DESC LIMIT 1;",
-                &[
-                    SqliteValue::Text(project_key.to_owned().into()),
-                    SqliteValue::Text(instance_id.to_owned().into()),
-                ],
-            )
-            .map_err(data_source_error)?;
+            &[
+                SqliteValue::Text(project_key.to_owned()),
+                SqliteValue::Text(instance_id.to_owned()),
+            ],
+        )
+        .map_err(data_source_error)?;
         let Some(row) = rows.first() else {
             return Ok(None);
         };
@@ -628,7 +622,7 @@ fn storage_file_size_bytes(path: &Path) -> u64 {
         .sum()
 }
 
-fn parse_instance_row(row: &Row) -> frankensearch_core::SearchResult<StorageInstanceRow> {
+fn parse_instance_row(row: &[SqliteValue]) -> frankensearch_core::SearchResult<StorageInstanceRow> {
     let project_key = row_text(row, 0, "instances.project_key")?.to_owned();
     let instance_id = row_text(row, 1, "instances.instance_id")?.to_owned();
     let host_name = row_opt_text(row, 2, "instances.host_name")?.map(ToOwned::to_owned);
@@ -668,7 +662,11 @@ fn data_source_error(error: impl std::fmt::Display) -> frankensearch_core::Searc
     }
 }
 
-fn row_i64(row: &Row, index: usize, field: &str) -> frankensearch_core::SearchResult<i64> {
+fn row_i64(
+    row: &[SqliteValue],
+    index: usize,
+    field: &str,
+) -> frankensearch_core::SearchResult<i64> {
     match row.get(index) {
         Some(SqliteValue::Integer(value)) => Ok(*value),
         Some(other) => Err(frankensearch_core::SearchError::SubsystemError {
@@ -685,7 +683,7 @@ fn row_i64(row: &Row, index: usize, field: &str) -> frankensearch_core::SearchRe
 }
 
 fn row_opt_i64(
-    row: &Row,
+    row: &[SqliteValue],
     index: usize,
     field: &str,
 ) -> frankensearch_core::SearchResult<Option<i64>> {
@@ -702,12 +700,12 @@ fn row_opt_i64(
 }
 
 fn row_opt_f64(
-    row: &Row,
+    row: &[SqliteValue],
     index: usize,
     field: &str,
 ) -> frankensearch_core::SearchResult<Option<f64>> {
     match row.get(index) {
-        Some(SqliteValue::Float(value)) => Ok(Some(*value)),
+        Some(SqliteValue::Real(value)) => Ok(Some(*value)),
         Some(SqliteValue::Integer(value)) => i64_to_f64_exact(*value, field).map(Some),
         Some(SqliteValue::Null) | None => Ok(None),
         Some(other) => Err(frankensearch_core::SearchError::SubsystemError {
@@ -720,7 +718,7 @@ fn row_opt_f64(
 }
 
 fn row_text<'a>(
-    row: &'a Row,
+    row: &'a [SqliteValue],
     index: usize,
     field: &str,
 ) -> frankensearch_core::SearchResult<&'a str> {
@@ -740,7 +738,7 @@ fn row_text<'a>(
 }
 
 fn row_opt_text<'a>(
-    row: &'a Row,
+    row: &'a [SqliteValue],
     index: usize,
     field: &str,
 ) -> frankensearch_core::SearchResult<Option<&'a str>> {
@@ -800,7 +798,7 @@ fn unix_timestamp_ms_u64() -> frankensearch_core::SearchResult<u64> {
 /// Mock data source for development and testing.
 ///
 /// Provides synthetic fleet data so the TUI can be developed and tested
-/// independently of the real `FrankenSQLite` backend.
+/// independently of the real SQLite backend.
 pub struct MockDataSource {
     snapshot: FleetSnapshot,
     control_plane: ControlPlaneMetrics,
@@ -1239,7 +1237,7 @@ mod tests {
         let now_ms = i64::try_from(unix_timestamp_ms_u64().expect("now ms")).expect("i64 now");
         storage
             .connection()
-            .execute_sync(
+            .execute_batch(
                 "INSERT INTO projects(project_key, display_name, created_at_ms, updated_at_ms) \
          VALUES ('proj-a', 'proj-a', 1, 1);",
             )
@@ -1248,7 +1246,7 @@ mod tests {
         let summary_start_ms = now_ms.saturating_sub(3_600_000);
         storage
             .connection()
-            .execute_sync(&format!(
+            .execute_batch(&format!(
                 "INSERT INTO instances(\
                 instance_id, project_key, host_name, pid, version, first_seen_ms, \
                 last_heartbeat_ms, state\
@@ -1259,7 +1257,7 @@ mod tests {
             .expect("insert instance");
         storage
             .connection()
-            .execute_sync(&format!(
+            .execute_batch(&format!(
                 "INSERT INTO search_summaries(\
                 project_key, instance_id, window, window_start_ms, search_count, \
                 p50_latency_us, p95_latency_us, p99_latency_us, avg_result_count\
@@ -1270,7 +1268,7 @@ mod tests {
             .expect("insert summary");
         storage
             .connection()
-            .execute_sync(&format!(
+            .execute_batch(&format!(
                 "INSERT INTO resource_samples(\
                 project_key, instance_id, cpu_pct, rss_bytes, io_read_bytes, io_write_bytes, \
                 queue_depth, ts_ms\
@@ -1281,7 +1279,7 @@ mod tests {
             .expect("insert resource sample");
         storage
             .connection()
-            .execute_sync(&format!(
+            .execute_batch(&format!(
                 "INSERT INTO index_inventory_snapshots(\
                 snapshot_id, project_key, instance_id, index_name, index_type, record_count, \
                 file_size_bytes, file_hash, is_stale, ts_ms\
@@ -1319,7 +1317,7 @@ mod tests {
         let now_ms = i64::try_from(unix_timestamp_ms_u64().expect("now ms")).expect("i64 now");
         storage
             .connection()
-            .execute_sync(
+            .execute_batch(
                 "INSERT INTO projects(project_key, display_name, created_at_ms, updated_at_ms) \
          VALUES ('proj-stale', 'proj-stale', 1, 1);",
             )
@@ -1328,7 +1326,7 @@ mod tests {
         let last_heartbeat_ms = now_ms.saturating_sub(90_000);
         storage
             .connection()
-            .execute_sync(&format!(
+            .execute_batch(&format!(
                 "INSERT INTO instances(\
                 instance_id, project_key, host_name, pid, version, first_seen_ms, \
                 last_heartbeat_ms, state\

@@ -53,7 +53,7 @@ tantivy-oracle = [
 # rev, duplicating every family package in the consumer's Cargo.lock.
 frankensearch-core = "0.4.0"
 frankensearch-index = "0.4.0"
-frankensearch-durability = { version = "0.4.0", optional = true, default-features = false }
+frankensearch-durability = { workspace = true, optional = true }
 frankensearch-lexical = { version = "0.4.0", optional = true, features = ["bench-internals"] }
 asupersync = { workspace = true }
 arc-swap = { workspace = true }

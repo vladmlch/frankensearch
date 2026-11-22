@@ -78,13 +78,10 @@ harness = false
 [dependencies]
 frankensearch-core = { workspace = true }
 frankensearch-tui = { workspace = true }
-# FrankenSQLite 0.3 removed the old caller-thread `Connection` facade. The ops
-# telemetry store keeps its documented synchronous API by using
-# `AsyncConnection`'s native dedicated-worker `*_sync` entry points; no private
-# executor or compatibility wrapper is involved. `async-api` is not a default
-# feature.
-fsqlite = { version = "0.4.7", features = ["async-api"] }
-fsqlite-types = "0.4.7"
+# Native C SQLite via rusqlite (bundled). The ops telemetry store uses a
+# mutex-protected `rusqlite::Connection`; the schema is a clean v1 baseline
+# stamped via `PRAGMA user_version` inside `BEGIN IMMEDIATE` before WAL.
+rusqlite = { workspace = true }
 
 # Terminal UI rendering (FrankenTUI)
 ftui-core = { workspace = true }

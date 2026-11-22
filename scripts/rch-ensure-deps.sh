@@ -4,7 +4,7 @@
 # When rch syncs frankensearch to a remote worker via rsync, it only syncs
 # the project directory itself. The workspace Cargo.toml references the sibling
 # `fast_cmaes` checkout, which does not exist on workers by default. Asupersync,
-# FrankenSQLite, and FrankenTUI are package dependencies and must be resolved
+# rusqlite, and FrankenTUI are package dependencies and must be resolved
 # by Cargo rather than shadowed by unrelated sibling clones.
 #
 # In worker mode this also warms cargo's SHARED caches (crates.io index + the

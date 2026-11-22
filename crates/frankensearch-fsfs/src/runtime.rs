@@ -247,7 +247,7 @@ pub struct IndexStoragePaths {
     pub vector_index_roots: Vec<PathBuf>,
     /// Lexical-index roots (segments and metadata).
     pub lexical_index_roots: Vec<PathBuf>,
-    /// Catalog/database files (`FrankenSQLite` and sidecars).
+    /// Catalog/database files (SQLite and sidecars).
     pub catalog_files: Vec<PathBuf>,
     /// Embedding cache roots.
     pub embedding_cache_roots: Vec<PathBuf>,
@@ -27979,8 +27979,7 @@ mod tests {
         QuillConfig, QuillIndex, QuillSearchIndex, SegmentStatsProvider, publish_current,
         resolve_current,
     };
-    use fsqlite::AsyncConnection as Connection;
-    use fsqlite_types::value::SqliteValue;
+    use rusqlite::Connection;
 
     #[cfg(unix)]
     use super::FSFS_DAEMON_REQUEST_MAX_BYTES;
@@ -36109,8 +36108,8 @@ mod tests {
     fn runtime_cleanup_catalog_tombstones_prunes_old_rows() {
         let temp = tempfile::tempdir().expect("tempdir");
         let db_path = temp.path().join("fsfs.db");
-        let conn = Connection::open_sync(db_path.display().to_string()).expect("open sqlite");
-        bootstrap_catalog_schema(&conn).expect("bootstrap catalog schema");
+        let mut conn = Connection::open(&db_path).expect("open sqlite");
+        bootstrap_catalog_schema(&mut conn).expect("bootstrap catalog schema");
 
         let now_ms = 1_710_000_000_000_u64;
         let retention_days = 7_u16;
@@ -36119,47 +36118,45 @@ mod tests {
             i64::try_from(now_ms.saturating_sub(retention_ms).saturating_sub(1_000)).unwrap();
         let fresh_deleted_ts = i64::try_from(now_ms.saturating_sub(retention_ms / 2)).unwrap();
 
-        let old_row = [
-            SqliteValue::Text("home:/tmp/old.txt".to_owned().into()),
-            SqliteValue::Text("home".to_owned().into()),
-            SqliteValue::Text("/tmp/old.txt".to_owned().into()),
-            SqliteValue::Blob(vec![1_u8; 32].into()),
-            SqliteValue::Integer(1),
-            SqliteValue::Text("full_semantic_lexical".to_owned().into()),
-            SqliteValue::Text("tombstoned".to_owned().into()),
-            SqliteValue::Integer(1),
-            SqliteValue::Integer(old_deleted_ts - 500),
-            SqliteValue::Integer(old_deleted_ts),
-            SqliteValue::Integer(old_deleted_ts),
-            SqliteValue::Integer(old_deleted_ts),
-        ];
-        conn.execute_with_params_sync(
+        conn.execute(
             "INSERT INTO fsfs_catalog_files \
              (file_key, mount_id, canonical_path, content_hash, revision, ingestion_class, pipeline_status, eligible, first_seen_ts, last_seen_ts, updated_ts, deleted_ts) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12);",
-            &old_row,
+            rusqlite::params![
+                "home:/tmp/old.txt",
+                "home",
+                "/tmp/old.txt",
+                vec![1_u8; 32],
+                1_i64,
+                "full_semantic_lexical",
+                "tombstoned",
+                1_i64,
+                old_deleted_ts - 500,
+                old_deleted_ts,
+                old_deleted_ts,
+                old_deleted_ts,
+            ],
         )
         .expect("insert old tombstone row");
 
-        let fresh_row = [
-            SqliteValue::Text("home:/tmp/fresh.txt".to_owned().into()),
-            SqliteValue::Text("home".to_owned().into()),
-            SqliteValue::Text("/tmp/fresh.txt".to_owned().into()),
-            SqliteValue::Blob(vec![2_u8; 32].into()),
-            SqliteValue::Integer(1),
-            SqliteValue::Text("full_semantic_lexical".to_owned().into()),
-            SqliteValue::Text("tombstoned".to_owned().into()),
-            SqliteValue::Integer(1),
-            SqliteValue::Integer(fresh_deleted_ts - 500),
-            SqliteValue::Integer(fresh_deleted_ts),
-            SqliteValue::Integer(fresh_deleted_ts),
-            SqliteValue::Integer(fresh_deleted_ts),
-        ];
-        conn.execute_with_params_sync(
+        conn.execute(
             "INSERT INTO fsfs_catalog_files \
              (file_key, mount_id, canonical_path, content_hash, revision, ingestion_class, pipeline_status, eligible, first_seen_ts, last_seen_ts, updated_ts, deleted_ts) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12);",
-            &fresh_row,
+            rusqlite::params![
+                "home:/tmp/fresh.txt",
+                "home",
+                "/tmp/fresh.txt",
+                vec![2_u8; 32],
+                1_i64,
+                "full_semantic_lexical",
+                "tombstoned",
+                1_i64,
+                fresh_deleted_ts - 500,
+                fresh_deleted_ts,
+                fresh_deleted_ts,
+                fresh_deleted_ts,
+            ],
         )
         .expect("insert fresh tombstone row");
 
@@ -36176,19 +36173,19 @@ mod tests {
             i64::try_from(now_ms.saturating_sub(retention_ms)).unwrap()
         );
 
-        // Reopen connection for verification — original `conn` holds a stale
-        // MVCC snapshot that predates the DELETE from `cleanup_catalog_tombstones`.
+        // Reopen connection for verification — `cleanup_catalog_tombstones`
+        // ran its DELETE through a separate connection.
         drop(conn);
-        let conn2 =
-            Connection::open_sync(db_path.display().to_string()).expect("reopen for verification");
-        let remaining = conn2
-            .query_sync("SELECT file_key FROM fsfs_catalog_files ORDER BY file_key;")
-            .expect("remaining rows query");
-        assert_eq!(remaining.len(), 1);
-        assert_eq!(
-            remaining[0].get(0),
-            Some(&SqliteValue::Text("home:/tmp/fresh.txt".to_owned().into()))
-        );
+        let conn2 = Connection::open(&db_path).expect("reopen for verification");
+        let mut statement = conn2
+            .prepare("SELECT file_key FROM fsfs_catalog_files ORDER BY file_key;")
+            .expect("prepare remaining rows query");
+        let remaining = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .expect("remaining rows query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect remaining rows");
+        assert_eq!(remaining, ["home:/tmp/fresh.txt"]);
     }
 
     #[test]
@@ -37574,9 +37571,10 @@ mod tests {
             context
                 .storage
                 .connection()
-                .execute_with_params_sync(
+                .expect("storage connection")
+                .execute(
                     "UPDATE embedding_jobs SET started_at = 0 WHERE job_id = ?1;",
-                    &[SqliteValue::Integer(claims[0].job_id)],
+                    rusqlite::params![claims[0].job_id],
                 )
                 .unwrap();
             pipeline

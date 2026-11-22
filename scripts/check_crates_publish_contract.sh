@@ -13,12 +13,14 @@ SOURCE_SHA_OVERRIDE=""
 ALLOW_DIRTY=false
 SCHEMA_VERSION="frankensearch-crates-publish-plan-v1"
 CENSUS_SCHEMA_VERSION="frankensearch-crates-registry-census-v1"
-# Audited dependency universe (bd-rnb6l). Both families come from crates.io
+# Audited dependency universe (bd-rnb6l). Both identities come from crates.io
 # only; bump these literals deliberately, together with the lockfile, the
 # fresh-process contract pin in frankensearch-embed, and docs/planning/UPGRADE_LOG.md.
 AUDITED_ASUPERSYNC_VERSION="0.5.0"
-AUDITED_FSQLITE_FAMILY_VERSION="0.4.7"
-AUDITED_FSQLITE_PAGER_VERSION="0.4.7"
+AUDITED_RUSQLITE_VERSION="0.40.2"
+# The bundled SQLite engine travels inside libsqlite3-sys; it is qualified
+# independently of the rusqlite facade version, so it keeps its own pin.
+AUDITED_LIBSQLITE3_SYS_VERSION="0.38.2"
 USER_AGENT="frankensearch-publish-contract/1.0 (https://github.com/Dicklesworthstone/frankensearch)"
 
 usage() {
@@ -209,12 +211,12 @@ run_source_cleanliness_self_test() {
 }
 
 # Positive dependency-universe lockfile: one registry Asupersync identity plus
-# a four-member fsqlite family, including the independently qualified pager.
+# the rusqlite pair (facade plus independently qualified libsqlite3-sys).
 write_registry_universe_lock() {
   local fixture_asupersync="${2:-$AUDITED_ASUPERSYNC_VERSION}"
-  local fixture_fsqlite="${3:-$AUDITED_FSQLITE_FAMILY_VERSION}"
-  local fixture_pager="${4:-$AUDITED_FSQLITE_PAGER_VERSION}"
-  local fixture_pager_source="${5:-registry+https://github.com/rust-lang/crates.io-index}"
+  local fixture_rusqlite="${3:-$AUDITED_RUSQLITE_VERSION}"
+  local fixture_sys="${4:-$AUDITED_LIBSQLITE3_SYS_VERSION}"
+  local fixture_sys_source="${5:-registry+https://github.com/rust-lang/crates.io-index}"
   printf '%s\n' \
     'version = 4' \
     '' \
@@ -224,31 +226,21 @@ write_registry_universe_lock() {
     'source = "registry+https://github.com/rust-lang/crates.io-index"' \
     '' \
     '[[package]]' \
-    'name = "fsqlite"' \
-    "version = \"${fixture_fsqlite}\"" \
-    'source = "registry+https://github.com/rust-lang/crates.io-index"' \
+    'name = "libsqlite3-sys"' \
+    "version = \"${fixture_sys}\"" \
+    "source = \"${fixture_sys_source}\"" \
     '' \
     '[[package]]' \
-    'name = "fsqlite-core"' \
-    "version = \"${fixture_fsqlite}\"" \
-    'source = "registry+https://github.com/rust-lang/crates.io-index"' \
-    '' \
-    '[[package]]' \
-    'name = "fsqlite-types"' \
-    "version = \"${fixture_fsqlite}\"" \
-    'source = "registry+https://github.com/rust-lang/crates.io-index"' \
-    '' \
-    '[[package]]' \
-    'name = "fsqlite-pager"' \
-    "version = \"${fixture_pager}\"" \
-    "source = \"${fixture_pager_source}\"" >"$1"
+    'name = "rusqlite"' \
+    "version = \"${fixture_rusqlite}\"" \
+    'source = "registry+https://github.com/rust-lang/crates.io-index"' >"$1"
 }
 
 run_self_test() {
   local temp_dir metadata_path census_path positive_receipt negative_metadata negative_census
   local negative_receipt negative_lock_receipt duplicate_asupersync_receipt unexpected_patch_receipt
   local alias_patch_receipt path_patch_receipt foreign_patch_receipt renamed_patch_receipt
-  local wrong_asupersync_source_receipt invalid_fsqlite_source_receipt mixed_family_receipt
+  local wrong_asupersync_source_receipt invalid_rusqlite_source_receipt fsqlite_present_receipt
   local script_path source_root source_sha
   temp_dir="$(mktemp -d /tmp/frankensearch-publish-contract-self-test.XXXXXX)"
   metadata_path="${temp_dir}/metadata-positive.json"
@@ -259,14 +251,15 @@ run_self_test() {
   negative_receipt="${temp_dir}/receipt-negative.json"
   negative_lock_receipt="${temp_dir}/receipt-lock-negative.json"
   duplicate_asupersync_receipt="${temp_dir}/receipt-asupersync-duplicate.json"
-  unexpected_patch_receipt="${temp_dir}/receipt-fsqlite-patch-git.json"
-  alias_patch_receipt="${temp_dir}/receipt-fsqlite-patch-alias.json"
-  path_patch_receipt="${temp_dir}/receipt-fsqlite-patch-path.json"
+  unexpected_patch_receipt="${temp_dir}/receipt-rusqlite-patch-git.json"
+  alias_patch_receipt="${temp_dir}/receipt-rusqlite-patch-alias.json"
+  path_patch_receipt="${temp_dir}/receipt-rusqlite-patch-path.json"
+  fsqlite_patch_receipt="${temp_dir}/receipt-fsqlite-patch.json"
   foreign_patch_receipt="${temp_dir}/receipt-foreign-patch-admitted.json"
-  renamed_patch_receipt="${temp_dir}/receipt-fsqlite-patch-renamed.json"
+  renamed_patch_receipt="${temp_dir}/receipt-rusqlite-patch-renamed.json"
   wrong_asupersync_source_receipt="${temp_dir}/receipt-asupersync-source-invalid.json"
-  invalid_fsqlite_source_receipt="${temp_dir}/receipt-fsqlite-source-invalid.json"
-  mixed_family_receipt="${temp_dir}/receipt-fsqlite-mixed-family.json"
+  invalid_rusqlite_source_receipt="${temp_dir}/receipt-rusqlite-source-invalid.json"
+  fsqlite_present_receipt="${temp_dir}/receipt-fsqlite-present.json"
   script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
   source_root="${temp_dir}/source-cleanliness-repo"
   source_sha="1111111111111111111111111111111111111111"
@@ -276,7 +269,7 @@ run_self_test() {
   script_path="${source_root}/scripts/check_crates_publish_contract.sh"
   printf '*.ignored\n' >"${source_root}/.gitignore"
   # Registry universe: no [patch] block at all, one Asupersync identity and
-  # a whole fsqlite family at the audited versions.
+  # the rusqlite pair at the audited versions.
   printf '%s\n' \
     '[workspace]' \
     'members = []' >"${source_root}/Cargo.toml"
@@ -484,12 +477,12 @@ run_self_test() {
     "$script_path"
 
 
-  # ── Rule 2: any fsqlite* patch is forbidden, however it is spelled ──────
+  # ── Rule 2: any rusqlite*/fsqlite* patch is forbidden, however spelled ──
 
   # git patch under the plain crate name
   printf '%s\n' \
     '[patch.crates-io]' \
-    'fsqlite = { git = "https://github.com/Dicklesworthstone/frankensqlite", rev = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }' >>"${source_root}/Cargo.toml"
+    'rusqlite = { git = "https://example.invalid/rusqlite", rev = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }' >>"${source_root}/Cargo.toml"
 
   if bash "$script_path" \
     --mode gate \
@@ -500,21 +493,21 @@ run_self_test() {
     --source-sha "$source_sha" \
     --allow-dirty \
     --output "$unexpected_patch_receipt"; then
-    echo "ERROR: git-patched FrankenSQLite self-test unexpectedly passed" >&2
+    echo "ERROR: git-patched rusqlite self-test unexpectedly passed" >&2
     return 1
   fi
 
   jq -e '
-    .blocker_codes == ["FRANKENSQLITE_PATCH_FORBIDDEN"]
+    .blocker_codes == ["RUSQLITE_PATCH_FORBIDDEN"]
   ' "$unexpected_patch_receipt" >/dev/null
 
-  # alias whose `package` rename points at an fsqlite crate
+  # alias whose `package` rename points at the rusqlite engine crate
   printf '%s\n' \
     '[workspace]' \
     'members = []' \
     '' \
     '[patch.crates-io]' \
-    'engine-alias = { package = "fsqlite-core", git = "https://example.invalid/evil", rev = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" }' >"${source_root}/Cargo.toml"
+    'engine-alias = { package = "libsqlite3-sys", git = "https://example.invalid/evil", rev = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" }' >"${source_root}/Cargo.toml"
 
   if bash "$script_path" \
     --mode gate \
@@ -525,22 +518,22 @@ run_self_test() {
     --source-sha "$source_sha" \
     --allow-dirty \
     --output "$renamed_patch_receipt"; then
-    echo "ERROR: renamed-package FrankenSQLite patch self-test unexpectedly passed" >&2
+    echo "ERROR: renamed-package rusqlite patch self-test unexpectedly passed" >&2
     return 1
   fi
 
   jq -e '
-    .blocker_codes == ["FRANKENSQLITE_PATCH_FORBIDDEN"]
+    .blocker_codes == ["RUSQLITE_PATCH_FORBIDDEN"]
     and (.blockers[0].message | contains("crates-io:engine-alias"))
   ' "$renamed_patch_receipt" >/dev/null
 
-  # fsqlite-prefixed alias whose package is something else entirely
+  # rusqlite-prefixed alias whose package is something else entirely
   printf '%s\n' \
     '[workspace]' \
     'members = []' \
     '' \
     '[patch.crates-io]' \
-    'fsqlite-lookalike = { package = "not-fsqlite", path = "../not-fsqlite" }' >"${source_root}/Cargo.toml"
+    'rusqlite-lookalike = { package = "not-rusqlite", path = "../not-rusqlite" }' >"${source_root}/Cargo.toml"
 
   if bash "$script_path" \
     --mode gate \
@@ -551,12 +544,12 @@ run_self_test() {
     --source-sha "$source_sha" \
     --allow-dirty \
     --output "$alias_patch_receipt"; then
-    echo "ERROR: fsqlite-prefixed alias patch self-test unexpectedly passed" >&2
+    echo "ERROR: rusqlite-prefixed alias patch self-test unexpectedly passed" >&2
     return 1
   fi
 
   jq -e '
-    .blocker_codes == ["FRANKENSQLITE_PATCH_FORBIDDEN"]
+    .blocker_codes == ["RUSQLITE_PATCH_FORBIDDEN"]
   ' "$alias_patch_receipt" >/dev/null
 
   # path patch under a non-crates.io registry key
@@ -565,7 +558,7 @@ run_self_test() {
     'members = []' \
     '' \
     '[patch."https://github.com/example/registry"]' \
-    'fsqlite-types = { path = "../frankensqlite/crates/fsqlite-types" }' >"${source_root}/Cargo.toml"
+    'rusqlite = { path = "../vendor/rusqlite" }' >"${source_root}/Cargo.toml"
 
   if bash "$script_path" \
     --mode gate \
@@ -576,13 +569,39 @@ run_self_test() {
     --source-sha "$source_sha" \
     --allow-dirty \
     --output "$path_patch_receipt"; then
-    echo "ERROR: path-patched FrankenSQLite self-test unexpectedly passed" >&2
+    echo "ERROR: path-patched rusqlite self-test unexpectedly passed" >&2
     return 1
   fi
 
   jq -e '
-    .blocker_codes == ["FRANKENSQLITE_PATCH_FORBIDDEN"]
+    .blocker_codes == ["RUSQLITE_PATCH_FORBIDDEN"]
   ' "$path_patch_receipt" >/dev/null
+
+  # retired fsqlite engine reintroduced through a manifest patch
+  printf '%s\n' \
+    '[workspace]' \
+    'members = []' \
+    '' \
+    '[patch.crates-io]' \
+    'fsqlite = { git = "https://example.invalid/fsqlite", rev = "dddddddddddddddddddddddddddddddddddddddd" }' >"${source_root}/Cargo.toml"
+
+  if bash "$script_path" \
+    --mode gate \
+    --scope facade \
+    --metadata "$metadata_path" \
+    --registry-census "$census_path" \
+    --release-tag "crates-v0.4.0" \
+    --source-sha "$source_sha" \
+    --allow-dirty \
+    --output "$fsqlite_patch_receipt"; then
+    echo "ERROR: fsqlite patch self-test unexpectedly passed" >&2
+    return 1
+  fi
+
+  jq -e '
+    .blocker_codes == ["RUSQLITE_PATCH_FORBIDDEN"]
+    and (.blockers[0].message | contains("crates-io:fsqlite"))
+  ' "$fsqlite_patch_receipt" >/dev/null
 
   # positive control: a patch on an unrelated crate is not this rule's business
   printf '%s\n' \
@@ -617,26 +636,26 @@ run_self_test() {
   # The immediately preceding audited versions remain invalid for this
   # candidate, even with coherent registry sources and no duplicate packages.
   local prior_family prior_receipt prior_code
-  for prior_family in asupersync fsqlite family-previous family-0.4.4 pager-old pager-previous pager-unreviewed; do
+  for prior_family in asupersync rusqlite rusqlite-previous rusqlite-unreviewed sys-previous sys-old sys-unreviewed; do
     prior_receipt="${temp_dir}/receipt-prior-${prior_family}.json"
     if [[ "$prior_family" == "asupersync" ]]; then
       write_registry_universe_lock "${source_root}/Cargo.lock" "0.4.10"
       prior_code="DEPENDENCY_UNIVERSE_ASUPERSYNC_LOCK_IDENTITY_INVALID"
-    elif [[ "$prior_family" == "family-previous" ]]; then
-      write_registry_universe_lock "${source_root}/Cargo.lock" "$AUDITED_ASUPERSYNC_VERSION" "0.4.0" "0.4.3"
-      prior_code="DEPENDENCY_UNIVERSE_FSQLITE_LOCK_SOURCE_INVALID"
-    elif [[ "$prior_family" == "family-0.4.4" ]]; then
-      write_registry_universe_lock "${source_root}/Cargo.lock" "$AUDITED_ASUPERSYNC_VERSION" "0.4.4" "0.4.4"
-      prior_code="DEPENDENCY_UNIVERSE_FSQLITE_LOCK_SOURCE_INVALID"
-    elif [[ "$prior_family" == pager-* ]]; then
-      local rejected_pager="0.4.0"
-      [[ "$prior_family" != "pager-previous" ]] || rejected_pager="0.4.3"
-      [[ "$prior_family" != "pager-unreviewed" ]] || rejected_pager="0.4.8"
-      write_registry_universe_lock "${source_root}/Cargo.lock" "$AUDITED_ASUPERSYNC_VERSION" "$AUDITED_FSQLITE_FAMILY_VERSION" "$rejected_pager"
-      prior_code="DEPENDENCY_UNIVERSE_FSQLITE_LOCK_SOURCE_INVALID"
+    elif [[ "$prior_family" == "rusqlite-previous" ]]; then
+      write_registry_universe_lock "${source_root}/Cargo.lock" "$AUDITED_ASUPERSYNC_VERSION" "0.40.1"
+      prior_code="DEPENDENCY_UNIVERSE_RUSQLITE_LOCK_SOURCE_INVALID"
+    elif [[ "$prior_family" == "rusqlite-unreviewed" ]]; then
+      write_registry_universe_lock "${source_root}/Cargo.lock" "$AUDITED_ASUPERSYNC_VERSION" "0.40.3"
+      prior_code="DEPENDENCY_UNIVERSE_RUSQLITE_LOCK_SOURCE_INVALID"
+    elif [[ "$prior_family" == sys-* ]]; then
+      local rejected_sys="0.38.0"
+      [[ "$prior_family" != "sys-previous" ]] || rejected_sys="0.38.1"
+      [[ "$prior_family" != "sys-unreviewed" ]] || rejected_sys="0.38.3"
+      write_registry_universe_lock "${source_root}/Cargo.lock" "$AUDITED_ASUPERSYNC_VERSION" "$AUDITED_RUSQLITE_VERSION" "$rejected_sys"
+      prior_code="DEPENDENCY_UNIVERSE_RUSQLITE_LOCK_SOURCE_INVALID"
     else
-      write_registry_universe_lock "${source_root}/Cargo.lock" "$AUDITED_ASUPERSYNC_VERSION" "0.3.18"
-      prior_code="DEPENDENCY_UNIVERSE_FSQLITE_LOCK_SOURCE_INVALID"
+      write_registry_universe_lock "${source_root}/Cargo.lock" "$AUDITED_ASUPERSYNC_VERSION" "0.39.0"
+      prior_code="DEPENDENCY_UNIVERSE_RUSQLITE_LOCK_SOURCE_INVALID"
     fi
     if bash "$script_path" \
       --mode gate --scope facade --metadata "$metadata_path" \
@@ -660,8 +679,13 @@ run_self_test() {
     'source = "registry+https://example.invalid/index"' \
     '' \
     '[[package]]' \
-    'name = "fsqlite"' \
-    "version = \"${AUDITED_FSQLITE_FAMILY_VERSION}\"" \
+    'name = "rusqlite"' \
+    "version = \"${AUDITED_RUSQLITE_VERSION}\"" \
+    'source = "registry+https://github.com/rust-lang/crates.io-index"' \
+    '' \
+    '[[package]]' \
+    'name = "libsqlite3-sys"' \
+    "version = \"${AUDITED_LIBSQLITE3_SYS_VERSION}\"" \
     'source = "registry+https://github.com/rust-lang/crates.io-index"' >"${source_root}/Cargo.lock"
 
   if bash "$script_path" \
@@ -707,11 +731,11 @@ run_self_test() {
     .blocker_codes == ["DEPENDENCY_UNIVERSE_ASUPERSYNC_LOCK_IDENTITY_INVALID"]
   ' "$duplicate_asupersync_receipt" >/dev/null
 
-  # ── Rule 3: fsqlite family source and coherence ─────────────────────────
+  # ── Rule 3: rusqlite pair source/coherence; fsqlite* is forbidden ──────
 
-  # one member sourced from git
-  write_registry_universe_lock "${source_root}/Cargo.lock" "$AUDITED_ASUPERSYNC_VERSION" "$AUDITED_FSQLITE_FAMILY_VERSION" "$AUDITED_FSQLITE_PAGER_VERSION" \
-    'git+https://github.com/Dicklesworthstone/frankensqlite?rev=0000000000000000000000000000000000000000#0000000000000000000000000000000000000000'
+  # the engine crate sourced from git
+  write_registry_universe_lock "${source_root}/Cargo.lock" "$AUDITED_ASUPERSYNC_VERSION" "$AUDITED_RUSQLITE_VERSION" "$AUDITED_LIBSQLITE3_SYS_VERSION" \
+    'git+https://example.invalid/libsqlite3-sys?rev=0000000000000000000000000000000000000000#0000000000000000000000000000000000000000'
 
   if bash "$script_path" \
     --mode gate \
@@ -721,23 +745,24 @@ run_self_test() {
     --release-tag "crates-v0.4.0" \
     --source-sha "$source_sha" \
     --allow-dirty \
-    --output "$invalid_fsqlite_source_receipt"; then
-    echo "ERROR: git-sourced FrankenSQLite member self-test unexpectedly passed" >&2
+    --output "$invalid_rusqlite_source_receipt"; then
+    echo "ERROR: git-sourced libsqlite3-sys self-test unexpectedly passed" >&2
     return 1
   fi
 
   jq -e '
-    .blocker_codes == ["DEPENDENCY_UNIVERSE_FSQLITE_LOCK_SOURCE_INVALID"]
-    and (.blockers[0].message | contains("fsqlite-pager@"))
-  ' "$invalid_fsqlite_source_receipt" >/dev/null
+    .blocker_codes == ["DEPENDENCY_UNIVERSE_RUSQLITE_LOCK_SOURCE_INVALID"]
+    and (.blockers[0].message | contains("libsqlite3-sys@"))
+  ' "$invalid_rusqlite_source_receipt" >/dev/null
 
-  # mixed family: every member from the registry, one left on an older version
+  # a leftover fsqlite* package is itself an invalid lockfile entry, even
+  # when it carries a coherent registry source and an audited-era version
   write_registry_universe_lock "${source_root}/Cargo.lock"
   printf '%s\n' \
     '' \
     '[[package]]' \
-    'name = "fsqlite-wal"' \
-    'version = "0.4.3"' \
+    'name = "fsqlite"' \
+    'version = "0.4.7"' \
     'source = "registry+https://github.com/rust-lang/crates.io-index"' >>"${source_root}/Cargo.lock"
 
   if bash "$script_path" \
@@ -748,17 +773,17 @@ run_self_test() {
     --release-tag "crates-v0.4.0" \
     --source-sha "$source_sha" \
     --allow-dirty \
-    --output "$mixed_family_receipt"; then
-    echo "ERROR: mixed FrankenSQLite family self-test unexpectedly passed" >&2
+    --output "$fsqlite_present_receipt"; then
+    echo "ERROR: leftover FrankenSQLite lockfile entry self-test unexpectedly passed" >&2
     return 1
   fi
 
   jq -e '
-    .blocker_codes == ["DEPENDENCY_UNIVERSE_FSQLITE_LOCK_SOURCE_INVALID"]
-    and (.blockers[0].message | contains("fsqlite-wal@0.4.3"))
-  ' "$mixed_family_receipt" >/dev/null
+    .blocker_codes == ["DEPENDENCY_UNIVERSE_RUSQLITE_LOCK_SOURCE_INVALID"]
+    and (.blockers[0].message | contains("fsqlite@0.4.7"))
+  ' "$fsqlite_present_receipt" >/dev/null
 
-  # both rules at once: stale Asupersync plus a git-sourced family
+  # both rules at once: stale Asupersync plus a git-sourced rusqlite
   printf '%s\n' \
     'version = 4' \
     '' \
@@ -768,9 +793,9 @@ run_self_test() {
     'source = "registry+https://github.com/rust-lang/crates.io-index"' \
     '' \
     '[[package]]' \
-    'name = "fsqlite"' \
-    'version = "0.3.0"' \
-    'source = "git+https://github.com/Dicklesworthstone/frankensqlite?rev=4d09168fff2fdf5d7f8ede1607db5e040bca724b#4d09168fff2fdf5d7f8ede1607db5e040bca724b"' >"${source_root}/Cargo.lock"
+    'name = "rusqlite"' \
+    'version = "0.40.2"' \
+    'source = "git+https://example.invalid/rusqlite?rev=4d09168fff2fdf5d7f8ede1607db5e040bca724b#4d09168fff2fdf5d7f8ede1607db5e040bca724b"' >"${source_root}/Cargo.lock"
 
   if bash "$script_path" \
     --mode gate \
@@ -787,7 +812,7 @@ run_self_test() {
 
   jq -e '
     ([.blockers[].code] | index("DEPENDENCY_UNIVERSE_ASUPERSYNC_LOCK_IDENTITY_INVALID")) != null
-    and ([.blockers[].code] | index("DEPENDENCY_UNIVERSE_FSQLITE_LOCK_SOURCE_INVALID")) != null
+    and ([.blockers[].code] | index("DEPENDENCY_UNIVERSE_RUSQLITE_LOCK_SOURCE_INVALID")) != null
   ' "$negative_lock_receipt" >/dev/null
 
   echo "publish-contract self-test passed"
@@ -835,10 +860,10 @@ add_blocker() {
 }
 
 validate_dependency_universe_lock() {
-  local asupersync_identity_csv fsqlite_patch_csv fsqlite_lock_csv
-  local fsqlite_lock_entry fsqlite_package fsqlite_version fsqlite_source
-  local -a asupersync_identities fsqlite_patch_entries fsqlite_lock_entries invalid_fsqlite_entries
-  invalid_fsqlite_entries=()
+  local asupersync_identity_csv rusqlite_patch_csv rusqlite_lock_csv
+  local rusqlite_lock_entry rusqlite_package rusqlite_version rusqlite_source
+  local -a asupersync_identities rusqlite_patch_entries rusqlite_lock_entries invalid_rusqlite_entries
+  invalid_rusqlite_entries=()
   local registry_source="registry+https://github.com/rust-lang/crates.io-index"
   local expected_asupersync="asupersync@${AUDITED_ASUPERSYNC_VERSION}|${registry_source}"
 
@@ -885,17 +910,26 @@ validate_dependency_universe_lock() {
       "Regenerate the lockfile only after restoring the audited Asupersync ${AUDITED_ASUPERSYNC_VERSION} registry identity, or bump AUDITED_ASUPERSYNC_VERSION deliberately."
   fi
 
-  # Rule 2: no FrankenSQLite entry may be patched, under any registry key,
-  # whether the alias or the `package` rename names an fsqlite* crate. The
-  # published family is the only audited source; a patch (git, path, or
-  # registry) re-opens the dependency-smuggling hole the cutover closed.
-  # A manifest that cannot be parsed fails closed.
-  mapfile -t fsqlite_patch_entries < <(
+  # Rule 2: no SQLite-family entry may be patched, under any registry key,
+  # whether the alias or the `package` rename names a rusqlite*, fsqlite*,
+  # or libsqlite3-sys crate. The published pair is the only audited source; a
+  # patch (git, path, or registry) re-opens the dependency-smuggling hole
+  # the cutover closed, and an fsqlite* patch would smuggle the retired
+  # engine back in ahead of lockfile resolution. A manifest that cannot be
+  # parsed fails closed.
+  mapfile -t rusqlite_patch_entries < <(
     python3 - "${ROOT_DIR}/Cargo.toml" <<'PY' | LC_ALL=C sort -u
 import sys
 import tomllib
 
 sentinel = "<invalid-manifest>"
+
+def sqlite_family(name):
+    return isinstance(name, str) and (
+        name.startswith("rusqlite")
+        or name.startswith("fsqlite")
+        or name == "libsqlite3-sys"
+    )
 
 try:
     with open(sys.argv[1], "rb") as manifest_file:
@@ -917,28 +951,28 @@ for registry, patches in patch.items():
         continue
     for alias, spec in patches.items():
         package = spec.get("package") if isinstance(spec, dict) else None
-        alias_hit = isinstance(alias, str) and alias.startswith("fsqlite")
-        package_hit = isinstance(package, str) and package.startswith("fsqlite")
-        if alias_hit or package_hit:
+        if sqlite_family(alias) or sqlite_family(package):
             print(f"{registry}:{alias}")
 PY
   )
-  if (( ${#fsqlite_patch_entries[@]} > 0 )); then
-    fsqlite_patch_csv="$(IFS=,; printf '%s' "${fsqlite_patch_entries[*]}")"
+  if (( ${#rusqlite_patch_entries[@]} > 0 )); then
+    rusqlite_patch_csv="$(IFS=,; printf '%s' "${rusqlite_patch_entries[*]}")"
     add_blocker \
-      "FRANKENSQLITE_PATCH_FORBIDDEN" \
+      "RUSQLITE_PATCH_FORBIDDEN" \
       "" \
-      "fsqlite" \
+      "rusqlite" \
       "bd-rnb6l" \
-      "Cargo.toml must not patch any fsqlite* crate; the audited source is the published crates.io family at ${AUDITED_FSQLITE_FAMILY_VERSION}. Found: ${fsqlite_patch_csv}." \
-      "Remove the fsqlite* entries from [patch.*] and regenerate Cargo.lock from the registry."
+      "Cargo.toml must not patch any rusqlite*, fsqlite*, or libsqlite3-sys crate; the audited source is the published crates.io pair rusqlite@${AUDITED_RUSQLITE_VERSION} + libsqlite3-sys@${AUDITED_LIBSQLITE3_SYS_VERSION}. Found: ${rusqlite_patch_csv}." \
+      "Remove the SQLite-family entries from [patch.*] and regenerate Cargo.lock from the registry."
   fi
 
-  # Rule 3: registry-only audited versions. The candidate deliberately advances
-  # the whole published family to 0.4.7 (UPGRADE_LOG 2026-10-03). This exact
-  # identity check does not waive combined dependency, platform, or
-  # release-artifact qualification.
-  mapfile -t fsqlite_lock_entries < <(
+  # Rule 3: registry-only audited versions, and no FrankenSQLite at all. The
+  # cutover moved storage to rusqlite + bundled libsqlite3-sys; any fsqlite*
+  # entry left in the lockfile is an unaudited SQLite implementation riding
+  # alongside the audited one. This exact identity check does not waive
+  # combined dependency, platform, or release-artifact qualification.
+  local saw_rusqlite=false saw_libsqlite3_sys=false
+  mapfile -t rusqlite_lock_entries < <(
     awk '
       BEGIN { RS = ""; FS = "\\n" }
       $1 == "[[package]]" {
@@ -960,36 +994,48 @@ PY
             sub(/"$/, "", source)
           }
         }
-        if (name ~ /^fsqlite/) {
+        if (name ~ /^fsqlite/ || name ~ /^rusqlite/ || name == "libsqlite3-sys") {
           printf "%s|%s|%s\n", name, version, source
         }
       }
     ' "$LOCKFILE"
   )
-  for fsqlite_lock_entry in "${fsqlite_lock_entries[@]}"; do
-    fsqlite_package="${fsqlite_lock_entry%%|*}"
-    fsqlite_version="${fsqlite_lock_entry#*|}"
-    fsqlite_version="${fsqlite_version%%|*}"
-    fsqlite_source="${fsqlite_lock_entry##*|}"
-    local expected_fsqlite_version="$AUDITED_FSQLITE_FAMILY_VERSION"
-    if [[ "$fsqlite_package" == "fsqlite-pager" ]]; then
-      expected_fsqlite_version="$AUDITED_FSQLITE_PAGER_VERSION"
-    fi
-    if [[ "$fsqlite_source" != "$registry_source" ]] \
-      || [[ "$fsqlite_version" != "$expected_fsqlite_version" ]]; then
-      invalid_fsqlite_entries+=("${fsqlite_package}@${fsqlite_version}|${fsqlite_source:-<no-source>}")
+  for rusqlite_lock_entry in "${rusqlite_lock_entries[@]}"; do
+    rusqlite_package="${rusqlite_lock_entry%%|*}"
+    rusqlite_version="${rusqlite_lock_entry#*|}"
+    rusqlite_version="${rusqlite_version%%|*}"
+    rusqlite_source="${rusqlite_lock_entry##*|}"
+    local expected_rusqlite_version=""
+    case "$rusqlite_package" in
+      rusqlite)
+        saw_rusqlite=true
+        expected_rusqlite_version="$AUDITED_RUSQLITE_VERSION"
+        ;;
+      libsqlite3-sys)
+        saw_libsqlite3_sys=true
+        expected_rusqlite_version="$AUDITED_LIBSQLITE3_SYS_VERSION"
+        ;;
+      *)
+        # fsqlite* remnants and any other rusqlite* member are unaudited.
+        ;;
+    esac
+    if [[ -z "$expected_rusqlite_version" ]] \
+      || [[ "$rusqlite_source" != "$registry_source" ]] \
+      || [[ "$rusqlite_version" != "$expected_rusqlite_version" ]]; then
+      invalid_rusqlite_entries+=("${rusqlite_package}@${rusqlite_version}|${rusqlite_source:-<no-source>}")
     fi
   done
-  if (( ${#fsqlite_lock_entries[@]} == 0 )) \
-    || (( ${#invalid_fsqlite_entries[@]} > 0 )); then
-    fsqlite_lock_csv="$(IFS=,; printf '%s' "${invalid_fsqlite_entries[*]:-<none>}")"
+  if [[ "$saw_rusqlite" != true ]] \
+    || [[ "$saw_libsqlite3_sys" != true ]] \
+    || (( ${#invalid_rusqlite_entries[@]} > 0 )); then
+    rusqlite_lock_csv="$(IFS=,; printf '%s' "${invalid_rusqlite_entries[*]:-<none>}")"
     add_blocker \
-      "DEPENDENCY_UNIVERSE_FSQLITE_LOCK_SOURCE_INVALID" \
+      "DEPENDENCY_UNIVERSE_RUSQLITE_LOCK_SOURCE_INVALID" \
       "" \
-      "fsqlite" \
+      "rusqlite" \
       "bd-rnb6l" \
-      "Cargo.lock must resolve fsqlite-pager at ${AUDITED_FSQLITE_PAGER_VERSION} and every other fsqlite* package at ${AUDITED_FSQLITE_FAMILY_VERSION}, all from ${registry_source}; invalid entries: ${fsqlite_lock_csv}." \
-      "Restore the audited per-package registry versions; change these pins only with dependency qualification evidence."
+      "Cargo.lock must resolve rusqlite at ${AUDITED_RUSQLITE_VERSION} and libsqlite3-sys at ${AUDITED_LIBSQLITE3_SYS_VERSION}, both from ${registry_source}, and must not contain any fsqlite* or other rusqlite* package; invalid entries: ${rusqlite_lock_csv}." \
+      "Restore the audited rusqlite registry pair and drop every fsqlite* entry; change these pins only with dependency qualification evidence."
   fi
 }
 
