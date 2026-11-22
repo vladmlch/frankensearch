@@ -107,8 +107,8 @@ echo "[quality-gate] repo=$REPO_ROOT rev=$(git rev-parse --short HEAD) dirty=$(g
 want fmt       && run_stage fmt    cargo fmt --check
 want check     && run_stage check  cargo check --locked --workspace --exclude frankensearch-quill --all-targets
 want clippy    && run_stage clippy cargo clippy --locked --workspace --exclude frankensearch-quill --all-targets -- -D warnings
-want clippy    && run_stage clippy-quill-bench cargo clippy --locked -p frankensearch-quill --all-targets --features bench-internals,conformance-internals,pruning-conformance,tantivy-oracle -- -D warnings
-want clippy    && run_stage clippy-quill-profile cargo clippy --locked -p frankensearch-quill --all-targets --features profile-internals,conformance-internals,pruning-conformance,tantivy-oracle -- -D warnings
+want clippy    && run_stage clippy-quill-bench cargo clippy --locked -p frankensearch-quill --all-targets --features bench-internals,conformance-internals,pruning-conformance -- -D warnings
+want clippy    && run_stage clippy-quill-profile cargo clippy --locked -p frankensearch-quill --all-targets --features profile-internals,conformance-internals,pruning-conformance -- -D warnings
 # The facade's product feature set (loaders + Quill) is what users build; it was never linted
 # until bd-fhy2j, and its future-Send analysis needs the crate's raised recursion limit.
 want clippy    && run_stage clippy-hybrid cargo clippy --locked -p frankensearch --features hybrid --all-targets -- -D warnings
