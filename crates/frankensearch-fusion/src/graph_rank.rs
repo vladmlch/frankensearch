@@ -571,7 +571,7 @@ impl GraphRanker {
             .zip(ranks.iter())
             .map(|(&doc_id, &rank)| (doc_id.clone(), rank))
             .collect();
-        Ok(Self::finalize_scores(ranks_map, limit))
+        Self::finalize_scores(ranks_map, limit)
     }
 }
 
