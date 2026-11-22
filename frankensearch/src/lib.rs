@@ -177,24 +177,6 @@
 // `future_not_send` check overflows the default limit of 128 there.
 #![recursion_limit = "256"]
 
-#[cfg(all(feature = "fts5", not(feature = "storage")))]
-compile_error!("feature `fts5` requires feature `storage`");
-
-#[cfg(all(
-    feature = "persistent",
-    not(all(feature = "hybrid", feature = "storage"))
-))]
-compile_error!("feature `persistent` requires both `hybrid` and `storage`");
-
-#[cfg(all(
-    feature = "durable",
-    not(all(feature = "persistent", feature = "durability"))
-))]
-compile_error!("feature `durable` requires both `persistent` and `durability`");
-
-#[cfg(all(feature = "full-fts5", not(all(feature = "full", feature = "fts5"))))]
-compile_error!("feature `full-fts5` requires both `full` and `fts5`");
-
 /// Compiles the repository README's Rust blocks as doctests of this crate.
 ///
 /// The 2026-09-01 reality check found the README quickstart importing a
@@ -239,36 +221,6 @@ pub use frankensearch_quill as quill;
 #[cfg(any(feature = "native", feature = "rerank"))]
 /// Native cross-encoder reranking and optional `FastEmbed` backend.
 pub use frankensearch_rerank as rerank;
-
-#[cfg(feature = "storage")]
-/// `FrankenSQLite` storage backend.
-pub use frankensearch_storage as storage;
-
-#[cfg(feature = "durability")]
-/// `RaptorQ` self-healing durability layer.
-pub use frankensearch_durability as durability;
-
-// ─── Feature-gated facade exports (flat import surface) ────────────────────
-
-#[cfg(feature = "storage")]
-pub use frankensearch_storage::{
-    BatchResult, ContentHasher, DeduplicationDecision, DocumentRecord, IndexMetadata, IngestAction,
-    IngestResult, JobQueueConfig, JobQueueMetrics, PersistentJobQueue, StalenessCheck,
-    StalenessReason, Storage, StorageBackedJobRunner, StorageConfig,
-};
-
-#[cfg(feature = "fts5")]
-pub use frankensearch_storage::{
-    Fts5AdapterConfig as Fts5Config, Fts5ContentMode, Fts5LexicalSearch,
-    Fts5TokenizerChoice as Fts5Tokenizer,
-};
-
-#[cfg(feature = "durability")]
-pub use frankensearch_durability::{
-    DefaultSymbolCodec, DurabilityConfig, DurabilityMetrics, FileHealth,
-    FileProtectionResult as ProtectionResult, FileProtector, FileRepairOutcome as RepairResult,
-    FsviProtector, RepairCodec, RepairCodecConfig, VerifyResult as RepairCodecVerifyResult,
-};
 
 // ─── Async runtime re-exports ───────────────────────────────────────────────
 
@@ -441,12 +393,6 @@ pub mod prelude {
         ScoreSource, ScoredResult, SearchError, SearchPhase, SearchResult, SyncTwoTierSearcher,
         TwoTierConfig, TwoTierMetrics, TwoTierSearcher,
     };
-
-    #[cfg(feature = "storage")]
-    pub use crate::{IngestAction, IngestResult, Storage, StorageBackedJobRunner};
-
-    #[cfg(feature = "durability")]
-    pub use crate::{FileProtector, FsviProtector, RepairCodec};
 
     #[cfg(feature = "graph")]
     pub use crate::GraphRanker;
@@ -644,47 +590,18 @@ mod tests {
             HashAlgorithm::FnvModular
         ));
     }
-
-    #[cfg(feature = "storage")]
-    #[test]
-    fn storage_reexports_accessible() {
-        let schema_version = storage::SCHEMA_VERSION;
-        assert!(schema_version >= 1);
-
-        let _cfg = StorageConfig::default();
-        let _queue = JobQueueConfig::default();
-        assert!(matches!(IngestAction::New, IngestAction::New));
-        let _ = std::mem::size_of::<StorageBackedJobRunner>();
-    }
-
-    #[cfg(feature = "durability")]
-    #[test]
-    fn durability_reexports_accessible() {
-        let trailer_version = durability::REPAIR_TRAILER_VERSION;
-        assert!(trailer_version >= 1);
-
-        let _ = std::mem::size_of::<DurabilityConfig>();
-        let _ = std::mem::size_of::<ProtectionResult>();
-        let _ = std::mem::size_of::<RepairResult>();
-        let _ = std::mem::size_of::<RepairCodecVerifyResult>();
-    }
 }
 
 #[cfg(all(
     test,
     any(
         feature = "hash",
-        feature = "storage",
-        feature = "durability",
         feature = "ann",
         feature = "quill",
         feature = "lexical-tantivy"
     )
 ))]
 mod feature_matrix_smoke {
-    #[cfg(feature = "durability")]
-    use std::sync::Arc;
-
     use super::*;
 
     fn emit_evidence(lane: &str, behavior: &str, observations: &serde_json::Value) {
@@ -778,42 +695,6 @@ mod feature_matrix_smoke {
         });
     }
 
-    #[cfg(feature = "storage")]
-    #[test]
-    fn persistent_lane_behavior() {
-        let storage = Storage::open_in_memory().expect("open in-memory storage");
-        let schema_version = storage::SCHEMA_VERSION;
-        assert!(schema_version >= 1);
-        emit_evidence(
-            "persistent",
-            "real_in_memory_storage",
-            &serde_json::json!({"schema_version": schema_version}),
-        );
-        drop(storage);
-    }
-
-    #[cfg(feature = "durability")]
-    #[test]
-    fn durable_lane_behavior() {
-        let dir = tempfile::tempdir().expect("durability tempdir");
-        let source = dir.path().join("feature-matrix.fsvi");
-        std::fs::write(&source, vec![0x5a_u8; 1024]).expect("write durability source");
-        let protector =
-            FsviProtector::new(Arc::new(DefaultSymbolCodec), DurabilityConfig::default())
-                .expect("construct protector");
-        let protection = protector.protect_atomic(&source).expect("protect source");
-        assert!(protection.sidecar_path.exists());
-        assert!(protector.verify_and_repair(&source).expect("verify source"));
-        emit_evidence(
-            "durable",
-            "protect_verify_roundtrip",
-            &serde_json::json!({
-                "source_bytes": protection.source_size,
-                "repair_bytes": protection.repair_size,
-            }),
-        );
-    }
-
     #[cfg(feature = "ann")]
     #[test]
     fn ann_lane_behavior() {
@@ -875,33 +756,6 @@ mod feature_matrix_smoke {
             "full_surface_exports",
             &serde_json::json!({"native": true, "ann": true, "download": true}),
         );
-    }
-
-    #[cfg(feature = "full-fts5")]
-    #[test]
-    fn full_fts5_lane_behavior() {
-        asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let adapter = Fts5LexicalSearch::new(Fts5Config::default());
-            let document =
-                IndexableDocument::new("doc-fts5", "fts5 feature matrix integration fixture");
-            LexicalWrite::index_document(&adapter, &cx, &document)
-                .await
-                .expect("index FTS5 document");
-            let hits = LexicalRead::search(&adapter, &cx, "integration", 5)
-                .await
-                .expect("search FTS5 document");
-            assert_eq!(hits.len(), 1);
-            assert_eq!(hits[0].doc_id, "doc-fts5");
-            emit_evidence(
-                "full-fts5",
-                "real_fts5_index_search",
-                &serde_json::json!({
-                    "documents": LexicalRead::doc_count(&adapter)
-                        .expect("read FTS5 document count"),
-                    "hits": hits.len(),
-                }),
-            );
-        });
     }
 
     #[cfg(feature = "quill")]

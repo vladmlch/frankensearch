@@ -33,12 +33,6 @@ cass-equivalence = [
 ]
 quill = ["dep:frankensearch-quill", "frankensearch-fusion/quill"]
 graph = ["frankensearch-fusion/graph"]
-storage = ["dep:frankensearch-storage"]
-durability = [
-    "dep:frankensearch-durability",
-    "frankensearch-quill?/durability",
-]
-fts5 = ["storage", "frankensearch-storage/fts5"]
 rerank = ["dep:frankensearch-rerank", "frankensearch-rerank/native", "frankensearch-fusion/rerank"]
 native = ["dep:frankensearch-rerank", "frankensearch-rerank/native", "frankensearch-fusion/rerank"]
 fastembed-reranker = ["rerank", "frankensearch-rerank/fastembed-reranker"]
@@ -47,10 +41,7 @@ download = ["frankensearch-embed/download"]
 api = ["frankensearch-embed/api"]
 semantic = ["hash", "model2vec", "fastembed"]
 hybrid = ["semantic", "lexical"]
-persistent = ["hybrid", "storage"]
-durable = ["persistent", "durability"]
-full = ["durable", "rerank", "ann", "download", "graph", "api"]
-full-fts5 = ["full", "fts5"]
+full = ["hybrid", "rerank", "ann", "download", "graph", "api"]
 
 [dependencies]
 frankensearch-core = { workspace = true }
@@ -60,8 +51,6 @@ frankensearch-lexical = { workspace = true, optional = true }
 frankensearch-quill = { workspace = true, optional = true }
 frankensearch-fusion = { workspace = true }
 frankensearch-rerank = { workspace = true, optional = true }
-frankensearch-storage = { workspace = true, optional = true }
-frankensearch-durability = { workspace = true, optional = true }
 asupersync = { workspace = true }
 tracing = { workspace = true }
 # Native snapshot descriptors and retained source-document persistence.

@@ -3345,11 +3345,6 @@ mod tests {
     use std::rc::Rc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    #[cfg(feature = "hnsw-patch-ab")]
-    use hnsw_rs_034::prelude::{
-        AnnT as BaselineAnnT, DistDot as BaselineDistDot, Hnsw as BaselineHnsw,
-    };
-
     use super::*;
     use crate::Quantization;
 
@@ -3554,74 +3549,6 @@ mod tests {
             serde_json::to_vec(&receipt).expect("serialize updated receipt"),
         )
         .expect("make corrupt pair digest-valid");
-    }
-
-    #[cfg(feature = "hnsw-patch-ab")]
-    fn install_digest_valid_wrong_layer_generation(
-        generation_path: &Path,
-        installed_basename: &str,
-        vectors: Vec<Vec<f32>>,
-    ) {
-        let installed_graph = generation_path.join(format!("{installed_basename}.hnsw.graph"));
-        let installed_data = generation_path.join(format!("{installed_basename}.hnsw.data"));
-        let malformed_directory = tempfile::tempdir().expect("malformed fixture directory");
-        let budget = dist_dot_budget(vectors[0].len()).expect("distance budget");
-        let normalized = vectors
-            .into_iter()
-            .map(|vector| normalize_for_dist_dot(vector, budget))
-            .collect::<Vec<_>>();
-
-        let mut malformed_basename = None;
-        for attempt in 0..4_096 {
-            let baseline = BaselineHnsw::new(16, normalized.len(), 16, 200, BaselineDistDot);
-            for (origin_id, vector) in normalized.iter().enumerate() {
-                baseline.insert((vector, origin_id));
-            }
-            let malformed = baseline.get_point_indexation().into_iter().any(|point| {
-                let max_layer = usize::from(point.get_point_id().0);
-                point
-                    .get_neighborhood_id()
-                    .iter()
-                    .skip(max_layer.saturating_add(1))
-                    .any(|neighbors| !neighbors.is_empty())
-            });
-            if malformed {
-                malformed_basename = Some(
-                    baseline
-                        .file_dump(malformed_directory.path(), &format!("malformed-{attempt}"))
-                        .expect("dump malformed baseline graph"),
-                );
-                break;
-            }
-        }
-        let malformed_basename =
-            malformed_basename.expect("published 0.3.4 must reproduce the wrong-layer topology");
-        std::fs::copy(
-            malformed_directory
-                .path()
-                .join(format!("{malformed_basename}.hnsw.graph")),
-            &installed_graph,
-        )
-        .expect("install malformed graph");
-        std::fs::copy(
-            malformed_directory
-                .path()
-                .join(format!("{malformed_basename}.hnsw.data")),
-            &installed_data,
-        )
-        .expect("install malformed data");
-
-        let receipt_path = generation_path.join(HNSW_GENERATION_RECEIPT_FILENAME);
-        let mut receipt: HnswGenerationReceipt =
-            serde_json::from_slice(&std::fs::read(&receipt_path).expect("receipt"))
-                .expect("parse receipt");
-        receipt.graph = fingerprint_hnsw_sidecar(&installed_graph).expect("graph digest");
-        receipt.data = fingerprint_hnsw_sidecar(&installed_data).expect("data digest");
-        std::fs::write(
-            receipt_path,
-            serde_json::to_vec(&receipt).expect("serialize updated receipt"),
-        )
-        .expect("update receipt");
     }
 
     fn recall_at_k(approx: &[VectorHit], exact: &[VectorHit]) -> f64 {
@@ -5526,61 +5453,6 @@ mod tests {
         assert_eq!(disposition, HnswLoadDisposition::Native);
     }
 
-    #[cfg(feature = "hnsw-patch-ab")]
-    #[test]
-    fn save_ignores_digest_valid_but_topologically_invalid_ready_generation() {
-        let vectors = vec![vec![1.0_f32, 0.0], vec![0.0_f32, 1.0]];
-        let source_path = temp_path("ready-topology-source", "fsvi");
-        let source_index = write_index(&source_path, &vectors).expect("source index");
-        let ann = HnswIndex::build_from_vector_index(&source_index, HnswConfig::default())
-            .expect("ANN index");
-        let metadata_path = temp_path("ready-topology", "hnsw");
-        ann.save_with_metadata_publisher(&metadata_path, reject_hnsw_metadata_publish)
-            .expect_err("retain unpublished READY generation");
-        let before = ready_generation_paths(&metadata_path, ann.vector_fingerprint);
-        assert_eq!(before.len(), 1);
-        let rejected_generation = before[0]
-            .file_name()
-            .and_then(|name| name.to_str())
-            .expect("generation name")
-            .to_owned();
-        let receipt_path = before[0].join(HNSW_GENERATION_RECEIPT_FILENAME);
-        let receipt: HnswGenerationReceipt =
-            serde_json::from_slice(&std::fs::read(&receipt_path).expect("read receipt"))
-                .expect("parse receipt");
-        install_digest_valid_wrong_layer_generation(&before[0], &receipt.sidecar_basename, vectors);
-        let graph_path = before[0].join(format!("{}.hnsw.graph", receipt.sidecar_basename));
-        assert!(
-            !hnsw_generation_is_loadable(
-                &before[0],
-                &receipt.sidecar_basename,
-                &graph_path,
-                ann.len(),
-                ann.dimension(),
-            ),
-            "loadable but topologically invalid READY generation must not be reusable"
-        );
-
-        ann.save(&metadata_path)
-            .expect("save past topologically invalid retained generation");
-        let after = ready_generation_paths(&metadata_path, ann.vector_fingerprint);
-        assert_eq!(
-            after.len(),
-            2,
-            "invalid retained generation must remain untouched while a fresh one is published"
-        );
-        let metadata: HnswMeta =
-            serde_json::from_slice(&std::fs::read(&metadata_path).expect("read metadata"))
-                .expect("parse metadata");
-        assert_ne!(
-            metadata.sidecar_generation.as_deref(),
-            Some(rejected_generation.as_str())
-        );
-        let (_, disposition) = HnswIndex::load_with_disposition(&metadata_path, &source_index)
-            .expect("native load after rejecting invalid retained generation");
-        assert_eq!(disposition, HnswLoadDisposition::Native);
-    }
-
     #[test]
     fn save_ignores_oversized_ready_receipt() {
         let source_path = temp_path("ready-oversized-source", "fsvi");
@@ -6130,38 +6002,6 @@ mod tests {
             hits[0].doc_id, "doc-0000",
             "v5 graph without topology attestation must rebuild under v6"
         );
-    }
-
-    #[cfg(feature = "hnsw-patch-ab")]
-    #[test]
-    fn current_digest_valid_malformed_native_graph_rebuilds_instead_of_serving() {
-        let vectors = vec![vec![1.0_f32, 0.0], vec![0.0_f32, 1.0]];
-        let source_path = temp_path("malformed-v6-source", "fsvi");
-        let source_index = write_index(&source_path, &vectors).expect("source index");
-        let ann = HnswIndex::build_from_vector_index(&source_index, HnswConfig::default())
-            .expect("candidate graph");
-        let metadata_path = temp_path("malformed-v6", "hnsw");
-        ann.save(&metadata_path).expect("save candidate graph");
-
-        let meta: HnswMeta =
-            serde_json::from_slice(&std::fs::read(&metadata_path).expect("metadata"))
-                .expect("parse metadata");
-        let (generation_path, installed_basename) =
-            persisted_hnsw_sidecar_location(&metadata_path, &meta).expect("sidecar location");
-        // Keep the fixture cryptographically self-consistent. Receipt/digest
-        // validation alone must pass so topology attestation is the reason the
-        // current-format native pair is rejected.
-        install_digest_valid_wrong_layer_generation(&generation_path, &installed_basename, vectors);
-
-        let (loaded, disposition) = HnswIndex::load_with_disposition(&metadata_path, &source_index)
-            .expect("malformed native graph must rebuild");
-        assert_eq!(disposition, HnswLoadDisposition::Rebuilt);
-        let (hits, stats) = loaded
-            .knn_search_with_stats(&[1.0, 0.0], 2, HNSW_DEFAULT_EF_SEARCH)
-            .expect("search rebuilt graph");
-        assert_eq!(hits.len(), 2);
-        assert_eq!(hits[0].doc_id, "doc-0000");
-        assert_eq!(stats.fallback_reason, None);
     }
 
     #[test]

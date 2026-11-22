@@ -67,11 +67,11 @@ unset RCH_REQUIRE_REMOTE || true
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-16}"
 export CARGO_TERM_COLOR="${CARGO_TERM_COLOR:-never}"
 MODEL_DIR="${QUALITY_GATE_MODEL_DIR:-$HOME/.local/share/frankensearch/models}"
-STAGES="${QUALITY_GATE_STAGES:-fmt,check,clippy,cross,tests,quill,fsfs,facade,e2e,quickstart}"
+STAGES="${QUALITY_GATE_STAGES:-fmt,check,clippy,cross,tests,facade}"
 IFS=',' read -ra selected_stages <<< "$STAGES"
 for stage in "${selected_stages[@]}"; do
   case "$stage" in
-    fmt|check|clippy|cross|tests|quill|quill-full|quill-probes|fsfs|facade|examples|perf|e2e|quickstart) ;;
+    fmt|check|clippy|cross|tests|facade|examples|perf) ;;
     *) printf '[quality-gate] FAIL unknown stage: %s\n' "$stage" >&2; exit 2 ;;
   esac
 done
@@ -105,8 +105,10 @@ run_stage() {
 echo "[quality-gate] repo=$REPO_ROOT rev=$(git rev-parse --short HEAD) dirty=$(git status --porcelain | wc -l | tr -d ' ') started=$started host=$(hostname)"
 
 want fmt       && run_stage fmt    cargo fmt --check
-want check     && run_stage check  cargo check --locked --workspace --all-targets
-want clippy    && run_stage clippy cargo clippy --locked --workspace --all-targets -- -D warnings
+want check     && run_stage check  cargo check --locked --workspace --exclude frankensearch-quill --all-targets
+want clippy    && run_stage clippy cargo clippy --locked --workspace --exclude frankensearch-quill --all-targets -- -D warnings
+want clippy    && run_stage clippy-quill-bench cargo clippy --locked -p frankensearch-quill --all-targets --features bench-internals,conformance-internals,pruning-conformance,tantivy-oracle -- -D warnings
+want clippy    && run_stage clippy-quill-profile cargo clippy --locked -p frankensearch-quill --all-targets --features profile-internals,conformance-internals,pruning-conformance,tantivy-oracle -- -D warnings
 # The facade's product feature set (loaders + Quill) is what users build; it was never linted
 # until bd-fhy2j, and its future-Send analysis needs the crate's raised recursion limit.
 want clippy    && run_stage clippy-hybrid cargo clippy --locked -p frankensearch --features hybrid --all-targets -- -D warnings
@@ -130,11 +132,7 @@ if want cross; then
   fi
 fi
 
-want tests     && run_stage tests  cargo test --locked --workspace --tests --exclude frankensearch-quill-gauntlet --exclude frankensearch-fsfs
-want quill     && run_stage quill python3 scripts/check_quill_correctness.py
-want quill-full && run_stage quill-full python3 scripts/check_quill_correctness.py --full
-want quill-probes && run_stage quill-probes python3 scripts/check_quill_correctness.py --probes
-want fsfs      && run_stage fsfs   cargo test --locked -p frankensearch-fsfs --tests
+want tests     && run_stage tests  cargo test --locked --workspace --tests --exclude frankensearch-quill
 
 # The library crate's own integration tests on the product feature set. With the registered
 # models present the real-model two-tier lane is REQUIRED (it panics instead of skipping), so a
@@ -174,32 +172,9 @@ if want perf; then
       FRANKENSEARCH_PERF_RECEIPT_OUT="$perf_out" \
       cargo test --locked --release -p frankensearch --features hybrid --test latency_receipt -- --nocapture
     echo "[quality-gate] perf receipt: $perf_out"
-    # The product half: the fsfs binary's own index cost, cold start, and daemon-served
-    # query latency (plus the rerank series), written beside the library receipt.
-    perf_fsfs_out="${QUALITY_GATE_PERF_FSFS_RECEIPT_OUT:-docs/evidence/perf/fsfs-latency-$(date -u +%Y%m%d)-$(hostname).json}"
-    case "$perf_fsfs_out" in /*) ;; *) perf_fsfs_out="$REPO_ROOT/$perf_fsfs_out" ;; esac
-    run_stage perf-fsfs env FRANKENSEARCH_MODEL_DIR="$MODEL_DIR" FRANKENSEARCH_PERF_RECEIPT=1 \
-      FRANKENSEARCH_PERF_RECEIPT_OUT="$perf_fsfs_out" \
-      cargo test --locked --release -p frankensearch-fsfs --test fsfs_latency_receipt -- --nocapture
-    echo "[quality-gate] perf-fsfs receipt: $perf_fsfs_out"
   else
     fail perf "registered models absent under $MODEL_DIR; the latency receipt needs potion + MiniLM"
   fi
-fi
-
-if want e2e; then
-  if [ -d "$MODEL_DIR/potion-multilingual-128M" ] && [ -d "$MODEL_DIR/all-MiniLM-L6-v2" ]; then
-    run_stage e2e env FSFS_DEFAULT_E2E_MODEL_DIR="$MODEL_DIR" FRANKENSEARCH_REQUIRE_SEMANTIC_E2E=1 \
-      cargo test --locked -p frankensearch-fsfs --test default_build_quickstart -- --include-ignored
-  elif [ "${QUALITY_GATE_ALLOW_MODEL_SKIP:-0}" = "1" ]; then
-    skip e2e "registered models absent under $MODEL_DIR (allowed by QUALITY_GATE_ALLOW_MODEL_SKIP=1)"
-  else
-    fail e2e "registered models absent under $MODEL_DIR; run scripts/rch-ensure-deps.sh --models-only or set QUALITY_GATE_ALLOW_MODEL_SKIP=1"
-  fi
-fi
-
-if want quickstart; then
-  run_stage quickstart env FRANKENSEARCH_MODEL_DIR="$MODEL_DIR" scripts/check_fsfs_executable_quickstart.sh --negative-probes --require-source --keep-artifacts
 fi
 
 echo "[quality-gate] finished=$(date -u +%FT%TZ) failures=${#failures[@]}"

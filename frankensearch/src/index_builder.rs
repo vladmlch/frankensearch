@@ -32,10 +32,6 @@ use frankensearch_core::generation::{EmbeddingIdentityBundleV1, QuantizationForm
 use frankensearch_core::traits::LexicalRead;
 use frankensearch_core::traits::{Embedder, MetricsExporter};
 use frankensearch_core::types::{EmbeddingMetrics, IndexMetrics, IndexableDocument};
-#[cfg(all(feature = "durability", feature = "quill"))]
-use frankensearch_durability::FileProtector;
-#[cfg(feature = "durability")]
-use frankensearch_durability::{DefaultSymbolCodec, DurabilityConfig, FsviProtector};
 #[cfg(any(feature = "native", feature = "rerank"))]
 use frankensearch_embed::DetectOptions;
 use frankensearch_embed::auto_detect::{EmbedderStack, TwoTierAvailability};
@@ -912,16 +908,6 @@ impl IndexBuilder {
             (None, 0.0)
         };
 
-        #[cfg(feature = "durability")]
-        {
-            build_checkpoint(cx, "durability sidecar protection")?;
-            if let Err(error) = protect_durability_sidecars(&self.data_dir) {
-                export_error(metrics_exporter.as_ref(), &error);
-                return Err(error);
-            }
-            build_checkpoint(cx, "durability sidecars protected")?;
-        }
-
         build_checkpoint(cx, "index build completion")?;
         let has_quality = quality_embedder.is_some();
         let size_bytes = compute_size_breakdown(&self.data_dir);
@@ -1788,13 +1774,6 @@ async fn build_lexical_index(
         ..QuillConfig::default()
     };
 
-    #[cfg(feature = "durability")]
-    let lexical = {
-        let protector =
-            FileProtector::new(Arc::new(DefaultSymbolCodec), DurabilityConfig::default())?;
-        QuillIndex::create_durable(cx, data_dir, config, protector).await?
-    };
-    #[cfg(not(feature = "durability"))]
     let lexical = QuillIndex::create(cx, data_dir, config).await?;
     build_checkpoint(cx, "Quill lexical document indexing")?;
 
@@ -1996,30 +1975,6 @@ async fn build_tantivy_lexical_index(
     })
 }
 
-#[cfg(feature = "durability")]
-fn protect_durability_sidecars(data_dir: &Path) -> SearchResult<()> {
-    let protector = FsviProtector::new(Arc::new(DefaultSymbolCodec), DurabilityConfig::default())?;
-
-    let fast_path = {
-        let dedicated = data_dir.join(VECTOR_INDEX_FAST_FILENAME);
-        if dedicated.exists() {
-            dedicated
-        } else {
-            data_dir.join(VECTOR_INDEX_FALLBACK_FILENAME)
-        }
-    };
-    if fast_path.exists() {
-        protector.protect_atomic(&fast_path)?;
-    }
-
-    let quality_path = data_dir.join(VECTOR_INDEX_QUALITY_FILENAME);
-    if quality_path.exists() {
-        protector.protect_atomic(&quality_path)?;
-    }
-
-    Ok(())
-}
-
 fn file_size_bytes(path: &Path) -> u64 {
     std::fs::metadata(path).map_or(0, |metadata| metadata.len())
 }
@@ -2049,10 +2004,6 @@ mod tests {
     use frankensearch_core::traits::LexicalWrite;
     use frankensearch_core::traits::{MetricsExporter, ModelCategory, SearchFuture};
     use frankensearch_core::types::{EmbeddingMetrics, IndexMetrics, SearchMetrics};
-    #[cfg(feature = "durability")]
-    use frankensearch_durability::FsviProtector;
-    #[cfg(all(feature = "durability", feature = "quill"))]
-    use frankensearch_durability::{DefaultSymbolCodec, DurabilityConfig, FsviVerifyResult};
     #[cfg(any(
         all(feature = "quill", feature = "lexical-tantivy"),
         all(feature = "lexical", not(feature = "quill"))
@@ -4495,111 +4446,6 @@ mod tests {
                     .collect::<Vec<_>>()
             };
             assert_eq!(admitted_ids, vec!["doc-failed".to_owned()]);
-        });
-    }
-
-    #[cfg(feature = "durability")]
-    #[test]
-    fn build_wires_durability_sidecars_when_feature_enabled() {
-        asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let dir = tempfile::tempdir().unwrap();
-            let stats = IndexBuilder::new(dir.path())
-                .with_embedder_stack(stub_stack())
-                .add_document("doc-1", "Durability alpha")
-                .add_document("doc-2", "Durability beta")
-                .build(&cx)
-                .await
-                .unwrap();
-
-            assert_eq!(stats.doc_count, 2);
-
-            let fast_path = {
-                let dedicated = dir.path().join(super::VECTOR_INDEX_FAST_FILENAME);
-                if dedicated.exists() {
-                    dedicated
-                } else {
-                    dir.path().join(super::VECTOR_INDEX_FALLBACK_FILENAME)
-                }
-            };
-            let fast_sidecar = FsviProtector::sidecar_path(&fast_path);
-            assert!(fast_sidecar.exists());
-
-            #[cfg(feature = "quill")]
-            {
-                let lexical_dir = dir.path().join("lexical");
-                let protected_sidecars = std::fs::read_dir(&lexical_dir)
-                    .unwrap()
-                    .filter_map(Result::ok)
-                    .map(|entry| entry.path())
-                    .filter(|path| path.extension().is_some_and(|extension| extension == "fec"))
-                    .collect::<Vec<_>>();
-                assert!(
-                    protected_sidecars
-                        .iter()
-                        .any(|path| path.to_string_lossy().ends_with(".fslx.fec")),
-                    "bulk-built Quill segment must have a generic FileProtector sidecar: \
-                     {protected_sidecars:?}"
-                );
-                assert!(
-                    protected_sidecars
-                        .iter()
-                        .any(|path| path.file_name().is_some_and(|name| name == "MANIFEST.fec")),
-                    "published Quill manifest must have a generic FileProtector sidecar: \
-                     {protected_sidecars:?}"
-                );
-
-                let fslx_sidecar = protected_sidecars
-                    .iter()
-                    .find(|path| path.to_string_lossy().ends_with(".fslx.fec"))
-                    .expect("protected Quill FSLX segment");
-                let fslx_path = std::path::PathBuf::from(
-                    fslx_sidecar
-                        .to_string_lossy()
-                        .strip_suffix(".fec")
-                        .expect("FSLX sidecar suffix"),
-                );
-                let original = std::fs::read(&fslx_path).expect("read protected FSLX");
-                assert!(!original.is_empty());
-
-                let protector =
-                    FsviProtector::new(Arc::new(DefaultSymbolCodec), DurabilityConfig::default())
-                        .expect("construct FSLX verifier");
-                assert_eq!(
-                    protector.verify(&fslx_path).expect("verify intact FSLX"),
-                    FsviVerifyResult::Intact
-                );
-
-                let mut corrupted = original.clone();
-                corrupted[0] ^= 0xff;
-                std::fs::write(&fslx_path, &corrupted).expect("corrupt FSLX fixture");
-                assert!(matches!(
-                    protector
-                        .verify(&fslx_path)
-                        .expect("detect FSLX corruption"),
-                    FsviVerifyResult::Corrupted { repairable: true }
-                ));
-                assert!(
-                    protector
-                        .verify_and_repair(&fslx_path)
-                        .expect("repair FSLX from sidecar")
-                );
-                assert_eq!(
-                    std::fs::read(&fslx_path).expect("read repaired FSLX"),
-                    original
-                );
-                eprintln!(
-                    "{}",
-                    serde_json::json!({
-                        "schema": "quill-consumer-durability-e2e-v1",
-                        "fixture_id": "index-builder-fslx-repair",
-                        "source_bytes": original.len(),
-                        "corruption": "single-byte-xor",
-                        "verify_before": "intact",
-                        "verify_corrupt": "repairable",
-                        "verify_after": "intact",
-                    })
-                );
-            }
         });
     }
 

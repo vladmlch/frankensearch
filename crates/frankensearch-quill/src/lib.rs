@@ -67,8 +67,6 @@ pub use index::{
     QuillProfileCacheDisposition, QuillProfileExecutionMode, QuillProfileOutcome,
     QuillProfileReceipt, QuillProfileWorkUnits, QuillProfiledSearchOutcome,
 };
-#[cfg(feature = "durability")]
-pub use keeper::UnrepairableSegmentPolicy;
 pub use keeper::{
     BlueGreenEngine, CURRENT_ENGINE_VERSION, CURRENT_FILE_NAME, CURRENT_FORMAT_VERSION,
     CompactionError, CompactionPolicy, CompactionReport, ConcatMergeError, CurrentPointer,

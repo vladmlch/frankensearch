@@ -7,15 +7,8 @@ members = [
     "crates/frankensearch-lexical",
     "crates/frankensearch-fusion",
     "crates/frankensearch-rerank",
-    "crates/frankensearch-storage",
-    "crates/frankensearch-durability",
-    "crates/frankensearch-fsfs",
-    "crates/frankensearch-tui",
-    "crates/frankensearch-ops",
     "crates/frankensearch-quill",
-    "crates/frankensearch-quill-gauntlet",
     "frankensearch",
-    "tools/optimize_params",
 ]
 default-members = [
     "crates/frankensearch-core",
@@ -24,11 +17,6 @@ default-members = [
     "crates/frankensearch-lexical",
     "crates/frankensearch-fusion",
     "crates/frankensearch-rerank",
-    "crates/frankensearch-storage",
-    "crates/frankensearch-durability",
-    "crates/frankensearch-fsfs",
-    "crates/frankensearch-tui",
-    "crates/frankensearch-ops",
     "crates/frankensearch-quill",
     "frankensearch",
 ]
@@ -47,11 +35,6 @@ frankensearch-index = { version = "0.4.0", path = "crates/frankensearch-index" }
 frankensearch-lexical = { version = "0.4.0", path = "crates/frankensearch-lexical" }
 frankensearch-fusion = { version = "0.4.0", path = "crates/frankensearch-fusion" }
 frankensearch-rerank = { version = "0.5.0", path = "crates/frankensearch-rerank" }
-frankensearch-storage = { version = "0.4.0", path = "crates/frankensearch-storage" }
-frankensearch-durability = { version = "0.4.0", path = "crates/frankensearch-durability", default-features = false }
-frankensearch-fsfs = { version = "1.12.1", path = "crates/frankensearch-fsfs" }
-frankensearch-tui = { version = "0.3.1", path = "crates/frankensearch-tui" }
-frankensearch-ops = { version = "0.4.0", path = "crates/frankensearch-ops" }
 frankensearch-quill = { version = "0.4.1", path = "crates/frankensearch-quill" }
 
 # Async runtime (structured concurrency, NO tokio)
@@ -82,8 +65,6 @@ rustix = { version = "=1.1.5", default-features = false, features = [
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# The reference TOON implementation; its default `cli` feature pulls a TUI stack.
-toon-format = { version = "0.5.0", default-features = false }
 
 # Error handling
 thiserror = "2"
@@ -166,45 +147,11 @@ toml = "1.1.6"
 # SHA-256 verification for model manifests
 sha2 = "0.11.0"
 
-# Authenticated encryption and keyed digests for private evidence artifacts (bd-fttb)
-chacha20poly1305 = "=0.11.0"
-getrandom = "=0.4.3"
-hmac = "=0.13.0"
-zeroize = "=1.9.0"
-# Ed25519 receipt signatures mandated by the frozen ArtifactStore v4 F0
-# contract (docs/artifactstore-v4-threat-model.md); consumed by
-# frankensearch-quill-gauntlet's `supervisor` module (F2/F3).
-# NOT UNUSED — DO NOT REMOVE (now removed twice: fc107a73, ca9ff867; each time
-# `cargo metadata` broke for the WHOLE workspace): quill-gauntlet is a
-# workspace member EXCLUDED from default-members, so default-scoped
-# unused-dependency sweeps cannot see this consumer. Check `cargo metadata`
-# or the gauntlet crate before removing. Pinned to the version the lock
-# already resolves through asupersync, so no new dependency universe entry
-# is introduced.
-ed25519-dalek = "=3.0.0"
-
-# PDF text extraction (digital PDFs with selectable text)
-pdf-extract = "0.12.1"
-
 # Benchmarking
 criterion = { version = "0.8.2", features = ["html_reports"] }
 proptest = "1.6"
 
 # Date/time formatting/parsing for telemetry RFC3339 timestamps
-
-# System information (CPU, memory, etc.)
-sysinfo = "0.39.6"
-
-# FrankenTUI terminal UI framework
-ftui-core = "0.7.0"
-ftui-render = "0.7.0"
-ftui-style = "0.7.0"
-ftui-text = "0.7.0"
-ftui-layout = "0.7.0"
-ftui-widgets = "0.7.0"
-ftui-tty = "0.7.0"
-ftui-backend = "0.7.0"
-ftui-extras = "0.7.0"
 
 # FrankenSQLite production edge is crates.io 0.3.8 (async Connection plus
 # the AsyncConnection sync facade). Do not reintroduce a 0.1 compatibility

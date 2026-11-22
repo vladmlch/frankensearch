@@ -45,8 +45,6 @@ use frankensearch_core::{
     DocId, IndexableDocument, LexicalCandidateBatch, LexicalHydrationContext, LexicalRead,
     LexicalWrite, ScoreSource, ScoredResult, SearchError, SearchFuture, SearchResult,
 };
-#[cfg(feature = "durability")]
-use frankensearch_durability::FileProtector;
 use rayon::prelude::*;
 #[cfg(feature = "pruning-conformance")]
 use serde::{Deserialize, Serialize};
@@ -77,8 +75,6 @@ use crate::grimoire::{
 };
 #[cfg(feature = "bench-internals")]
 use crate::keeper::BenchmarkQuillDirectorySyncState;
-#[cfg(feature = "durability")]
-use crate::keeper::UnrepairableSegmentPolicy;
 use crate::keeper::{
     BlueGreenEngine, CURRENT_ENGINE_VERSION, CompactionPolicy, CompactionReport, CurrentPointer,
     CurrentPointerError, GarbageCollectionOptions, GarbageCollectionReport, KeeperError,
@@ -5470,102 +5466,6 @@ impl QuillWriterState {
             let writer =
                 open_sidecarless_writer(cx, directory.into(), schema, &config, false).await?;
             let index = Self::from_backend(IndexBackend::Durable(writer), schema, config)?;
-            record_snapshot_fields(&open_span, index.authority_snapshot()?);
-            Ok(index)
-        }
-        .instrument(instrumented)
-        .await
-    }
-
-    /// Open an existing shipping-schema index with FEC repair enabled.
-    ///
-    /// # Errors
-    ///
-    /// Returns typed configuration, admission, recovery, schema, or durability
-    /// failures.
-    #[cfg(feature = "durability")]
-    pub async fn open_durable(
-        cx: &Cx,
-        directory: impl Into<PathBuf>,
-        config: QuillConfig,
-        protector: FileProtector,
-    ) -> Result<Self, QuillIndexError> {
-        validate_config(&config)?;
-        let open_span = tracing::info_span!(
-            target: crate::tracing_conventions::TARGET,
-            crate::tracing_conventions::KEEPER_OPEN,
-            phase = "open",
-            durability = true,
-            generation = tracing::field::Empty,
-            segment_count = tracing::field::Empty,
-            doc_count = tracing::field::Empty,
-            duration_us = tracing::field::Empty,
-        );
-        let _open_timer = crate::tracing_conventions::StageTimer::new(&open_span);
-        let instrumented = open_span.clone();
-        async move {
-            let unrepairable = if config.quarantine_on_unrepairable {
-                UnrepairableSegmentPolicy::Quarantine
-            } else {
-                UnrepairableSegmentPolicy::FailClosed
-            };
-            let writer = KeeperWriter::open_durable_with_policy(
-                cx,
-                directory,
-                DEFAULT_SCHEMA,
-                protector,
-                unrepairable,
-            )
-            .await?;
-            let index = Self::from_backend(IndexBackend::Durable(writer), DEFAULT_SCHEMA, config)?;
-            record_snapshot_fields(&open_span, index.authority_snapshot()?);
-            Ok(index)
-        }
-        .instrument(instrumented)
-        .await
-    }
-
-    /// Create or open a shipping-schema index with FEC repair enabled.
-    ///
-    /// # Errors
-    ///
-    /// Returns typed configuration, admission, recovery, schema, or durability
-    /// failures.
-    #[cfg(feature = "durability")]
-    pub async fn create_durable(
-        cx: &Cx,
-        directory: impl Into<PathBuf>,
-        config: QuillConfig,
-        protector: FileProtector,
-    ) -> Result<Self, QuillIndexError> {
-        validate_config(&config)?;
-        let open_span = tracing::info_span!(
-            target: crate::tracing_conventions::TARGET,
-            crate::tracing_conventions::KEEPER_OPEN,
-            phase = "open",
-            durability = true,
-            generation = tracing::field::Empty,
-            segment_count = tracing::field::Empty,
-            doc_count = tracing::field::Empty,
-            duration_us = tracing::field::Empty,
-        );
-        let _open_timer = crate::tracing_conventions::StageTimer::new(&open_span);
-        let instrumented = open_span.clone();
-        async move {
-            let unrepairable = if config.quarantine_on_unrepairable {
-                UnrepairableSegmentPolicy::Quarantine
-            } else {
-                UnrepairableSegmentPolicy::FailClosed
-            };
-            let writer = KeeperWriter::create_durable_with_policy(
-                cx,
-                directory,
-                DEFAULT_SCHEMA,
-                protector,
-                unrepairable,
-            )
-            .await?;
-            let index = Self::from_backend(IndexBackend::Durable(writer), DEFAULT_SCHEMA, config)?;
             record_snapshot_fields(&open_span, index.authority_snapshot()?);
             Ok(index)
         }
@@ -12039,42 +11939,6 @@ impl QuillIndex {
         ))
     }
 
-    /// Open an existing shipping-schema index with FEC repair enabled.
-    ///
-    /// # Errors
-    ///
-    /// Returns typed configuration, admission, recovery, schema, or durability
-    /// failures.
-    #[cfg(feature = "durability")]
-    pub async fn open_durable(
-        cx: &Cx,
-        directory: impl Into<PathBuf>,
-        config: QuillConfig,
-        protector: FileProtector,
-    ) -> Result<Self, QuillIndexError> {
-        Ok(Self::from_writer(
-            QuillWriterState::open_durable(cx, directory, config, protector).await?,
-        ))
-    }
-
-    /// Create or open a shipping-schema index with FEC repair enabled.
-    ///
-    /// # Errors
-    ///
-    /// Returns typed configuration, admission, recovery, schema, creation, or
-    /// durability failures.
-    #[cfg(feature = "durability")]
-    pub async fn create_durable(
-        cx: &Cx,
-        directory: impl Into<PathBuf>,
-        config: QuillConfig,
-        protector: FileProtector,
-    ) -> Result<Self, QuillIndexError> {
-        Ok(Self::from_writer(
-            QuillWriterState::create_durable(cx, directory, config, protector).await?,
-        ))
-    }
-
     /// Construct an owned-buffer genesis index without filesystem I/O.
     ///
     /// # Errors
@@ -13607,13 +13471,6 @@ async fn open_sidecarless_writer(
     create: bool,
 ) -> Result<KeeperWriter, QuillIndexError> {
     if config.quarantine_on_unrepairable {
-        #[cfg(feature = "durability")]
-        return Ok(if create {
-            KeeperWriter::create_quarantining(cx, directory, schema).await?
-        } else {
-            KeeperWriter::open_quarantining(cx, directory, schema).await?
-        });
-        #[cfg(not(feature = "durability"))]
         return Err(QuillIndexError::Config(SearchError::InvalidConfig {
             field: "quarantine_on_unrepairable".to_owned(),
             value: "true".to_owned(),
@@ -18027,8 +17884,6 @@ mod tests {
     use asupersync::runtime::yield_now;
     use asupersync::types::Budget;
     use asupersync::{LabConfig, LabRuntime};
-    #[cfg(feature = "durability")]
-    use frankensearch_durability::{DefaultSymbolCodec, DurabilityConfig};
 
     use super::*;
     use crate::argus::CollectedTopDocs;
@@ -22131,19 +21986,6 @@ mod tests {
                 }
             }
         });
-    }
-
-    #[cfg(feature = "durability")]
-    fn test_file_protector() -> FileProtector {
-        FileProtector::new(
-            Arc::new(DefaultSymbolCodec),
-            DurabilityConfig {
-                symbol_size: 256,
-                repair_overhead: 2.0,
-                ..DurabilityConfig::default()
-            },
-        )
-        .expect("valid test durability configuration")
     }
 
     #[test]
@@ -29340,103 +29182,6 @@ mod tests {
                 generation + 1,
                 "alpha",
                 "dropped-commit",
-                1,
-            )
-            .await;
-        });
-    }
-
-    #[cfg(feature = "durability")]
-    #[test]
-    fn dropped_durable_commit_reconciliation_repairs_corrupted_fslx_on_the_live_index() {
-        let _pause_serial = crate::keeper::manifest_publish_pause_test_serial_guard();
-        run_with_blocking_cx(|cx| async move {
-            let directory =
-                tempfile::tempdir().expect("temporary dropped durable-commit directory");
-            let protector = test_file_protector();
-            let index = QuillIndex::create_durable(
-                &cx,
-                directory.path(),
-                deterministic_config(),
-                protector,
-            )
-            .await
-            .expect("create durable dropped-commit index");
-            let generation = index
-                .snapshot()
-                .expect("fresh durable dropped-commit snapshot is authoritative")
-                .loaded_manifest()
-                .manifest
-                .generation;
-            index
-                .index_document(
-                    &cx,
-                    &IndexableDocument::new("dropped-durable-commit", "alpha durable repair"),
-                )
-                .await
-                .expect("stage durable dropped-commit document");
-
-            let pause = crate::keeper::pause_manifest_publish_at_checkpoint_for_test(
-                directory.path(),
-                crate::keeper::PublishCheckpoint::TempMovedToCurrent,
-            );
-            let mut commit = Box::pin(index.commit(&cx));
-            crate::keeper::drive_manifest_publish_to_checkpoint_for_test(
-                &mut commit,
-                &pause,
-                PUBLISH_PAUSE_RENDEZVOUS_TIMEOUT,
-            )
-            .await
-            .expect("reach bounded dropped durable-commit rendezvous");
-            drop(commit);
-
-            assert_public_authority_refuses_stale_publication(
-                &index,
-                &cx,
-                "alpha",
-                "dropped-durable-commit",
-            )
-            .await;
-            let installed = Manifest::from_bytes(
-                &std::fs::read(directory.path().join("MANIFEST"))
-                    .expect("read durable dropped-commit MANIFEST"),
-            )
-            .expect("decode durable dropped-commit MANIFEST");
-            assert_eq!(installed.generation, generation + 1);
-            assert_eq!(installed.segments.len(), 1);
-            let segment_path = directory.path().join(format!(
-                "seg-{:016x}.fslx",
-                installed.segments[0].segment_id
-            ));
-            let intact = std::fs::read(&segment_path).expect("read durable successor FSLX");
-            let mut corrupt = intact.clone();
-            corrupt[0] ^= 0x80;
-            std::fs::write(&segment_path, &corrupt).expect("corrupt one FSLX byte after publish");
-            assert!(matches!(
-                KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA),
-                Err(KeeperError::SegmentOpen { path, .. }) if path == segment_path
-            ));
-
-            pause.release();
-            let reconciled = index
-                .reconcile_publication(&cx)
-                .await
-                .expect("live durable reconciliation repairs the abandoned FSLX");
-            assert_eq!(reconciled.keeper_generation(), generation + 1);
-            assert_eq!(
-                std::fs::read(&segment_path).expect("read repaired FSLX"),
-                intact
-            );
-            assert!(
-                !index.has_uncommitted_changes(),
-                "live reconciliation must resolve the retained commit retry state"
-            );
-            assert_public_authority_observes_reconciled_single_document(
-                &index,
-                &cx,
-                generation + 1,
-                "alpha",
-                "dropped-durable-commit",
                 1,
             )
             .await;
@@ -36748,59 +36493,6 @@ mod tests {
                 .search_paginated(&cx, "abandoned", 10, 0, true)
                 .expect("search committed snapshot only");
             assert_eq!(abandoned.total_count, Some(0));
-        });
-    }
-
-    #[cfg(feature = "durability")]
-    #[test]
-    fn durable_facade_protects_commit_and_reopens_searchable_snapshot() {
-        let directory = tempfile::tempdir().expect("durable index tempdir").keep();
-        run_with_cx(|cx| async move {
-            let protector = test_file_protector();
-            let index = QuillIndex::create_durable(
-                &cx,
-                &directory,
-                deterministic_config(),
-                protector.clone(),
-            )
-            .await
-            .expect("create durable index");
-            index
-                .index_documents(&cx, &fixture_documents())
-                .await
-                .expect("durable ingest");
-            index.commit(&cx).await.expect("durable commit");
-            let segment_path = index
-                .snapshot()
-                .expect("durable facade snapshot is authoritative")
-                .segments()[0]
-                .path()
-                .to_path_buf();
-            drop(index);
-
-            let manifest_path = directory.join("MANIFEST");
-            assert!(
-                protector
-                    .verify_file(&manifest_path, &FileProtector::sidecar_path(&manifest_path))
-                    .expect("verify MANIFEST sidecar")
-                    .healthy
-            );
-            assert!(
-                protector
-                    .verify_file(&segment_path, &FileProtector::sidecar_path(&segment_path))
-                    .expect("verify FSLX sidecar")
-                    .healthy
-            );
-
-            let reopened =
-                QuillIndex::open_durable(&cx, &directory, deterministic_config(), protector)
-                    .await
-                    .expect("reopen durable index");
-            let result = reopened
-                .search_paginated(&cx, "rust", 10, 0, true)
-                .expect("search reopened durable index");
-            assert_eq!(result.total_count, Some(2));
-            assert_eq!(result.doc_count, 3);
         });
     }
 

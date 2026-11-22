@@ -76,13 +76,13 @@ jobs:
           git diff --check
 
       - name: Strict Quill library and publication lint checks
-        run: cargo clippy --locked -p frankensearch-quill --lib --test publication_validation --test cancellation_contract --features durability,conformance-internals -- -D warnings
+        run: cargo clippy --locked -p frankensearch-quill --lib --test publication_validation --test cancellation_contract --features conformance-internals -- -D warnings
 
       - name: Default-feature Quill library and publication tests
         run: cargo test --locked -p frankensearch-quill --lib --test publication_validation --test cancellation_contract
 
-      - name: Durability and deterministic cancellation regression tests
-        run: cargo test --locked -p frankensearch-quill --lib --test publication_validation --test cancellation_contract --features durability,conformance-internals
+      - name: Deterministic cancellation regression tests
+        run: cargo test --locked -p frankensearch-quill --lib --test publication_validation --test cancellation_contract --features conformance-internals
 
       - name: Commit only validated production changes directly to main
         if: inputs.land
