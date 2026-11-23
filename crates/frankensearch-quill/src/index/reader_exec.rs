@@ -1,3 +1,5 @@
+#[cfg(feature = "profile-internals")]
+use crate::argus::QueryWorkCheckpoint;
 use crate::argus::{ArgusError, DocSetCollector, QueryWorkKind, TopDocsCollector};
 use crate::query::{
     BooleanClause, Occur, Query, QueryDiagnostic, QueryExplanation, QueryNode, QueryValue,

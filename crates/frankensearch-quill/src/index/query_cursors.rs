@@ -1,3 +1,5 @@
+#[cfg(feature = "profile-internals")]
+use crate::argus::QueryWorkCheckpoint;
 use crate::argus::{
     ArgusError, Bm25FieldSnapshot, CheckpointPostingCursor, DeltaFieldNorms, DeltaPostingCursor,
     FieldNormReader, PositionsHandle, PositionsReader, PostingCursor, QueryWorkKind,

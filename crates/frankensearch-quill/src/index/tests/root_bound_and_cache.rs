@@ -1,3 +1,4 @@
+#[cfg(feature = "bench-internals")]
 use crate::query::QueryField;
 
 use super::*;

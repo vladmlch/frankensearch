@@ -1,3 +1,4 @@
+#[cfg(feature = "bench-internals")]
 use crate::keeper::KeeperWriter;
 
 use super::*;

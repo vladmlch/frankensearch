@@ -58,20 +58,6 @@ pub(super) fn negative_boolean_dedup_key(child: SyntaxKey) -> SyntaxKey {
 /// `MustNot` clauses are never touched, and singleton groups are kept —
 /// lowering's `scorer_union` pops a one-child union, so the wrapper never
 /// constructs and cannot change association.
-#[cfg(test)]
-mod pttxk_slop_probe {
-    use crate::query::DefaultQueryParser;
-    #[test]
-    #[ignore = "bd-1i4j4 measurement probe; run explicitly"]
-    fn probe_slop_parse() {
-        let parser = DefaultQueryParser::new(crate::DEFAULT_SCHEMA).expect("parser");
-        let parsed = parser.parse_lenient("\"alpha beta\"~2");
-        println!("PROBE diagnostics = {:?}", parsed.diagnostics);
-        println!("PROBE query root = {:?}", parsed.query.root());
-        println!("PROBE nodes = {}", parsed.query.node_count());
-    }
-}
-
 pub(super) fn collapse_degenerate_groups(query: &mut Query) {
     let mut pending = Vec::new();
     if pending.try_reserve_exact(query.node_count()).is_err() {
@@ -786,5 +772,19 @@ pub(super) fn merge_field_queries(queries: Vec<Query>) -> Option<Query> {
             }
             Some(Query::boolean(clauses, None))
         }
+    }
+}
+
+#[cfg(test)]
+mod pttxk_slop_probe {
+    use crate::query::DefaultQueryParser;
+    #[test]
+    #[ignore = "bd-1i4j4 measurement probe; run explicitly"]
+    fn probe_slop_parse() {
+        let parser = DefaultQueryParser::new(crate::DEFAULT_SCHEMA).expect("parser");
+        let parsed = parser.parse_lenient("\"alpha beta\"~2");
+        println!("PROBE diagnostics = {:?}", parsed.diagnostics);
+        println!("PROBE query root = {:?}", parsed.query.root());
+        println!("PROBE nodes = {}", parsed.query.node_count());
     }
 }
