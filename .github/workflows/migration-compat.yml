@@ -21,8 +21,11 @@ on:
   pull_request:
     paths:
       - "crates/frankensearch-quill/src/segment.rs"
+      - "crates/frankensearch-quill/src/segment/**"
       - "crates/frankensearch-quill/src/keeper.rs"
+      - "crates/frankensearch-quill/src/keeper/**"
       - "crates/frankensearch-quill/src/scribe.rs"
+      - "crates/frankensearch-quill/src/scribe/**"
       - "crates/frankensearch-index/src/**"
       - ".github/workflows/migration-compat.yml"
   push:
