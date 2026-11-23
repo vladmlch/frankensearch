@@ -85,7 +85,9 @@ pub use types::{
     OracleSegmentLayout,
 };
 
+#[cfg(test)]
 pub(crate) use schema::build_schema;
+#[cfg(test)]
 pub(crate) use tokenizer::build_tokenizer;
 #[cfg(feature = "tantivy-oracle")]
 pub(crate) use types::oracle_searcher_sha256;

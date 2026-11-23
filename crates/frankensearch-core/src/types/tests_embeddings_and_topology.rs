@@ -1,4 +1,4 @@
-use super::tests_support::{bound, identity, semantic_identity, test_digest};
+use super::tests_support::{identity, semantic_identity, test_digest};
 use super::*;
 
 #[test]

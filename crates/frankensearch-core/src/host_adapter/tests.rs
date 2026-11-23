@@ -2,6 +2,8 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use serde::Serialize;
+
 use super::*;
 use crate::collectors::{
     EmbedderTier, EmbeddingStage, EmbeddingStatus, IndexInventory, IndexOperation, IndexStatus,

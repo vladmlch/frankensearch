@@ -15,7 +15,7 @@ pub(super) struct CassTokenizer {
     token: Token,
 }
 
-struct CassTokenStream<'a> {
+pub(super) struct CassTokenStream<'a> {
     text: &'a str,
     cursor: usize,
     token: &'a mut Token,
