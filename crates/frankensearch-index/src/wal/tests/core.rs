@@ -1,5 +1,3 @@
-use std::fs;
-
 use frankensearch_core::SearchError;
 use half::f16;
 

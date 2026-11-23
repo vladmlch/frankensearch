@@ -12,7 +12,6 @@ use frankensearch_core::generation::{
     InMemoryAntiRollbackFloorStoreV1,
 };
 use std::fs::{self, OpenOptions};
-use std::io::Write as _;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 

@@ -10,7 +10,6 @@ use std::sync::{Arc, Mutex};
 
 use ahash::AHashMap;
 use asupersync::Cx;
-use asupersync::time::timeout;
 
 #[cfg(feature = "graph")]
 use frankensearch_core::DocumentGraph;
@@ -27,8 +26,8 @@ use frankensearch_core::traits::{
     ModelCategory, Reranker, SearchFuture,
 };
 use frankensearch_core::types::{
-    EmbeddingMetrics, IndexMetrics, PhaseMetrics, ScoreSource, ScoredResult, SearchMetrics,
-    SearchPhase, VectorHit,
+    EmbeddingMetrics, IndexMetrics, ScoreSource, ScoredResult, SearchMetrics, SearchPhase,
+    VectorHit,
 };
 use frankensearch_core::{
     AdapterIdentity, AdapterLifecycleEvent, EmbedderTier, EmbeddingStage, EmbeddingStatus,

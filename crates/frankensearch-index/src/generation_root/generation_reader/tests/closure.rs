@@ -9,7 +9,7 @@ use frankensearch_core::generation::{
     ActivationManifest, GenerationComponentRole, GenerationRootSecurityProfileV1,
     InMemoryAntiRollbackFloorStoreV1,
 };
-use sha2::{Digest as _, Sha256};
+use sha2::Sha256;
 use std::fs::{self, DirBuilder};
 use std::os::unix::fs::DirBuilderExt;
 use std::sync::Arc;
