@@ -494,7 +494,7 @@ fn parallel_filter_path_propagates_doc_id_errors() {
 
     let inspect = VectorIndex::open(&path).expect("open index");
     let bad_idx = inspect
-        .find_index_by_doc_hash(super::super::fnv1a_hash(b"doc-b"))
+        .find_index_by_doc_hash(crate::fnv1a_hash(b"doc-b"))
         .expect("doc-b index");
     let record = inspect.record_at(bad_idx).expect("record");
     let bad_offset = inspect.strings_offset + usize::try_from(record.doc_id_offset).unwrap_or(0);

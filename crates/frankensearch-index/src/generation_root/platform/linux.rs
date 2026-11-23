@@ -22,7 +22,6 @@ use rustix::io::Errno;
 use sha2::{Digest, Sha256};
 use std::ffi::OsStr;
 use std::os::fd::{AsRawFd, RawFd};
-use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 
 #[cfg(target_os = "linux")]

@@ -360,7 +360,7 @@ pub(super) struct AbsoluteRoute {
 
 pub(super) struct OpenedRoute {
     pub(super) descriptor: OwnedFd,
-    route_identities: Vec<BasicObjectIdentity>,
+    pub(super) route_identities: Vec<BasicObjectIdentity>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

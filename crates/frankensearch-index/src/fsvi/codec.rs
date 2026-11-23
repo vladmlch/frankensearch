@@ -17,7 +17,8 @@ use super::types::take_f16_destination_reservation_failure;
 use super::types::{
     FSVI_MAGIC, FSVI_V2_FIXED_PREFIX_BYTES, FSVI_V2_IDENTITY_BINDING_SCHEMA,
     FSVI_V2_MAX_HEADER_BYTES, FSVI_V2_VERSION, FSVI_VERSION, FsviV2IdentityBinding,
-    ORDERED_DOCSET_DIGEST_DOMAIN, Quantization, SHA256_BYTES, VECTOR_CONTENT_DIGEST_DOMAIN,
+    ORDERED_DOCSET_DIGEST_DOMAIN, Quantization, RECORD_FLAG_TOMBSTONE, SHA256_BYTES,
+    VECTOR_CONTENT_DIGEST_DOMAIN,
 };
 
 pub(super) fn fsvi_v2_header_len(binding: &FsviV2IdentityBinding) -> SearchResult<usize> {

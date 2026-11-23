@@ -14,7 +14,7 @@ use super::{
 /// Internal qualified directory capability used while atomically binding the
 /// named LOCK and AUTHORITY anchors.
 pub(in crate::generation_root) struct QualifiedGenerationDirectory {
-    inner: platform::RootHandle,
+    pub(in crate::generation_root) inner: platform::RootHandle,
 }
 
 impl QualifiedGenerationDirectory {

@@ -178,13 +178,13 @@ impl Quantization {
 #[derive(Clone, PartialEq, Eq)]
 pub struct FsviV2IdentityBinding {
     pub(super) generation: ArtifactGenerationIdentityV1,
-    pub(super) frozen_identity: FrozenEmbeddingIdentityBundleV1,
-    pub(super) space_canonical_bytes: Vec<u8>,
+    pub(crate) frozen_identity: FrozenEmbeddingIdentityBundleV1,
+    pub(crate) space_canonical_bytes: Vec<u8>,
     pub(super) storage_canonical_bytes: Vec<u8>,
     pub(super) bundle_fingerprint: [u8; SHA256_BYTES],
     pub(super) space_fingerprint: [u8; SHA256_BYTES],
     pub(super) producer_fingerprint: [u8; SHA256_BYTES],
-    pub(super) input_fingerprint: [u8; SHA256_BYTES],
+    pub(crate) input_fingerprint: [u8; SHA256_BYTES],
     pub(super) storage_fingerprint: [u8; SHA256_BYTES],
     pub(super) generation_fingerprint: [u8; SHA256_BYTES],
     pub(super) dimension: usize,

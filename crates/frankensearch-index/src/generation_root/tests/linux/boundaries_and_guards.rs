@@ -11,7 +11,7 @@ use super::super::super::{
 use super::*;
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt, symlink};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt, symlink};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 

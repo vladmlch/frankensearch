@@ -519,7 +519,7 @@ fn resolves_doc_ids_only_for_winners() {
 
     let inspect = VectorIndex::open(&path).expect("open index");
     let loser_idx = inspect
-        .find_index_by_doc_hash(super::super::fnv1a_hash(b"loser"))
+        .find_index_by_doc_hash(crate::fnv1a_hash(b"loser"))
         .expect("loser index");
     let entry = inspect.record_at(loser_idx).expect("record");
     let loser_offset = inspect.strings_offset + usize::try_from(entry.doc_id_offset).unwrap_or(0);
@@ -548,7 +548,7 @@ fn bitset_filter_skips_doc_id_decode_for_non_matching_records() {
 
     let inspect = VectorIndex::open(&path).expect("open index");
     let bad_idx = inspect
-        .find_index_by_doc_hash(super::super::fnv1a_hash(b"doc-b"))
+        .find_index_by_doc_hash(crate::fnv1a_hash(b"doc-b"))
         .expect("doc-b index");
     let record = inspect.record_at(bad_idx).expect("record");
     let bad_offset =

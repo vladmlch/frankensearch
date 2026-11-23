@@ -259,7 +259,7 @@ pub enum GenerationFileRole {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GenerationFileExpectation {
     pub(in crate::generation_root) byte_len: u64,
-    sha256: Option<[u8; 32]>,
+    pub(in crate::generation_root) sha256: Option<[u8; 32]>,
     pub(in crate::generation_root) role: GenerationFileRole,
 }
 

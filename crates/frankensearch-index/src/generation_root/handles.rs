@@ -186,7 +186,7 @@ pub(in crate::generation_root) enum GenerationRootLockMode {
 #[must_use = "holding this guard keeps the kernel lock acquired"]
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 pub(in crate::generation_root) struct GenerationRootLock {
-    inner: platform::LockHandle,
+    pub(in crate::generation_root) inner: platform::LockHandle,
 }
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
