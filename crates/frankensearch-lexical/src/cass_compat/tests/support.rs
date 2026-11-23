@@ -1,5 +1,7 @@
+use tantivy::schema::Value as _;
+
 use super::{
-    CassDocumentRef, CassFields, CassQueryFilters, CassTantivyIndex, Value as _, cass_build_schema,
+    CassDocumentRef, CassFields, CassQueryFilters, CassTantivyIndex, cass_build_schema,
     cass_build_tantivy_query, cass_fields_from_schema,
 };
 

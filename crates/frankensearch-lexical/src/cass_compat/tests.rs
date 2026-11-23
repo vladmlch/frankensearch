@@ -4,7 +4,7 @@ pub(super) use frankensearch_core::error::SearchResult;
 pub(super) use tantivy::{
     indexer::NoMergePolicy,
     query::RegexQuery,
-    schema::{Field, IndexRecordOption, Value as _},
+    schema::{Field, IndexRecordOption},
     tokenizer::{TextAnalyzer, TokenStream, Tokenizer},
 };
 
@@ -18,7 +18,7 @@ pub(super) use super::query_builder::{
 };
 pub(super) use super::tokenizer::{CassTokenizer, is_cjk, next_char_from};
 pub(super) use super::*;
-pub(super) use support::*;
+use support::*;
 
 mod query_and_oracle;
 mod support;
