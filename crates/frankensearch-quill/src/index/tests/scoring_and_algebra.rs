@@ -1,3 +1,5 @@
+use crate::query::QueryField;
+
 use super::*;
 
 #[test]

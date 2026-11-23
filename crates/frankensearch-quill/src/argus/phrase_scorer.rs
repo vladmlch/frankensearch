@@ -58,10 +58,10 @@ impl<'a> PhraseTerm<'a> {
     }
 }
 
-struct PhraseSlot<'a> {
+pub(in crate::argus) struct PhraseSlot<'a> {
     position: u32,
     alternatives: Vec<Box<dyn PostingCursor + 'a>>,
-    positions: Vec<u32>,
+    pub(in crate::argus) positions: Vec<u32>,
     pub(in crate::argus) cost: u64,
     pub(in crate::argus) size_hint: u32,
 }

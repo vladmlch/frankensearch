@@ -1,6 +1,4 @@
-use crate::argus::{
-    ArgusError, DocSetCollector, QueryWorkCheckpoint, QueryWorkKind, TopDocsCollector,
-};
+use crate::argus::{ArgusError, DocSetCollector, QueryWorkKind, TopDocsCollector};
 use crate::query::{
     BooleanClause, Occur, Query, QueryDiagnostic, QueryExplanation, QueryNode, QueryValue,
     canonicalize_query, classify_query,

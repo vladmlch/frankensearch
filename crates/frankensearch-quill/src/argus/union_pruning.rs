@@ -10,7 +10,7 @@ use super::{
     ArgusError, BMW_MIN_CLAUSES, BMW_MIN_TOTAL_COST, MAX_SCORE_MAX_CLAUSES, UNION_HORIZON,
 };
 
-impl<'a> BufferedUnionScorer<'a> {
+impl BufferedUnionScorer<'_> {
     pub(in crate::argus) fn competitive_candidates(
         &self,
         window_start: u32,

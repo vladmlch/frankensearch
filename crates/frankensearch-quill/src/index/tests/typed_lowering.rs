@@ -1,3 +1,5 @@
+use crate::keeper::KeeperWriter;
+
 use super::*;
 
 fn apply_typed_delta_document(

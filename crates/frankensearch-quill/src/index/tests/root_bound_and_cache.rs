@@ -1,3 +1,5 @@
+use crate::query::QueryField;
+
 use super::*;
 
 /// A refresh with nothing new published reads only the MANIFEST: it

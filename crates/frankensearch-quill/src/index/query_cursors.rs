@@ -1,8 +1,7 @@
 use crate::argus::{
     ArgusError, Bm25FieldSnapshot, CheckpointPostingCursor, DeltaFieldNorms, DeltaPostingCursor,
-    FieldNormReader, PositionsHandle, PositionsReader, PostingCursor, QueryWorkCheckpoint,
-    QueryWorkKind, ReferenceScorer, SealedPostingCursor, TermRecordOption, TermScorer,
-    ValidatedArrivalCursor,
+    FieldNormReader, PositionsHandle, PositionsReader, PostingCursor, QueryWorkKind,
+    ReferenceScorer, SealedPostingCursor, TermRecordOption, TermScorer, ValidatedArrivalCursor,
 };
 #[cfg(test)]
 use crate::delta::DeltaSnapshot;
