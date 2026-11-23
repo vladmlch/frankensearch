@@ -151,12 +151,48 @@ pub use api_provider::{
 
 #[cfg(test)]
 mod build_policy_tests {
+    use std::fs;
+    use std::path::Path;
+
     const BUILD_SCRIPT: &str = include_str!("../build.rs");
-    const AUTO_DETECT_SOURCE: &str = include_str!("auto_detect.rs");
-    const FASTEMBED_SOURCE: &str = include_str!("fastembed_embedder.rs");
-    const MODEL_DOWNLOAD_SOURCE: &str = include_str!("model_download.rs");
-    const MODEL_REGISTRY_SOURCE: &str = include_str!("model_registry.rs");
-    const MODEL2VEC_SOURCE: &str = include_str!("model2vec_embedder.rs");
+
+    fn load_module_subtree(stem: &str) -> String {
+        let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let root_file = src_dir.join(format!("{stem}.rs"));
+        let mut combined = fs::read_to_string(&root_file)
+            .unwrap_or_else(|err| panic!("failed to read {}: {err}", root_file.display()));
+
+        let sub_dir = src_dir.join(stem);
+        if sub_dir.is_dir() {
+            let mut sub_files = Vec::new();
+            let mut stack = vec![sub_dir];
+            while let Some(dir) = stack.pop() {
+                let entries = fs::read_dir(&dir)
+                    .unwrap_or_else(|err| panic!("failed to read {}: {err}", dir.display()));
+                for entry in entries {
+                    let path = entry
+                        .unwrap_or_else(|err| {
+                            panic!("failed to inspect entry in {}: {err}", dir.display())
+                        })
+                        .path();
+                    if path.is_dir() {
+                        stack.push(path);
+                    } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+                        sub_files.push(path);
+                    }
+                }
+            }
+            sub_files.sort();
+            for path in sub_files {
+                let content = fs::read_to_string(&path)
+                    .unwrap_or_else(|err| panic!("failed to read {}: {err}", path.display()));
+                combined.push('\n');
+                combined.push_str(&content);
+            }
+        }
+
+        combined
+    }
 
     #[test]
     fn build_script_is_strictly_network_free_and_non_destructive() {
@@ -180,13 +216,14 @@ mod build_policy_tests {
 
     #[test]
     fn model_identity_logs_do_not_emit_raw_paths() {
-        for source in [
-            AUTO_DETECT_SOURCE,
-            FASTEMBED_SOURCE,
-            MODEL2VEC_SOURCE,
-            MODEL_DOWNLOAD_SOURCE,
-            MODEL_REGISTRY_SOURCE,
+        for stem in [
+            "auto_detect",
+            "fastembed_embedder",
+            "model2vec_embedder",
+            "model_download",
+            "model_registry",
         ] {
+            let source = load_module_subtree(stem);
             for forbidden in [
                 "path = %",
                 "model_dir = %",
@@ -200,7 +237,7 @@ mod build_policy_tests {
             ] {
                 assert!(
                     !source.contains(forbidden),
-                    "model logging source contains raw-path field {forbidden}"
+                    "model logging source ({stem}) contains raw-path field {forbidden}"
                 );
             }
         }

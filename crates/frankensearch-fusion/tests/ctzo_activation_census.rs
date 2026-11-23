@@ -34,14 +34,213 @@ fn read(relative: &str) -> String {
     })
 }
 
-/// The production half of a source file: everything above the inline test
-/// module. Consuming a symbol only from a test would satisfy "the symbol
-/// exists" while leaving production unmigrated, which is exactly the
-/// confusion C5 exists to prevent.
-fn production_half(source: &str) -> &str {
-    source
-        .split_once("\n#[cfg(test)]")
-        .map_or(source, |(production, _)| production)
+/// Collect non-test `.rs` files under `dir` recursively in deterministic sorted order.
+fn collect_production_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let entries = std::fs::read_dir(dir).unwrap_or_else(|error| {
+        panic!(
+            "census could not read submodule directory {}: {error}",
+            dir.display()
+        );
+    });
+    for entry in entries {
+        let entry = entry.unwrap_or_else(|error| {
+            panic!(
+                "census failed reading directory entry under {}: {error}",
+                dir.display()
+            );
+        });
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if path.is_dir() {
+            if name == "tests" {
+                continue;
+            }
+            collect_production_rs_files(&path, out);
+        } else if path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("rs"))
+        {
+            let is_test_file =
+                path.file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .is_some_and(|stem| {
+                        stem == "tests" || stem.ends_with("_tests") || stem.ends_with(".tests")
+                    });
+            if !is_test_file {
+                out.push(path);
+            }
+        }
+    }
+    out.sort();
+}
+
+/// Skip comments, string literals, and char literals starting at `idx`,
+/// returning the index of the next code byte if `bytes[idx]` opened one.
+fn skip_non_code_token(bytes: &[u8], idx: usize) -> Option<usize> {
+    if bytes[idx] == b'/' && bytes.get(idx + 1) == Some(&b'/') {
+        let mut cursor = idx + 2;
+        while cursor < bytes.len() && bytes[cursor] != b'\n' {
+            cursor += 1;
+        }
+        return Some(cursor);
+    }
+    if bytes[idx] == b'/' && bytes.get(idx + 1) == Some(&b'*') {
+        let mut cursor = idx + 2;
+        let mut depth = 1_usize;
+        while cursor + 1 < bytes.len() && depth > 0 {
+            if bytes[cursor] == b'/' && bytes[cursor + 1] == b'*' {
+                depth += 1;
+                cursor += 2;
+            } else if bytes[cursor] == b'*' && bytes[cursor + 1] == b'/' {
+                depth -= 1;
+                cursor += 2;
+            } else {
+                cursor += 1;
+            }
+        }
+        return Some(cursor);
+    }
+    if bytes[idx] == b'"' {
+        let mut cursor = idx + 1;
+        while cursor < bytes.len() {
+            if bytes[cursor] == b'\\' {
+                cursor = (cursor + 2).min(bytes.len());
+            } else if bytes[cursor] == b'"' {
+                return Some(cursor + 1);
+            } else {
+                cursor += 1;
+            }
+        }
+        return Some(bytes.len());
+    }
+    if bytes[idx] == b'\'' {
+        if bytes.get(idx + 1) == Some(&b'\\') {
+            let mut cursor = idx + 3;
+            while cursor < bytes.len() && bytes[cursor] != b'\'' && bytes[cursor] != b'\n' {
+                cursor += 1;
+            }
+            return Some((cursor + 1).min(bytes.len()));
+        }
+        if bytes.get(idx + 2) == Some(&b'\'') {
+            return Some(idx + 3);
+        }
+    }
+    None
+}
+
+/// Advance past one `#[cfg(test)]` Rust item (an out-of-line `mod tests;` /
+/// `const ...;` ending in `;` at depth 0, or a braced item `mod tests { ... }`
+/// / `fn ... { ... }`).
+fn skip_cfg_test_item(bytes: &[u8], start: usize) -> usize {
+    let mut cursor = start;
+    let mut attr_depth = 0_usize;
+    while cursor < bytes.len() {
+        if let Some(next) = skip_non_code_token(bytes, cursor) {
+            cursor = next;
+            continue;
+        }
+        if bytes[cursor] == b'[' {
+            attr_depth += 1;
+        } else if bytes[cursor] == b']' {
+            attr_depth = attr_depth.saturating_sub(1);
+            if attr_depth == 0 {
+                cursor += 1;
+                break;
+            }
+        }
+        cursor += 1;
+    }
+
+    let mut brace_depth = 0_usize;
+    let mut bracket_depth = 0_usize;
+    let mut saw_brace = false;
+    while cursor < bytes.len() {
+        if let Some(next) = skip_non_code_token(bytes, cursor) {
+            cursor = next;
+            continue;
+        }
+        match bytes[cursor] {
+            b'[' => bracket_depth += 1,
+            b']' => bracket_depth = bracket_depth.saturating_sub(1),
+            b'{' if bracket_depth == 0 => {
+                brace_depth += 1;
+                saw_brace = true;
+            }
+            b'}' if bracket_depth == 0 => {
+                brace_depth = brace_depth.saturating_sub(1);
+                if saw_brace && brace_depth == 0 {
+                    return cursor + 1;
+                }
+            }
+            b';' if bracket_depth == 0 && brace_depth == 0 && !saw_brace => {
+                return cursor + 1;
+            }
+            _ => {}
+        }
+        cursor += 1;
+    }
+    bytes.len()
+}
+
+/// The production half of a source file: everything outside `#[cfg(test)]`
+/// items (handles inline `#[cfg(test)] mod tests { ... }`, out-of-line
+/// `#[cfg(test)] mod tests;`, and individual `#[cfg(test)]` items without
+/// truncating production code below them). Consuming a symbol only from a
+/// test would satisfy "the symbol exists" while leaving production unmigrated,
+/// which is exactly the confusion C5 exists to prevent.
+fn production_half(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let mut out = String::with_capacity(source.len());
+    let mut keep_from = 0_usize;
+    let mut cursor = 0_usize;
+
+    while cursor < bytes.len() {
+        if let Some(next) = skip_non_code_token(bytes, cursor) {
+            cursor = next;
+            continue;
+        }
+        if bytes[cursor..].starts_with(b"#[cfg(test)]") {
+            out.push_str(&source[keep_from..cursor]);
+            cursor = skip_cfg_test_item(bytes, cursor);
+            keep_from = cursor;
+            continue;
+        }
+        cursor += 1;
+    }
+
+    if keep_from < bytes.len() {
+        out.push_str(&source[keep_from..]);
+    }
+    out
+}
+
+/// Read the production half of `relative` plus, when a matching `<stem>/`
+/// directory exists alongside `<stem>.rs`, the production half of every
+/// non-test `.rs` submodule sorted deterministically.
+fn read_production_subtree(relative: &str) -> String {
+    let root_path = workspace_root().join(relative);
+    let root_source = read(relative);
+    let mut combined = production_half(&root_source);
+
+    let sibling_dir = root_path.with_extension("");
+    if sibling_dir.is_dir() {
+        let mut subfiles = Vec::new();
+        collect_production_rs_files(&sibling_dir, &mut subfiles);
+        for subfile in subfiles {
+            let sub_source = std::fs::read_to_string(&subfile).unwrap_or_else(|error| {
+                panic!(
+                    "census could not read submodule {}: {error}",
+                    subfile.display()
+                );
+            });
+            combined.push('\n');
+            combined.push_str(&production_half(&sub_source));
+        }
+    }
+
+    combined
 }
 
 fn census() -> serde_json::Value {
@@ -63,8 +262,7 @@ fn every_named_entry_point_exists_in_production_source() {
     for entry in entries {
         let file = entry["file"].as_str().expect("file");
         let symbol = entry["symbol"].as_str().expect("symbol");
-        let source = read(file);
-        let production = production_half(&source);
+        let production = read_production_subtree(file);
         assert!(
             production.contains(symbol),
             "census names `{symbol}` in {file}, but it is absent from that file's \
@@ -88,8 +286,7 @@ fn production_call_site_counts_match_the_census_exactly() {
         let callee = site["callee"].as_str().expect("callee");
         let expected = usize::try_from(site["count"].as_u64().expect("count")).expect("count fits");
 
-        let source = read(file);
-        let production = production_half(&source);
+        let production = read_production_subtree(file);
         // The definition line is not a call site; count only invocations.
         let actual = production
             .lines()
@@ -136,14 +333,14 @@ fn the_activation_types_are_consumed_outside_their_defining_crate() {
 
     // And the strong form: a type defined in core is named in a production
     // file of another crate. `docs` alone would not prove consumption.
-    let searcher = read("crates/frankensearch-fusion/src/searcher.rs");
+    let searcher = read_production_subtree("crates/frankensearch-fusion/src/searcher.rs");
     assert!(
-        production_half(&searcher).contains("TieredQueryEmbeddings"),
+        searcher.contains("TieredQueryEmbeddings"),
         "the async searcher must consume TieredQueryEmbeddings in production code"
     );
-    let sync_searcher = read("crates/frankensearch-fusion/src/sync_searcher.rs");
+    let sync_searcher = read_production_subtree("crates/frankensearch-fusion/src/sync_searcher.rs");
     assert!(
-        production_half(&sync_searcher).contains("TieredQueryEmbeddings"),
+        sync_searcher.contains("TieredQueryEmbeddings"),
         "the sync searcher must consume TieredQueryEmbeddings in production code"
     );
 }
