@@ -32,7 +32,7 @@ use crate::scribe::{DOC_ORDS_PER_LEASE, TermInterner};
 use arena::TypedChainArena;
 use ingest::validate_lease_base;
 pub use snapshot::DeltaSnapshot;
-pub(crate) use snapshot::{DeltaOrderedTerms, DeltaStoredMaterialization};
+pub(crate) use snapshot::DeltaStoredMaterialization;
 pub use types::{
     DeltaApply, DeltaBlockMax, DeltaError, DeltaFieldNorm, DeltaMemoryStats, DeltaNumericValue,
     DeltaPosting, DeltaStoredValue, DeltaTermPosting,

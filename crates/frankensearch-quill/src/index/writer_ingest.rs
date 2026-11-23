@@ -18,9 +18,7 @@ use super::conformance::ConformanceCancellationStage;
 use super::error_results::{
     MAX_GLOBAL_DOCID_EXCLUSIVE, QuillIndexError, check_cancel, invalid_state,
 };
-use super::ingest_doc::{
-    IngestBatch, SchemaDocument, canonical_metadata, manifest_segment, write_canonical_metadata,
-};
+use super::ingest_doc::{IngestBatch, SchemaDocument};
 use super::parallel_ingest::{
     FANOUT_MIN_SHARD_DOCUMENTS, FANOUT_WAVE_SHARD_DOCUMENTS, INTERNAL_PARALLEL_INGEST_SHARDS,
     IngestParallelismPolicy, MIN_ARENA_CHUNK_BYTES, PARALLEL_ARENA_BUDGET_DIVISOR,

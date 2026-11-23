@@ -120,9 +120,7 @@ use manifest_publish_choreography::publish_manifest_choreography;
 #[cfg(all(test, unix))]
 use manifest_validation::usize_to_u64;
 #[cfg(test)]
-use manifest_validation::{
-    invalid, put_u16, put_u32, tombstone_chunk_count, validate_tombstone_bytes,
-};
+use manifest_validation::{put_u16, put_u32, tombstone_chunk_count, validate_tombstone_bytes};
 #[cfg(all(test, unix))]
 use publish::GenerationClaimGuard;
 #[cfg(test)]
@@ -140,8 +138,6 @@ use slot_io::{ManifestSlot, read_manifest_slot};
 use snapshot::manifest_matches_proposal;
 #[cfg(all(test, unix))]
 use stats_and_cursor::detect_live_writer;
-#[cfg(test)]
-use stats_and_cursor::managed_disk_bytes;
 #[cfg(test)]
 use writer::PublicationAuthorityTransition;
 #[cfg(all(test, unix))]

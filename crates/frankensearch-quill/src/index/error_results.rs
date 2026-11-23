@@ -3,8 +3,8 @@ use crate::config::QuillConfig;
 use crate::error::QuillError;
 use crate::grimoire::TermDictionaryError;
 use crate::keeper::{
-    CurrentPointer, CurrentPointerError, KeeperError, KeeperSnapshot, KeeperWriter,
-    PublicationAuthorityPhase, PublicationAuthorityState, TierPolicyError,
+    CurrentPointerError, KeeperError, KeeperSnapshot, KeeperWriter, PublicationAuthorityPhase,
+    PublicationAuthorityState, TierPolicyError,
 };
 use crate::query::{
     QueryCapabilityError, QueryDiagnostic, QueryExplanation, QueryParserConfigError,
@@ -134,7 +134,7 @@ pub enum QuillIndexError {
 }
 
 impl From<ArgusError> for QuillIndexError {
-    pub(super) fn from(error: ArgusError) -> Self {
+    fn from(error: ArgusError) -> Self {
         match error {
             ArgusError::QueryCancelled { phase } => Self::Cancelled { phase },
             ArgusError::QueryFuelExhausted {
@@ -253,7 +253,7 @@ pub struct QuillSearchResult {
 }
 
 impl From<QuillIndexError> for SearchError {
-    pub(super) fn from(error: QuillIndexError) -> Self {
+    fn from(error: QuillIndexError) -> Self {
         match error {
             QuillIndexError::Config(source) => source,
             QuillIndexError::Keeper(source) => source.into(),

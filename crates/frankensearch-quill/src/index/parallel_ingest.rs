@@ -4,7 +4,7 @@ use crate::quiver::NumericValue;
 use crate::schema::{Analyzer, FieldKind, SchemaDescriptor};
 use crate::scribe::{
     AccumulatorError, ArenaSpan, ColumnarAccumulator, DEFAULT_ARENA_CHUNK_BYTES, DocIdSpan,
-    FIELD_PREFIX_BYTES, FrankensearchTokenizer, TERM_BUCKET_BYTES_ESTIMATE,
+    FIELD_PREFIX_BYTES, FrankensearchTokenizer, TERM_BUCKET_BYTES_ESTIMATE, TokenAnalyzer,
 };
 use crate::segment::EncodedSegment;
 use asupersync::Cx;
@@ -23,9 +23,7 @@ use super::error_results::{
     CONTENT_FIELD, ID_FIELD, MAX_GLOBAL_DOCID_EXCLUSIVE, METADATA_FIELD, QuillIndexError,
     TITLE_FIELD, check_cancel, invalid_state,
 };
-use super::ingest_doc::{
-    IngestBatch, canonical_metadata, manifest_segment, write_canonical_metadata,
-};
+use super::ingest_doc::{IngestBatch, canonical_metadata};
 use super::reader::QuillReader;
 
 pub(super) const PARALLEL_INGEST_MIN_DOCS_PER_SHARD: usize = 64;

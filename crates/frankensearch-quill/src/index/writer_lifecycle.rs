@@ -1,7 +1,7 @@
 use crate::keeper::{
     CompactionPolicy, CompactionReport, GarbageCollectionOptions, GarbageCollectionReport,
-    KeeperError, KeeperSnapshot, LiveDocumentFloor, MANIFEST_FLAG_BULK_MODE_IN_PROGRESS,
-    PublicationReadState, PublishIntent, TierMergePolicy, plan_tier_merge,
+    KeeperError, KeeperSnapshot, MANIFEST_FLAG_BULK_MODE_IN_PROGRESS, PublicationReadState,
+    PublishIntent, TierMergePolicy, plan_tier_merge,
 };
 use crate::scribe::{DocIdAllocator, DocIdSpan};
 use asupersync::Cx;
@@ -19,7 +19,7 @@ use super::error_results::{
     MAX_GLOBAL_DOCID_EXCLUSIVE, QuillIndexError, check_cancel, invalid_state,
     record_snapshot_fields, wall_clock_unix_s,
 };
-use super::ingest_doc::{IngestBatch, write_canonical_metadata};
+use super::ingest_doc::IngestBatch;
 use super::parallel_ingest::{
     FANOUT_WAVE_SHARD_DOCUMENTS, IngestParallelismPolicy, ParallelBatchObservation,
     PendingIdentity, ScribeShardState, ValidatedBatchAdmission, accumulate_shard_run,

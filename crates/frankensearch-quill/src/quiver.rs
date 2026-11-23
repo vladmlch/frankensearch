@@ -31,7 +31,6 @@ pub use doclen::{
 };
 pub use id_hash::{EncodedIdHashSection, IdHashCodecError, IdHashLimits, IdHashSection};
 pub(crate) use id_hash::{IdHashLookupPlan, IdMapPresence};
-pub(crate) use id_map::IdMapConcatPlan;
 pub use id_map::{
     EncodedIdMapSection, ID_HASH_ENTRY_LEN, ID_HASH_HEADER_LEN, ID_HASH_SEED, ID_MAP_HASH_LEN,
     ID_MAP_HEADER_LEN, ID_MAP_MAX_SPAN, ID_MAP_OFFSET_LEN, IdMapCodecError, IdMapEntry,
@@ -64,9 +63,7 @@ pub use stored_meta::{
     BorrowedStoredMetaSection, EncodedStoredMetaSection, STORED_META_DIRECTORY_ENTRY_LEN,
     StoredMetaCodecError, StoredMetaFieldInput, StoredMetaLimits,
 };
-pub(crate) use stored_meta::{
-    StoredMetaConcatPlan, StoredMetaLookup, ValidatedStoredMetaLookupPlan,
-};
+pub(crate) use stored_meta::{StoredMetaLookup, ValidatedStoredMetaLookupPlan};
 #[cfg(test)]
 pub(crate) use stored_meta::{reset_stored_meta_materializations, stored_meta_materializations};
 pub use stored_meta_section::{StoredMetaField, StoredMetaSection};

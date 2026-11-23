@@ -3,7 +3,6 @@ use super::postings::{
     BLOCK_HEADER_LEN, FREQ_ALL_ONE, FREQ_BITPACKED, POSTINGS_PER_BLOCK, POSTINGS_PER_BLOCK_U8,
     Posting, PostingBlockKind, PostingCodecError, VINT_KIND,
 };
-use super::{read_u16, read_u32};
 
 #[derive(Clone, Copy)]
 enum FrequencyEncoding {

@@ -12,6 +12,7 @@ use super::boolean_scorers::{
     scorer_intersection, scorer_union, scorer_union_unscored,
 };
 use super::collector::{CollectorState, DocSetCollector, LiveDocs, ScoredDoc, TopDocsCollector};
+use super::cursor::PostingCursor;
 #[cfg(test)]
 use super::cursor::TermCursor;
 use super::phrase_scorer::PhraseScorer;

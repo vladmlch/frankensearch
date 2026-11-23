@@ -3,7 +3,6 @@ use crate::quiver::postings::{
     BITMAP_KIND, FOR_KIND, FREQ_ALL_ONE, FREQ_BITPACKED, POSTINGS_PER_BLOCK_U8, VINT_KIND,
 };
 
-use super::super::*;
 use super::*;
 
 #[test]

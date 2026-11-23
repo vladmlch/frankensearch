@@ -1,10 +1,12 @@
+#![allow(clippy::wildcard_imports)]
+
 use std::error::Error;
 
 use crate::schema::{FieldDescriptor, FieldKind, SchemaDescriptor};
 
 use super::block_max::write_vint64;
 use super::postings_codec::{encode_for_block, write_vint};
-use super::*;
+pub(super) use super::*;
 
 mod bitpack_postings;
 mod block_max;

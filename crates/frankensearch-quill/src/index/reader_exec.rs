@@ -1,11 +1,13 @@
-use crate::argus::{ArgusError, DocSetCollector, QueryWorkKind, TopDocsCollector};
+use crate::argus::{
+    ArgusError, DocSetCollector, QueryWorkCheckpoint, QueryWorkKind, TopDocsCollector,
+};
 use crate::query::{
     BooleanClause, Occur, Query, QueryDiagnostic, QueryExplanation, QueryNode, QueryValue,
     canonicalize_query, classify_query,
 };
 use crate::schema::FieldKind;
 use crate::snippet::{SnippetConfig, SnippetGenerator};
-use crate::stats::SegmentStats;
+use crate::stats::{SegmentStats, SegmentStatsProvider};
 use asupersync::Cx;
 use frankensearch_core::{SearchError, SearchResult};
 use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};

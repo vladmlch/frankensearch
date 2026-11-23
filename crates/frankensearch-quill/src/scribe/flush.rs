@@ -7,9 +7,9 @@ use crate::grimoire::{EncodedTermDictionary, TermDictionaryError, TermSectionLen
 use crate::quiver::{
     BlockMaxError, BorrowedStoredMetaSection, DocLenCodecError, DocLenFieldInput,
     EncodedDocLenSection, EncodedIdHashSection, EncodedIdMapSection, EncodedNumericSection,
-    EncodedStoredMetaSection, FieldStats, IdHashCodecError, IdMapCodecError, IdMapEntryInput,
-    NumericCodecError, NumericEntry, NumericFieldInput, NumericValue, PositionCodecError,
-    StatsCodecError, StoredMetaCodecError, StoredMetaFieldInput,
+    EncodedStatsSection, EncodedStoredMetaSection, FieldStats, IdHashCodecError, IdMapCodecError,
+    IdMapEntryInput, NumericCodecError, NumericEntry, NumericFieldInput, NumericValue,
+    PositionCodecError, StatsCodecError, StoredMetaCodecError, StoredMetaFieldInput,
 };
 use crate::schema::{FieldKind, SchemaDescriptor};
 #[cfg(feature = "bench-internals")]
@@ -22,7 +22,7 @@ use super::DOC_ORDS_PER_LEASE;
 use super::accumulator::ColumnarAccumulator;
 use super::analyzer::TokenAnalyzer;
 use super::radix::{
-    build_doclen_columns, build_id_map_inputs, collect_flush_rows, durable_len,
+    OrderedTermStreams, build_doclen_columns, build_id_map_inputs, collect_flush_rows, durable_len,
     encode_delta_term_streams, encode_ordered_term_streams, filled_vec, rebase_doc_id,
     schema_has_positions, stable_radix_partition_for_mode, validate_flush_documents,
 };

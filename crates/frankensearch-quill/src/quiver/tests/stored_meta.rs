@@ -1,6 +1,5 @@
 use crate::scribe::ColumnarAccumulator;
 
-use super::super::*;
 use super::*;
 
 #[test]

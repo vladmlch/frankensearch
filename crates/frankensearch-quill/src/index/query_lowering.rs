@@ -26,7 +26,6 @@ use super::error_results::{QuillIndexError, invalid_state};
 use super::query_cursors::{
     SnapshotDocFreqDeltaAdmission, borrowed_fieldnorms, checkpointed_snapshot_doc_freq,
     composite_snapshot_field, leaf_phrase_prefix_terms, lower_leaf_term, open_owned_cursor,
-    snapshot_doc_freq,
 };
 use super::query_predicates::{
     lower_leaf_glob, lower_leaf_range, lower_leaf_set, numeric_query_bounds, numeric_query_values,

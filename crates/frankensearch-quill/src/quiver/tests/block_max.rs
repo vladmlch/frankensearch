@@ -5,7 +5,6 @@ use crate::quiver::block_max::{
 };
 use crate::quiver::postings::BITMAP_KIND;
 
-use super::super::*;
 use super::*;
 
 #[test]

@@ -1,3 +1,5 @@
+use crate::scribe::TokenAnalyzer;
+
 use super::*;
 
 fn assert_parallel_budget_bound_for_schema(schema: SchemaDescriptor) {

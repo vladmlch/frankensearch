@@ -1,4 +1,5 @@
 use std::fs::File;
+use std::io::Read;
 use std::path::Path;
 
 use frankensearch_core::{SearchError, SearchResult};

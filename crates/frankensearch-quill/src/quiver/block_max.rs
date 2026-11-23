@@ -5,7 +5,6 @@ use super::postings::{POSTINGS_PER_BLOCK, Posting, PostingCodecError, PostingLis
 use super::postings_codec::{
     DecodedBlock, decode_block_at, encode_bitmap_block, encode_for_block, encode_vint_block,
 };
-use super::read_u32;
 
 /// Typed failures from encoding or validating an FSLX BLOCKMAX term stream.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]

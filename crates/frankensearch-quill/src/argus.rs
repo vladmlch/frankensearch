@@ -39,9 +39,11 @@ pub use phrase_scorer::{PhraseScorer, PhraseTerm};
 pub use reference_scorer::{ReferenceScorer, ScorerClause};
 pub use segment_cursors::{DeltaFieldNorms, DeltaPostingCursor, SealedPostingCursor};
 pub use term_scorer::{Bm25FieldSnapshot, FieldNormReader, TermRecordOption, TermScorer};
-pub(crate) use union_scorer::PruningTelemetry;
+#[cfg(feature = "pruning-conformance")]
+pub(crate) use union_scorer::ConformanceUnionRefill;
 #[cfg(any(test, feature = "pruning-conformance"))]
-pub(crate) use union_scorer::{ConformanceUnionRefill, ConformanceUnionRefillStrategy};
+pub(crate) use union_scorer::ConformanceUnionRefillStrategy;
+pub(crate) use union_scorer::PruningTelemetry;
 
 /// Postings per Delta logical block, the granularity a Delta walk charges.
 ///

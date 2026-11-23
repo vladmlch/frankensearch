@@ -205,20 +205,20 @@ fn validate_phrase_term_binding(
 /// scorer owns and reuses every positional scratch buffer, so advancing after
 /// warm-up performs no per-document allocation.
 pub struct PhraseScorer<'a> {
-    slots: Vec<PhraseSlot<'a>>,
+    pub(in crate::argus) slots: Vec<PhraseSlot<'a>>,
     prefix_gate: Vec<PhraseSlot<'a>>,
     prefix_constant_score: bool,
     fieldnorms: Box<dyn FieldNormReader + 'a>,
     snapshot: Bm25FieldSnapshot,
     weight: f32,
     lead_slot: usize,
-    cost: u64,
-    size_hint: u32,
+    pub(in crate::argus) cost: u64,
+    pub(in crate::argus) size_hint: u32,
     pub(in crate::argus) segment_num_docs: u32,
     current: Option<u32>,
     current_frequency: u32,
     slop: u32,
-    decode_scratch: Vec<u32>,
+    pub(in crate::argus) decode_scratch: Vec<u32>,
     position_indices: Vec<usize>,
     slop_positions: Vec<u32>,
     slop_costs: Vec<u32>,
@@ -757,7 +757,7 @@ impl<'a> PhraseScorer<'a> {
         Ok(scorer)
     }
 
-    fn doc(&self) -> Option<u32> {
+    pub(in crate::argus) fn doc(&self) -> Option<u32> {
         self.current
     }
 

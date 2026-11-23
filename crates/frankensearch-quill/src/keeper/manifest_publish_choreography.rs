@@ -1,15 +1,12 @@
 #[cfg(test)]
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::Arc;
 #[cfg(test)]
 use std::time::Duration;
-
-#[cfg(test)]
-use asupersync::sync::Mutex;
 
 #[cfg(windows)]
 use super::admission::open_windows_regular_file_no_reparse;

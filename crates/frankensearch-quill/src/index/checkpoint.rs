@@ -6,10 +6,8 @@ use crate::query::{Occur, Query, QueryNode, QueryValue};
 use crate::schema::{FieldKind, SchemaDescriptor};
 use crate::segment::{EncodedSegment, SectionKind};
 use asupersync::Cx;
-#[cfg(feature = "pruning-conformance")]
 use std::collections::HashMap;
 use std::sync::Arc;
-#[cfg(feature = "pruning-conformance")]
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(feature = "pruning-conformance")]

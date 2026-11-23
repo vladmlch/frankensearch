@@ -6,7 +6,7 @@ use crate::scribe::{
 };
 use crate::segment::EncodedSegment;
 use frankensearch_core::IndexableDocument;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use xxhash_rust::xxh3::Xxh3;
 
 use super::error_results::{

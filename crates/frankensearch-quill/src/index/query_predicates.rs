@@ -1,6 +1,6 @@
 use crate::argus::{
-    ArgusError, CheckpointPostingCursor, DeltaPostingCursor, PostingCursor, QueryWorkKind,
-    ReferenceScorer, ScorerClause, TermRecordOption, ValidatedArrivalCursor,
+    ArgusError, CheckpointPostingCursor, DeltaPostingCursor, PostingCursor, QueryWorkCheckpoint,
+    QueryWorkKind, ReferenceScorer, ScorerClause, TermRecordOption, ValidatedArrivalCursor,
 };
 use crate::delta::DeltaSnapshot;
 use crate::grimoire::{TermDictionaryError, trailing_star_prefix};

@@ -390,17 +390,17 @@ impl PositionsReader for SealedPostingCursor<'_> {
 pub struct DeltaPostingCursor<'a> {
     term: Option<DeltaTerm<'a>>,
     block_max: Option<DeltaBlockMax>,
-    remaining: Option<DeltaPostings<'a>>,
+    pub(in crate::argus) remaining: Option<DeltaPostings<'a>>,
     current: Option<DeltaPosting<'a>>,
-    current_ordinal: Option<u32>,
-    next_ordinal: u32,
-    last_physical_doc: Option<u32>,
+    pub(in crate::argus) current_ordinal: Option<u32>,
+    pub(in crate::argus) next_ordinal: u32,
+    pub(in crate::argus) last_physical_doc: Option<u32>,
     /// Physical rows this term holds, tombstoned ones included.
     ///
     /// A step is only real while an unread row remains, so this bounds the
     /// admissions: a walk that ends exactly on a logical-block boundary must
     /// not buy a permit for a block that does not exist.
-    physical_len: u32,
+    pub(in crate::argus) physical_len: u32,
     size_hint: u32,
     cost: u64,
     segment_num_docs: u32,
@@ -506,7 +506,7 @@ impl<'a> DeltaPostingCursor<'a> {
     /// walk reads to skip superseded postings are work the query performed,
     /// and charging only the live positions understated it while leaving the
     /// walk itself unobservable.
-    fn pull_next_live(
+    pub(in crate::argus) fn pull_next_live(
         &mut self,
         checkpoint: Option<&dyn QueryWorkCheckpoint>,
     ) -> Result<Option<u32>, ArgusError> {

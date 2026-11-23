@@ -1,7 +1,8 @@
 use crate::argus::{
     ArgusError, Bm25FieldSnapshot, CheckpointPostingCursor, DeltaFieldNorms, DeltaPostingCursor,
-    FieldNormReader, PositionsHandle, PositionsReader, PostingCursor, QueryWorkKind,
-    ReferenceScorer, SealedPostingCursor, TermRecordOption, TermScorer, ValidatedArrivalCursor,
+    FieldNormReader, PositionsHandle, PositionsReader, PostingCursor, QueryWorkCheckpoint,
+    QueryWorkKind, ReferenceScorer, SealedPostingCursor, TermRecordOption, TermScorer,
+    ValidatedArrivalCursor,
 };
 #[cfg(test)]
 use crate::delta::DeltaSnapshot;
@@ -14,8 +15,6 @@ use crate::quiver::{
     DocLenField, DocLenSection, PositionList, Posting, PostingCodecError, PostingList,
     SnapshotFieldStats,
 };
-#[cfg(test)]
-use crate::schema::FieldKind;
 use crate::schema::SchemaDescriptor;
 use crate::segment::SectionKind;
 use crate::snippet::SnippetTerm;

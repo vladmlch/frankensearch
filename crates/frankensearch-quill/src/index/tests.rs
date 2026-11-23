@@ -48,13 +48,12 @@ use crate::grimoire::{MAX_TERM_BYTES, TermDictionaryError};
 use crate::keeper::GarbageCollectionOptions;
 use crate::keeper::{
     BlueGreenEngine, CURRENT_ENGINE_VERSION, CompactionError, CompactionPolicy, ConcatMergeError,
-    CurrentPointer, KeeperError, KeeperSnapshot, KeeperWriter, MANIFEST_FLAG_BULK_MODE_IN_PROGRESS,
-    Manifest, ManifestFieldStats, ManifestSegment, PublicationReadState, RecoveredSegment,
-    publish_current,
+    CurrentPointer, KeeperError, KeeperSnapshot, MANIFEST_FLAG_BULK_MODE_IN_PROGRESS, Manifest,
+    ManifestFieldStats, ManifestSegment, PublicationReadState, RecoveredSegment, publish_current,
 };
 use crate::query::{
-    BooleanClause, BooleanOperator, DefaultQueryParser, Occur, Query, QueryField, QueryNode,
-    QueryValue, canonicalize_query,
+    BooleanClause, BooleanOperator, DefaultQueryParser, Occur, Query, QueryNode, QueryValue,
+    canonicalize_query,
 };
 #[cfg(feature = "bench-internals")]
 use crate::query::{QueryCapabilityError, QueryExplanation};

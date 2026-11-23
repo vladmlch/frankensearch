@@ -254,7 +254,7 @@ impl AllScorer {
         u32::try_from(self.span).unwrap_or(u32::MAX)
     }
 
-    fn is_raw_unit_score(&self) -> bool {
+    pub(in crate::argus) fn is_raw_unit_score(&self) -> bool {
         self.score.to_bits() == 1.0_f32.to_bits()
     }
 
@@ -320,7 +320,7 @@ impl NumericRangeScorer {
         )
     }
 
-    fn new_materialized(
+    pub(in crate::argus) fn new_materialized(
         docids: Vec<u32>,
         segment_num_docs: u32,
         covers_every_document: bool,
@@ -458,7 +458,10 @@ impl ConstantScoreScorer {
         self.doc()
     }
 
-    fn seek_danger(&mut self, target: u32) -> Result<SeekDangerResult, ArgusError> {
+    pub(in crate::argus) fn seek_danger(
+        &mut self,
+        target: u32,
+    ) -> Result<SeekDangerResult, ArgusError> {
         let result = self.seek(target);
         classify_seek_result(target, result)
     }
@@ -542,7 +545,10 @@ impl<'a> UnscoredUnionScorer<'a> {
         Ok(self.refresh_current())
     }
 
-    fn seek_danger(&mut self, target: u32) -> Result<SeekDangerResult, ArgusError> {
+    pub(in crate::argus) fn seek_danger(
+        &mut self,
+        target: u32,
+    ) -> Result<SeekDangerResult, ArgusError> {
         let result = self.seek(target)?;
         classify_seek_result(target, result)
     }
@@ -655,7 +661,10 @@ impl<'a> IntersectionScorer<'a> {
         self.align()
     }
 
-    fn seek_danger(&mut self, target: u32) -> Result<SeekDangerResult, ArgusError> {
+    pub(in crate::argus) fn seek_danger(
+        &mut self,
+        target: u32,
+    ) -> Result<SeekDangerResult, ArgusError> {
         for scorer in &mut self.scorers {
             match scorer.seek_danger(target)? {
                 SeekDangerResult::Found => {}
@@ -790,7 +799,10 @@ impl<'a> RequiredOptionalScorer<'a> {
         self.required.advance(target)
     }
 
-    fn seek_danger(&mut self, target: u32) -> Result<SeekDangerResult, ArgusError> {
+    pub(in crate::argus) fn seek_danger(
+        &mut self,
+        target: u32,
+    ) -> Result<SeekDangerResult, ArgusError> {
         self.score_cache = None;
         self.required.seek_danger(target)
     }

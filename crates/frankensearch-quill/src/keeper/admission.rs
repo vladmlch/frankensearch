@@ -12,7 +12,7 @@ use std::ffi::OsString;
 use std::fs::File;
 #[cfg(windows)]
 use std::fs::OpenOptions;
-use std::io::{self, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
