@@ -94,7 +94,7 @@ impl TantivyIndex {
     /// writer count, and heap budget.
     ///
     /// This is the same shipping analyzer, document conversion, writer, and
-    /// commit path used by [`LexicalSearch`]. Only the knobs that the Quill QG
+    /// commit path used by [`LexicalWrite`](frankensearch_core::LexicalWrite). Only the knobs that the Quill QG
     /// matrix must hold equal across engines are exposed. Shipping callers use
     /// [`Self::in_memory`] instead.
     ///

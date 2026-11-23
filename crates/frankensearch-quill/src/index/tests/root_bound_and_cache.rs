@@ -1,4 +1,4 @@
-#[cfg(feature = "bench-internals")]
+#[cfg(all(feature = "bench-internals", feature = "conformance-internals"))]
 use crate::query::QueryField;
 
 use super::*;

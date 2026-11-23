@@ -360,7 +360,7 @@ pub struct EncodedStoredMetaSection {
 /// # Why this exists (`bd-4xr99`)
 ///
 /// A stored byte used to be copied twice per seal: once from the caller's
-/// borrowed input into [`StoredFieldColumns`]'s owned blob, and again from that
+/// borrowed input into [`StoredFieldColumns`](crate::scribe::StoredFieldColumns)'s owned blob, and again from that
 /// blob into the section's owned `Vec<u8>` — which the segment assembler then
 /// copied a third time into the durable buffer. Only the first copy is forced:
 /// it is where borrowed input becomes bytes that outlive the caller. The

@@ -10,7 +10,7 @@ use super::cass::is_cass_cjk;
 /// This fuses Tantivy's `SimpleTokenizer` and `LowerCaser`: split on
 /// non-alphanumeric Unicode scalar values, ASCII-lowercase in place, and use
 /// the full Unicode lowercase expansion otherwise. It deliberately does not
-/// enforce [`MAX_TERM_BYTES`]; admission belongs to document/query consumers
+/// enforce [`MAX_TERM_BYTES`](crate::grimoire::MAX_TERM_BYTES); admission belongs to document/query consumers
 /// so a dropped document token retains its position gap.
 ///
 /// Token boundaries are found by a one-pass 32-byte portable SIMD classifier,
@@ -18,7 +18,7 @@ use super::cass::is_cass_cjk;
 /// tail. `wide` lowers the same safe code to the available SSE2/AVX2, NEON, or
 /// wasm SIMD implementation without exposing architecture intrinsics here. The
 /// emitted stream is byte-parity-identical to
-/// [`analyze_default_scalar_reference`] — the retained scalar oracle — which
+/// `analyze_default_scalar_reference` — the retained scalar oracle — which
 /// the tokenizer parity tests pin. The quill crate root remains
 /// `#![forbid(unsafe_code)]`.
 #[derive(Debug, Clone, Default)]

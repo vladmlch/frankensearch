@@ -8,7 +8,7 @@ use super::tokenizer::{FrankensearchTokenizer, next_token_position, tokenizer_ne
 /// The shipping CASS analyzer retains exactly 256 UTF-8 bytes and drops 257.
 /// This inclusive boundary intentionally differs from Tantivy's strict
 /// `RemoveLongFilter::limit(256)` predicate and is much smaller than Quill's
-/// global [`MAX_TERM_BYTES`] admission ceiling.
+/// global [`MAX_TERM_BYTES`](crate::grimoire::MAX_TERM_BYTES) admission ceiling.
 pub const CASS_MAX_TOKEN_BYTES: usize = 256;
 
 /// Maximum Unicode-scalar prefix length generated for CASS prefix fields.

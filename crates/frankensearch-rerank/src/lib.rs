@@ -1,6 +1,6 @@
 //! Cross-encoder reranking for frankensearch.
 //!
-//! The pure-Rust [`NativeReranker`] (feature `native`) runs a BERT
+//! The pure-Rust `NativeReranker` (feature `native`) runs a BERT
 //! cross-encoder forward pass on frankentorch tensors — no ONNX / `ort` /
 //! native C++ dependency — producing `sigmoid(logit)` relevance scores in
 //! `[0, 1]`. An optional `FastEmbed` backend is available behind

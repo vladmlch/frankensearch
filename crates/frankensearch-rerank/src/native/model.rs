@@ -262,7 +262,7 @@ impl Model {
             .map_err(|e| rerank_err("add_layer_norm", e))
     }
 
-    /// Exact GELU via the vectorized [`fast_gelu`] (A–S erf), replacing the
+    /// Exact GELU via the vectorized [`fast_gelu_inplace`] (A–S erf), replacing the
     /// `tensor_gelu` tape op's scalar libm `erff`. Round-trips through f32 values +
     /// a fresh leaf, consistent with the int8 linear (which already returns a
     /// detached f32 leaf), so there is no live autograd graph to preserve.

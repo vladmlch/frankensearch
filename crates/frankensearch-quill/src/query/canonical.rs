@@ -357,7 +357,7 @@ pub fn classify_query(query: &str) -> QueryExplanation {
 /// Parser recovery/normalization diagnostic category.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryDiagnosticKind {
-    /// The query exceeded [`MAX_QUERY_LENGTH`].
+    /// The query exceeded [`MAX_QUERY_LENGTH`](super::MAX_QUERY_LENGTH).
     Truncated,
     /// Invalid syntax was repaired or skipped.
     SyntaxRecovery,

@@ -295,7 +295,7 @@ pub(in crate::delta) struct PostingRecord {
     pub(in crate::delta) has_positions: bool,
 }
 
-/// Immutable posting yielded by a [`DeltaTerm`] view.
+/// Immutable posting yielded by a [`DeltaTerm`](super::DeltaTerm) view.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeltaPosting<'a> {
     /// Absolute global document identifier.

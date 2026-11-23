@@ -124,8 +124,8 @@ test_logs/
 nohup.out
 
 # Core dumps and agent config backups
-core.*
-core
+/core.*
+/core
 *.mcp.json.*.bak
 cline.mcp.json
 codex.mcp.json

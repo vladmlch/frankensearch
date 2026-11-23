@@ -135,7 +135,7 @@ pub struct HybridIndexParts {
     /// Actual lexical engine behind [`Self::lexical`].
     ///
     /// A caller that requires Quill's semantic behavior can fail closed when
-    /// this is [`Some(LexicalReaderBackend::TantivyOracle)`]. It is `None`
+    /// this is [`Some(LexicalReaderBackend::TantivyOracle)`](LexicalReaderBackend::TantivyOracle). It is `None`
     /// exactly when [`Self::lexical`] is absent.
     pub lexical_backend: Option<LexicalReaderBackend>,
 }

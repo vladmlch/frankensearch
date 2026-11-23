@@ -48,7 +48,7 @@ impl LeaseGrant {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DocIdSpan {
     /// Global docid of the lease block's ordinal zero. This is the value the
-    /// flush stage consumes as [`FlushSegmentInput::lease_docid_base`].
+    /// flush stage consumes as [`FlushSegmentInput::lease_docid_base`](super::FlushSegmentInput::lease_docid_base).
     pub lease_base: u64,
     /// First allocated lease-relative ordinal.
     pub ord_start: u32,

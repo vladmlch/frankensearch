@@ -385,25 +385,25 @@ if child == 0:
     os.write(ready_write, b"r")
     os.close(ready_write)
     if os.read(continue_read, 1) != b"c":
-os._exit(3)
+        os._exit(3)
     os.close(continue_read)
     child_self_route = os.readlink(f"/proc/self/fd/{probe_number}")
     parent_same_number_route = os.readlink(
-f"/proc/{parent_pid}/fd/{probe_number}"
+        f"/proc/{parent_pid}/fd/{probe_number}"
     )
     child_ok = (
-child_self_route == inherited_path
-and parent_same_number_route == parent_decoy_path
+        child_self_route == inherited_path
+        and parent_same_number_route == parent_decoy_path
     )
     print(json.dumps({
-"role": "child",
-"probe_number": probe_number,
-"self_route": child_self_route,
-"parent_same_number_route": parent_same_number_route,
-"self_is_inherited": child_self_route == inherited_path,
-"parent_same_number_is_decoy": (
-    parent_same_number_route == parent_decoy_path
-),
+        "role": "child",
+        "probe_number": probe_number,
+        "self_route": child_self_route,
+        "parent_same_number_route": parent_same_number_route,
+        "self_is_inherited": child_self_route == inherited_path,
+        "parent_same_number_is_decoy": (
+            parent_same_number_route == parent_decoy_path
+        ),
     }), flush=True)
     os._exit(0 if child_ok else 4)
 

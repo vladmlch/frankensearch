@@ -81,7 +81,8 @@ impl WriterPlan {
     }
 }
 
-/// A Tantivy-backed full-text search index implementing [`LexicalSearch`].
+/// A Tantivy-backed full-text search index implementing [`LexicalRead`](frankensearch_core::LexicalRead)
+/// and [`LexicalWrite`](frankensearch_core::LexicalWrite).
 ///
 /// Thread-safe for concurrent reads. Writes are serialized internally via
 /// the Tantivy `IndexWriter` (which requires `&mut self` for `add_document`

@@ -543,7 +543,7 @@ pub(in crate::grimoire) struct IndexRecord {
 /// validation.
 ///
 /// This stays crate-private so callers cannot pair validated offsets with an
-/// unrelated byte source. [`TermDictionary::from_validated_metadata`] also
+/// unrelated byte source. [`TermDictionary::from_validated_metadata`](super::TermDictionary::from_validated_metadata) also
 /// checks the exact live slice address and length before constructing a cheap
 /// borrowed view.
 #[derive(Debug)]

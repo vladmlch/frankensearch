@@ -899,7 +899,7 @@ impl ModelArtifactManifestV1 {
     /// A native manifest is derived from its download manifest by
     /// [`Self::from_download_manifest`], so both describe one artifact set.
     /// When `download_manifest` carries a valid `.verified` receipt for
-    /// `model_dir` (minted only by [`verify_dir_and_record`] after a full
+    /// `model_dir` (minted only by [`verify_dir_and_record`](super::verify_dir_and_record) after a full
     /// SHA-256 pass, and invalidated by any size, mtime, or identity change)
     /// and every artifact here matches that manifest's file entry on relative
     /// path, size, and SHA-256, the full hash pass is skipped. This is what

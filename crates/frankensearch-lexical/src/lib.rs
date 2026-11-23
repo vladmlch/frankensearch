@@ -1,6 +1,7 @@
 //! Tantivy BM25 full-text search integration for frankensearch.
 //!
-//! Provides the [`TantivyIndex`] implementation of the [`LexicalSearch`] trait,
+//! Provides the [`TantivyIndex`] implementation of the [`LexicalRead`](frankensearch_core::LexicalRead)
+//! and [`LexicalWrite`](frankensearch_core::LexicalWrite) traits,
 //! including schema creation, document indexing, BM25 query parsing,
 //! and search result ranking.
 //!
