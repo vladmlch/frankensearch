@@ -66,7 +66,11 @@ fn collect_production_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
                 path.file_stem()
                     .and_then(|stem| stem.to_str())
                     .is_some_and(|stem| {
-                        stem == "tests" || stem.ends_with("_tests") || stem.ends_with(".tests")
+                        stem == "tests"
+                            || stem.ends_with("_tests")
+                            || std::path::Path::new(stem)
+                                .extension()
+                                .is_some_and(|ext| ext.eq_ignore_ascii_case("tests"))
                     });
             if !is_test_file {
                 out.push(path);
