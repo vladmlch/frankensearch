@@ -464,7 +464,7 @@ impl AdaptiveNqcDenseWeight {
         }
     }
 
-    /// Whether the down-weight is enabled (`beta > 0`). When disabled, [`weight_for_cv`] is a
+    /// Whether the down-weight is enabled (`beta > 0`). When disabled, [`Self::weight_for_cv`] is a
     /// no-op returning the neutral `1.0`.
     #[must_use]
     pub fn is_active(&self) -> bool {

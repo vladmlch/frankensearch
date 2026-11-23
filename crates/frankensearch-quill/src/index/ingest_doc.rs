@@ -17,7 +17,7 @@ use super::error_results::{
 /// One document already projected onto an arbitrary compiled schema.
 ///
 /// [`IndexableDocument`] is the five-field shipping shape and stays the input
-/// type for [`super::QuillIndex::upsert_documents`]. This is its schema-general
+/// type for `QuillIndex::upsert_documents`. This is its schema-general
 /// sibling for indexes opened through [`super::QuillIndex::create_with_schema`]: every
 /// value carries its own stable field ordinal, so a caller with a wider schema
 /// — the CASS profile in [`crate::cass`], for instance — supplies each column

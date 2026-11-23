@@ -1,6 +1,6 @@
 //! Distribution-free recall certification for approximate nearest-neighbour search.
 //!
-//! The ANN search reports `SearchStats.estimated_recall` via [`crate::hnsw`]'s
+//! The ANN search reports `SearchStats.estimated_recall` via `crate::hnsw`'s
 //! `estimate_recall`, a magic-constant heuristic — `0.9 + 0.1·log2(ef/k)`, clamped
 //! — with **no empirical grounding and no guarantee**. That guess is exactly the
 //! kind of "magic threshold" the alien-graveyard §12.1 (Conformal Prediction,

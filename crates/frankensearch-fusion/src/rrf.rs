@@ -595,7 +595,7 @@ fn minmax_norm(score: f32, min: f32, max: f32) -> f64 {
 /// 2. A document a tier did *not* retrieve gets that tier's pool **minimum**
 ///    normalized value — which is `0.0` for min-max.
 /// 3. The fused score is the tier-weighted sum of the two normalized scores.
-/// 4. Sort by the same deterministic ordering as RRF ([`FusedHitScratch::cmp_for_ranking`],
+/// 4. Sort by the same deterministic ordering as RRF (`FusedHitScratch::cmp_for_ranking`,
 ///    the fused score living in `rrf_score`), then paginate.
 ///
 /// # Why it beats RRF
@@ -766,7 +766,7 @@ fn pool_minmax_fuse_for_vector_lane(
 ///
 /// **Bit-identical** to [`pool_minmax_fuse`]: f64 addition is commutative (emitting
 /// `semantic + lexical` yields the same fused score as `lexical + semantic`), the same
-/// first-occurrence dedup on each tier, and the same total-order [`FusedHitScratch::cmp_for_ranking`]
+/// first-occurrence dedup on each tier, and the same total-order `FusedHitScratch::cmp_for_ranking`
 /// comparator. Verified by `pool_minmax_merge_matches_map`. This is the variant a searcher should
 /// wire once pool-min-max fusion is enabled (as the searcher already uses
 /// [`rrf_fuse_with_graph_merge_unique`] over the map RRF).

@@ -272,7 +272,7 @@ impl QualifiedGenerationRoot {
     ///
     /// Linux opens both anchors descriptor-relatively. Apple Silicon returns
     /// [`GenerationRootErrorKind::PreopenedDescriptorRequired`]; use
-    /// [`Self::admit_preopened`]. Unsupported targets fail before path parsing
+    /// `Self::admit_preopened`. Unsupported targets fail before path parsing
     /// or filesystem I/O.
     ///
     /// # Errors
@@ -445,7 +445,7 @@ impl QualifiedGenerationRoot {
     ///
     /// Returns [`GenerationRootErrorKind::LockContended`] instead of blocking,
     /// or the precise tuple/content failure. Apple Silicon requires
-    /// [`Self::read_guard_preopened`].
+    /// `Self::read_guard_preopened`.
     pub fn read_guard(&self) -> GenerationRootResult<GenerationRootReadGuard<'_>> {
         #[cfg(target_os = "macos")]
         {

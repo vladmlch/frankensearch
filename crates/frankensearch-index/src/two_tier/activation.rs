@@ -23,7 +23,7 @@ use crate::{
 /// publication state, contradicting the owner contract on
 /// [`ValidatedFsviBytes`] ("no conversion into a mutable/path-opened
 /// `VectorIndex`"). The r2 repair retains the owner in full; callers wrap it
-/// in [`TierSource::AdmittedV2`](super::TierSource::AdmittedV2) and borrow the validated index from inside
+/// in `TierSource::AdmittedV2` and borrow the validated index from inside
 /// it, so the parsed v2 identity metadata (`identity_v2()` stays `Some`)
 /// still marks the tier ATTESTED on the assembled [`TwoTierIndex`](super::TwoTierIndex).
 /// One tier that passed every identity join, paired with the query bound to

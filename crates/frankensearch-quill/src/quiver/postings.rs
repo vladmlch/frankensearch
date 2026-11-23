@@ -1419,7 +1419,7 @@ impl<'a> PostingCursor<'a> {
     /// descent is monotone every later probe inside it is then free. Only the
     /// first read of a block costs one, which is exactly what
     /// [`Self::doc_before_decodes_block`] reports — both are written against the
-    /// same [`ArrivalPlan`], so the charge cannot drift from the work.
+    /// same `ArrivalPlan`, so the charge cannot drift from the work.
     ///
     /// # Errors
     ///
@@ -1482,7 +1482,7 @@ impl<'a> PostingCursor<'a> {
     /// This carries the same obligation as [`Self::advance_decodes_block`]: it
     /// mirrors the branch it predicts so a caller can admit the block before the
     /// read performs it. It cannot drift from that branch, because both read the
-    /// same [`ArrivalPlan`]. Three answers cost nothing — a target no block can
+    /// same `ArrivalPlan`. Three answers cost nothing — a target no block can
     /// hold, the block the cursor is parked in, and the block retained behind it.
     #[must_use]
     pub fn doc_before_decodes_block(&self, target: u32) -> bool {

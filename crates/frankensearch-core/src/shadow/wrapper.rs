@@ -500,7 +500,7 @@ impl crate::traits::LexicalRead for ShadowLexical {
     /// Forward the serving backend's candidate batch, pin and all.
     ///
     /// The batch's hydration context belongs to the serving backend, and
-    /// [`Self::hydrate_candidates`] forwards there too, so the pin stays
+    /// [`LexicalRead::hydrate_candidates`](crate::traits::LexicalRead::hydrate_candidates) forwards there too, so the pin stays
     /// coherent end to end and the decorator never mints or inspects one.
     ///
     /// A previous note here claimed the eager default was deliberate because

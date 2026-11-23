@@ -186,7 +186,7 @@ impl TopDocsCollector {
     /// Fold another collector's retained state into this one.
     ///
     /// The packed selection key's total order (score via the monotonic
-    /// [`score_to_sortable`] transform, then ascending docid) makes the
+    /// `score_to_sortable` transform, then ascending docid) makes the
     /// retained top-`retained` set unique regardless of insertion order, so
     /// folding per-segment partials in any order yields exactly the set a
     /// single serial collector retains.

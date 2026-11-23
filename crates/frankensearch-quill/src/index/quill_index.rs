@@ -1004,7 +1004,7 @@ impl QuillIndex {
     ///
     /// # Errors
     ///
-    /// Identical to [`Self::upsert_documents`].
+    /// Identical to `Self::upsert_documents`.
     pub async fn upsert_schema_documents(
         &self,
         cx: &Cx,

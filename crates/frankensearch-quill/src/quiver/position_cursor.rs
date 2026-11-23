@@ -276,7 +276,7 @@ impl PositionCursor<'_> {
 
     /// Number of POSTINGS block decodes [`Self::next`] would perform.
     ///
-    /// [`Self::advance_one`] touches the paired posting cursor exactly once,
+    /// `Self::advance_one` touches the paired posting cursor exactly once,
     /// so a positional step decodes whatever that single step decodes.
     #[must_use]
     pub fn next_decode_count(&self) -> u64 {

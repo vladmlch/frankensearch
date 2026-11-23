@@ -553,7 +553,7 @@ impl RefreshWorker {
     /// ([`BoundQueryEmbedding::verify_space_identity`]) and applies the
     /// SameProducer-only producer law
     /// ([`BoundQueryEmbedding::verify_producer_conformance`] via
-    /// [`require_same_producer`]), merges the carried live rows with the new
+    /// `require_same_producer`), merges the carried live rows with the new
     /// records (new wins per `doc_id`; tombstoned rows are never
     /// resurrected), and writes the replacement via
     /// [`VectorIndex::create_v2`] into a fresh attempt directory under

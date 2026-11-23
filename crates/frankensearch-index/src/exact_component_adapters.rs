@@ -5,7 +5,7 @@
 //! [`crate::native_hnsw::NativeHnswGenerationReceiptV2`] already carry
 //! everything the vector and ANN clauses of the exact-generation contract need,
 //! but nothing converted them into the
-//! [`ExactComponentReceiptV1`][frankensearch_core::generation::ExactComponentReceiptV1]
+//! [`ExactComponentReceiptV1`]
 //! that
 //! [`ExactGenerationComponentsV1::admit`][frankensearch_core::generation::ExactGenerationComponentsV1::admit]
 //! consumes — so that join was only ever exercised by receipts constructed by
@@ -31,7 +31,7 @@
 //! same mistake. Cross-engine agreement built on a shared error is worse than
 //! no agreement, because it looks like corroboration. So the adapters take the
 //! owner's ordered live document identifiers and recompute through
-//! [`CanonicalDocsetV1`][frankensearch_core::generation::CanonicalDocsetV1],
+//! [`CanonicalDocsetV1`],
 //! and `adapter_docset_digest_is_canonical_not_fsvi_domain` pins that the two
 //! digests genuinely differ.
 

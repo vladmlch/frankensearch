@@ -79,7 +79,7 @@ pub enum CassSourceFilter {
     Local,
     /// Remote-only (`origin_kind` == "ssh").
     Remote,
-    /// Specific source id (`source_id` == <id>).
+    /// Specific source id (`source_id == <id>`).
     SourceId(String),
 }
 
